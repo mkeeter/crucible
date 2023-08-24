@@ -586,7 +586,7 @@ impl Extent {
         }
 
         /*
-         * Open a connection to the metadata db
+         * Open a connection to the blocks db
          */
         path.set_extension("db");
         let conn =
@@ -606,6 +606,7 @@ impl Extent {
                 }
                 Ok(m) => m,
             };
+        // TODO: check block size here?
 
         // XXX: schema updates?
 
@@ -626,7 +627,7 @@ impl Extent {
     }
 
     /**
-     * Close an extent and the metadata db files for it.
+     * Close an blocks db files for the extent.
      */
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
         let inner = self.db.lock().await;
@@ -678,7 +679,7 @@ impl Extent {
             open_sqlite_connection(&path)?
         } else {
             /*
-             * Create the metadata db
+             * Create the blocks db
              */
             let conn = open_sqlite_connection(&path)?;
 
