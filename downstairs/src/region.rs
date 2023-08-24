@@ -49,9 +49,6 @@ pub struct DownstairsBlockContext {
 #[derive(Debug)]
 pub struct Inner {
     metadb: Connection,
-
-    /// Set of blocks that have been written since last flush.
-    dirty_blocks: HashSet<usize>,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -624,10 +621,7 @@ impl Extent {
             block_size: def.block_size(),
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(Inner {
-                metadb,
-                dirty_blocks: HashSet::new(),
-            }),
+            inner: Mutex::new(Inner { metadb }),
         };
 
         Ok(extent)
@@ -769,10 +763,7 @@ impl Extent {
             block_size: def.block_size(),
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(Inner {
-                metadb,
-                dirty_blocks: HashSet::new(),
-            }),
+            inner: Mutex::new(Inner { metadb }),
         })
     }
 
@@ -1107,17 +1098,6 @@ impl Extent {
                 },
                 &write.data,
             )?;
-
-            // Worth some thought: this could happen inside
-            // tx_set_block_context, if we passed a reference to dirty_blocks
-            // into that function too. This might be nice, since then a block
-            // context could never be set without marking the block as dirty.
-            // On the other paw, our test suite very much likes the fact that
-            // tx_set_block_context doesn't mark blocks as dirty, since it
-            // lets us easily test specific edge-cases of the database state.
-            // Could make another function that wraps tx_set_block_context
-            // and handles this as well.
-            let _ = inner.dirty_blocks.insert(write.offset.value as usize);
         }
         tx.commit()?;
 
@@ -1140,8 +1120,7 @@ impl Extent {
         job_id: u64,
         log: &Logger,
     ) -> Result<(), CrucibleError> {
-        let mut inner = self.inner.lock().await;
-
+        let inner = self.inner.lock().await;
         if !inner.dirty()? {
             /*
              * If we have made no writes to this extent since the last flush,
@@ -1149,9 +1128,6 @@ impl Extent {
              */
             return Ok(());
         }
-
-        // XXX I think this is the only thing that actually needs to happen
-        inner.metadb.cache_flush()?;
 
         // Read only extents should never have the dirty bit set. If they do,
         // bail
@@ -1161,48 +1137,20 @@ impl Extent {
             crucible_bail!(ModifyingReadOnlyRegion);
         }
 
-        // Used for profiling
-        let n_dirty_blocks = inner.dirty_blocks.len() as u64;
+        cdt::extent__flush__start!(|| { (job_id, self.number) });
 
-        cdt::extent__flush__start!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
-        // Clear old block contexts. In order to be crash consistent, only
-        // perform this after the extent fsync is done. For each block
-        // written since the last flush, remove all block context rows where
-        // the integrity hash does not map the last-written value. This is
-        // safe, because we know the process has not crashed since those
-        // values were written. When the region is first opened, the entire
-        // file is rehashed, since in that case we don't have that luxury.
-
-        cdt::extent__flush__collect__hashes__start!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
-        // All blocks that may have changed since the last flush
-        let mut dirty_blocks: Vec<usize> = inner.dirty_blocks.drain().collect();
-
-        // Sorting here is extremely important to get good performance out of
-        // truncate_encryption_contexts_and_hashes() later. It also means we
-        // can efficiently re-read only the dirty parts of the file.
-        dirty_blocks.sort_unstable();
-
-        // We could shrink this to 0, but it's nice not to have to expand the
-        // dirty_blocks HashMap on small writes. They have a hard enough time
-        // as it is. We don't want our maps to be keeping a lot of memory
-        // allocated though. With 16 entries max, even a 32TiB region of
-        // 128MiB extents would only be spending ~64MiB of ram on on this,
-        // across the entire region. There's potential for tuning here.
-        inner.dirty_blocks.shrink_to(16);
-
-        cdt::extent__flush__collect__hashes__done!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
+        // XXX I think this is the only thing that actually needs to happen
+        inner
+            .metadb
+            .execute("PRAGMA wal_checkpoint(FULL);", [])
+            .or_else(|e| match e {
+                rusqlite::Error::ExecuteReturnedResults => Ok(0),
+                _ => Err(e),
+            })?;
 
         inner.set_flush_number(new_flush, new_gen)?;
 
-        cdt::extent__flush__done!(|| { (job_id, self.number, n_dirty_blocks) });
+        cdt::extent__flush__done!(|| { (job_id, self.number,) });
 
         Ok(())
     }
@@ -2333,7 +2281,6 @@ mod test {
     fn new_extent(number: u32) -> Extent {
         let inn = Inner {
             metadb: Connection::open_in_memory().unwrap(),
-            dirty_blocks: HashSet::new(),
         };
 
         /*

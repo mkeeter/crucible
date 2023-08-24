@@ -402,8 +402,8 @@ pub mod cdt {
     fn submit__writeunwritten__done(_: u64) {}
     fn submit__write__done(_: u64) {}
     fn submit__flush__done(_: u64) {}
-    fn extent__flush__start(job_id: u64, extent_id: u32, extent_size: u64) {}
-    fn extent__flush__done(job_id: u64, extent_id: u32, extent_size: u64) {}
+    fn extent__flush__start(job_id: u64, extent_id: u32) {}
+    fn extent__flush__done(job_id: u64, extent_id: u32) {}
     fn extent__flush__file__start(
         job_id: u64,
         extent_id: u32,
