@@ -32,10 +32,10 @@ pub struct Extent {
     extent_size: Block,
     iov_max: usize,
 
-    /// Inner contains information about the actual extent file that holds the
+    /// Db contains information about the actual extent file that holds the
     /// data, the metadata (stored in the database) about that extent, and the
     /// set of dirty blocks that have been written to since last flush.
-    pub inner: Mutex<Inner>,
+    pub db: Mutex<Db>,
 }
 
 /// BlockContext, with the addition of block index
@@ -47,8 +47,8 @@ pub struct DownstairsBlockContext {
 }
 
 #[derive(Debug)]
-pub struct Inner {
-    metadb: Connection,
+pub struct Db {
+    conn: Connection,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -59,9 +59,9 @@ pub enum ExtentState {
     Closed,
 }
 
-impl Inner {
+impl Db {
     pub fn gen_number(&self) -> Result<u64> {
-        let mut stmt = self.metadb.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT value FROM metadata where name='gen_number'",
         )?;
         let gen_number_iter = stmt.query_map([], |row| row.get(0))?;
@@ -77,7 +77,7 @@ impl Inner {
     }
 
     pub fn flush_number(&self) -> Result<u64> {
-        let mut stmt = self.metadb.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT value FROM metadata where name='flush_number'",
         )?;
         let flush_number_iter = stmt.query_map([], |row| row.get(0))?;
@@ -96,13 +96,13 @@ impl Inner {
      * The flush and generation numbers will be updated at the same time.
      */
     fn set_flush_number(&self, new_flush: u64, new_gen: u64) -> Result<()> {
-        let mut stmt = self.metadb.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(
             "UPDATE metadata SET value=?1 WHERE name='flush_number'",
         )?;
 
         let _rows_affected = stmt.execute([new_flush])?;
 
-        let mut stmt = self.metadb.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(
             "UPDATE metadata SET value=?1 WHERE name='gen_number'",
         )?;
 
@@ -113,7 +113,7 @@ impl Inner {
          * set back to false.
          */
         let mut stmt = self
-            .metadb
+            .conn
             .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
         let _rows_affected = stmt.execute([])?;
 
@@ -122,7 +122,7 @@ impl Inner {
 
     pub fn dirty(&self) -> Result<bool> {
         let mut stmt = self
-            .metadb
+            .conn
             .prepare_cached("SELECT value FROM metadata where name='dirty'")?;
         let dirty_iter = stmt.query_map([], |row| row.get(0))?;
 
@@ -138,7 +138,7 @@ impl Inner {
 
     fn set_dirty(&self) -> Result<()> {
         let _ = self
-            .metadb
+            .conn
             .prepare_cached("UPDATE metadata SET value=1 WHERE name='dirty'")?
             .execute([])?;
         Ok(())
@@ -152,12 +152,12 @@ impl Inner {
     fn get_blocks(
         &self,
         block: u64,
-        count: u64,
         iovecs: &mut [&mut [u8]],
     ) -> Result<Vec<Option<DownstairsBlockContext>>> {
-        let stmt = "SELECT block, hash, nonce, tag, data FROM block_context \
+        let stmt = "SELECT block, hash, nonce, tag, data FROM blocks \
              WHERE block BETWEEN ?1 AND ?2";
-        let mut stmt = self.metadb.prepare_cached(stmt)?;
+        let mut stmt = self.conn.prepare_cached(stmt)?;
+        let count = iovecs.len() as u64;
 
         let stmt_iter =
             stmt.query_map(params![block, block + count - 1], |row| {
@@ -173,11 +173,7 @@ impl Inner {
                 Ok((block_index, hash, nonce, tag))
             })?;
 
-        let mut results = Vec::with_capacity(count as usize);
-        for _i in 0..count {
-            results.push(None);
-        }
-
+        let mut results = vec![None; count as usize];
         for row in stmt_iter {
             let (block_index, hash, nonce, tag) = row?;
 
@@ -204,17 +200,18 @@ impl Inner {
     }
 
     /// For a given block range, return all context rows since the last flush.
-    /// `get_block_contexts` returns a `Vec<Vec<DownstairsBlockContext>>` of
-    /// length equal to `count`. Each `Vec<DownstairsBlockContext>` inside this
-    /// parent Vec contains all contexts for a single block.
+    /// `get_block_contexts` returns a `Vec<Option<DownstairsBlockContext>>` of
+    /// length equal to `count`. Each `Option<DownstairsBlockContext>` inside this
+    /// parent Vec contains all contexts for a single block (which is either
+    /// zero or one context).
     fn get_block_contexts(
         &self,
         block: u64,
         count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>> {
-        let stmt = "SELECT block, hash, nonce, tag FROM block_context \
+    ) -> Result<Vec<Option<DownstairsBlockContext>>> {
+        let stmt = "SELECT block, hash, nonce, tag FROM blocks \
              WHERE block BETWEEN ?1 AND ?2";
-        let mut stmt = self.metadb.prepare_cached(stmt)?;
+        let mut stmt = self.conn.prepare_cached(stmt)?;
 
         let stmt_iter =
             stmt.query_map(params![block, block + count - 1], |row| {
@@ -226,11 +223,7 @@ impl Inner {
                 Ok((block_index, hash, nonce, tag))
             })?;
 
-        let mut results = Vec::with_capacity(count as usize);
-        for _i in 0..count {
-            results.push(Vec::new());
-        }
-
+        let mut results = vec![None; count as usize];
         for row in stmt_iter {
             let (block_index, hash, nonce, tag) = row?;
 
@@ -248,7 +241,9 @@ impl Inner {
                 block: block_index,
             };
 
-            results[(ctx.block - block) as usize].push(ctx);
+            let index = (ctx.block - block) as usize;
+            assert!(results[index].is_none());
+            results[index] = Some(ctx);
         }
 
         Ok(results)
@@ -257,13 +252,12 @@ impl Inner {
     /*
      * Append a block context row.
      */
-    pub fn tx_set_block_context(
+    pub fn tx_set_block(
         tx: &rusqlite::Transaction,
         block_context: &DownstairsBlockContext,
         data: &[u8],
     ) -> Result<()> {
-        let stmt =
-            "REPLACE INTO block_context (block, hash, nonce, tag, data) \
+        let stmt = "REPLACE INTO blocks (block, hash, nonce, tag, data) \
              VALUES (?1, ?2, ?3, ?4, ?5)";
 
         let (nonce, tag) = if let Some(encryption_context) =
@@ -301,10 +295,10 @@ impl Inner {
     ) -> Result<()> {
         self.set_dirty()?;
 
-        let tx = self.metadb.transaction()?;
+        let tx = self.conn.transaction()?;
 
         for block_context in block_contexts {
-            Self::tx_set_block_context(&tx, block_context, &[])?;
+            Self::tx_set_block(&tx, block_context, &[])?;
         }
 
         tx.commit()?;
@@ -505,11 +499,11 @@ pub fn validate_repair_files(eid: usize, files: &[String]) -> bool {
 /// Always open sqlite with journaling, and synchronous.
 /// Note: these pragma_updates are not durable
 fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
-    let metadb = Connection::open(path)?;
+    let conn = Connection::open(path)?;
 
-    assert!(metadb.is_autocommit());
-    metadb.pragma_update(None, "journal_mode", "WAL")?;
-    metadb.pragma_update(None, "synchronous", "NORMAL")?;
+    assert!(conn.is_autocommit());
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
 
     // 16 page * 4KiB page size = 64KiB cache size
     // Value chosen somewhat arbitrarily as a guess at a good starting point.
@@ -517,12 +511,12 @@ fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
     // not see any performance changes moving to a 64KiB cache size. But, this
     // value may be something we want to reduce further, tune, or scale with
     // extent size.
-    metadb.pragma_update(None, "cache_size", 16)?;
+    conn.pragma_update(None, "cache_size", 16)?;
 
     // rusqlite provides an LRU Cache (a cache which, when full, evicts the
     // least-recently-used value). This caches prepared statements, allowing
     // us to nullify the cost of parsing and compiling frequently used
-    // statements.  I've changed all sqlite queries in Inner to use
+    // statements.  I've changed all sqlite queries in Db to use
     // `prepare_cached` to take advantage of this cache. I have not done this
     // for `prepare_cached` region creation,
     // since it wouldn't be relevant there.
@@ -548,9 +542,9 @@ fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
 
     // Also, if you're curious, the hashing function used is
     // https://docs.rs/ahash/latest/ahash/index.html
-    metadb.set_prepared_statement_cache_capacity(64);
+    conn.set_prepared_statement_cache_capacity(64);
 
-    Ok(metadb)
+    Ok(conn)
 }
 
 impl Extent {
@@ -595,7 +589,7 @@ impl Extent {
          * Open a connection to the metadata db
          */
         path.set_extension("db");
-        let metadb =
+        let conn =
             match open_sqlite_connection(&path) {
                 Err(e) => {
                     error!(
@@ -621,21 +615,21 @@ impl Extent {
             block_size: def.block_size(),
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(Inner { metadb }),
+            db: Mutex::new(Db { conn }),
         };
 
         Ok(extent)
     }
 
     pub async fn dirty(&self) -> bool {
-        self.inner.lock().await.dirty().unwrap()
+        self.db.lock().await.dirty().unwrap()
     }
 
     /**
      * Close an extent and the metadata db files for it.
      */
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
-        let inner = self.inner.lock().await;
+        let inner = self.db.lock().await;
 
         let gen = inner.gen_number().unwrap();
         let flush = inner.flush_number().unwrap();
@@ -678,7 +672,7 @@ impl Extent {
         // Instead of creating the sqlite db for every extent, create it only
         // once, and copy from a seed db when creating other extents. This
         // minimizes Region create time.
-        let metadb = if Path::new(&seed).exists() {
+        let conn = if Path::new(&seed).exists() {
             std::fs::copy(&seed, &path)?;
 
             open_sqlite_connection(&path)?
@@ -686,12 +680,12 @@ impl Extent {
             /*
              * Create the metadata db
              */
-            let metadb = open_sqlite_connection(&path)?;
+            let conn = open_sqlite_connection(&path)?;
 
             /*
              * Create tables and insert base data
              */
-            metadb.execute(
+            conn.execute(
                 "CREATE TABLE metadata (
                     name TEXT PRIMARY KEY,
                     value INTEGER NOT NULL
@@ -701,21 +695,21 @@ impl Extent {
 
             let meta = ExtentMeta::default();
 
-            metadb.execute(
+            conn.execute(
                 "INSERT INTO metadata
                 (name, value) VALUES (?1, ?2)",
                 params!["ext_version", meta.ext_version],
             )?;
-            metadb.execute(
+            conn.execute(
                 "INSERT INTO metadata
                 (name, value) VALUES (?1, ?2)",
                 params!["gen_number", meta.gen_number],
             )?;
-            metadb.execute(
+            conn.execute(
                 "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
                 params!["flush_number", meta.flush_number],
             )?;
-            metadb.execute(
+            conn.execute(
                 "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
                 params!["dirty", meta.dirty],
             )?;
@@ -728,8 +722,8 @@ impl Extent {
             // The Downstairs will record a single row for each block, because
             // we're storing both the metadata and actual data BLOB in the
             // database.
-            metadb.execute(
-                "CREATE TABLE block_context (
+            conn.execute(
+                "CREATE TABLE blocks (
                     block INTEGER PRIMARY KEY,
                     hash INTEGER,
                     nonce BLOB,
@@ -740,10 +734,10 @@ impl Extent {
             )?;
 
             // write out
-            metadb.close().map_err(|e| {
+            conn.close().map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("metadb.close() failed! {}", e.1),
+                    format!("conn.close() failed! {}", e.1),
                 )
             })?;
 
@@ -762,7 +756,7 @@ impl Extent {
             block_size: def.block_size(),
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(Inner { metadb }),
+            db: Mutex::new(Db { conn }),
         })
     }
 
@@ -830,7 +824,7 @@ impl Extent {
             (job_id, self.number, requests.len() as u64)
         });
 
-        let inner = self.inner.lock().await;
+        let inner = self.db.lock().await;
 
         // This code batches up operations for contiguous regions of
         // ReadRequests, so we can perform larger read syscalls and sqlite
@@ -884,11 +878,8 @@ impl Extent {
             cdt::extent__read__get__contexts__start!(|| {
                 (job_id, self.number, n_contiguous_requests as u64)
             });
-            let block_contexts = inner.get_blocks(
-                first_req.offset.value,
-                n_contiguous_requests as u64,
-                iovecs.as_mut_slice(),
-            )?;
+            let block_contexts = inner
+                .get_blocks(first_req.offset.value, iovecs.as_mut_slice())?;
             cdt::extent__read__get__contexts__done!(|| {
                 (job_id, self.number, n_contiguous_requests as u64)
             });
@@ -966,7 +957,7 @@ impl Extent {
             (job_id, self.number, writes.len() as u64)
         });
 
-        let mut inner_guard = self.inner.lock().await;
+        let mut inner_guard = self.db.lock().await;
         // I realize this looks like some nonsense but what this is doing is
         // borrowing the inner up-front from the MutexGuard, which will allow
         // us to later disjointly borrow fields. Basically, we're helping the
@@ -1053,7 +1044,7 @@ impl Extent {
                 )?;
 
                 for (i, block_contexts) in block_contexts.iter().enumerate() {
-                    if !block_contexts.is_empty() {
+                    if block_contexts.is_some() {
                         let _ = writes_to_skip
                             .insert(i as u64 + first_write.offset.value);
                     }
@@ -1082,14 +1073,14 @@ impl Extent {
         cdt::extent__write__sqlite__insert__start!(|| {
             (job_id, self.number, writes.len() as u64)
         });
-        let tx = inner.metadb.transaction()?;
+        let tx = inner.conn.transaction()?;
         for write in writes {
             if writes_to_skip.contains(&write.offset.value) {
                 debug_assert!(only_write_unwritten);
                 continue;
             }
 
-            Inner::tx_set_block_context(
+            Db::tx_set_block(
                 &tx,
                 &DownstairsBlockContext {
                     block_context: write.block_context.clone(),
@@ -1119,7 +1110,7 @@ impl Extent {
         job_id: u64,
         log: &Logger,
     ) -> Result<(), CrucibleError> {
-        let inner = self.inner.lock().await;
+        let inner = self.db.lock().await;
         if !inner.dirty()? {
             /*
              * If we have made no writes to this extent since the last flush,
@@ -1140,7 +1131,7 @@ impl Extent {
 
         // XXX I think this is the only thing that actually needs to happen
         inner
-            .metadb
+            .conn
             .execute("PRAGMA wal_checkpoint(FULL);", [])
             .or_else(|e| match e {
                 rusqlite::Error::ExecuteReturnedResults => Ok(0),
@@ -1753,7 +1744,7 @@ impl Region {
         let mut result = Vec::with_capacity(self.extents.len());
         for eid in 0..self.extents.len() {
             let extent = self.get_opened_extent(eid).await;
-            result.push(extent.inner.lock().await.flush_number()?);
+            result.push(extent.db.lock().await.flush_number()?);
         }
 
         if result.len() > 12 {
@@ -1773,7 +1764,7 @@ impl Region {
         let mut result = Vec::with_capacity(self.extents.len());
         for eid in 0..self.extents.len() {
             let extent = self.get_opened_extent(eid).await;
-            result.push(extent.inner.lock().await.gen_number()?);
+            result.push(extent.db.lock().await.gen_number()?);
         }
         Ok(result)
     }
@@ -1782,7 +1773,7 @@ impl Region {
         let mut result = Vec::with_capacity(self.extents.len());
         for eid in 0..self.extents.len() {
             let extent = self.get_opened_extent(eid).await;
-            result.push(extent.inner.lock().await.dirty()?);
+            result.push(extent.db.lock().await.dirty()?);
         }
         Ok(result)
     }
@@ -2278,8 +2269,8 @@ mod test {
     }
 
     fn new_extent(number: u32) -> Extent {
-        let inn = Inner {
-            metadb: Connection::open_in_memory().unwrap(),
+        let inn = Db {
+            conn: Connection::open_in_memory().unwrap(),
         };
 
         /*
@@ -2292,7 +2283,7 @@ mod test {
             block_size: 512,
             extent_size: Block::new_512(100),
             iov_max: Extent::get_iov_max().unwrap(),
-            inner: Mutex::new(inn),
+            db: Mutex::new(inn),
         }
     }
 
@@ -3199,12 +3190,12 @@ mod test {
         region.extend(1).await?;
 
         let ext = region.get_opened_extent(0).await;
-        let mut inner = ext.inner.lock().await;
+        let mut inner = ext.db.lock().await;
 
         // Encryption context for blocks 0 and 1 should start blank
 
-        assert!(inner.get_block_contexts(0, 1)?[0].is_empty());
-        assert!(inner.get_block_contexts(1, 1)?[0].is_empty());
+        assert!(inner.get_block_contexts(0, 1)?[0].is_none());
+        assert!(inner.get_block_contexts(1, 1)?[0].is_none());
 
         // Set and verify block 0's context
 
@@ -3219,13 +3210,10 @@ mod test {
             block: 0,
         }])?;
 
-        let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-
-        assert_eq!(ctxs.len(), 1);
+        let ctxs = inner.get_block_contexts(0, 1)?[0].clone().unwrap();
 
         assert_eq!(
-            ctxs[0]
-                .block_context
+            ctxs.block_context
                 .encryption_context
                 .as_ref()
                 .unwrap()
@@ -3233,19 +3221,14 @@ mod test {
             vec![1, 2, 3]
         );
         assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            ctxs.block_context.encryption_context.as_ref().unwrap().tag,
             vec![4, 5, 6, 7]
         );
-        assert_eq!(ctxs[0].block_context.hash, 123);
+        assert_eq!(ctxs.block_context.hash, 123);
 
         // Block 1 should still be blank
 
-        assert!(inner.get_block_contexts(1, 1)?[0].is_empty());
+        assert!(inner.get_block_contexts(1, 1)?[0].is_none());
 
         // Set and verify a new context for block 0
 
@@ -3263,14 +3246,11 @@ mod test {
             block: 0,
         }])?;
 
-        let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-
-        assert_eq!(ctxs.len(), 1);
+        let ctxs = inner.get_block_contexts(0, 1)?[0].clone().unwrap();
 
         // Second context was appended
         assert_eq!(
-            ctxs[0]
-                .block_context
+            ctxs.block_context
                 .encryption_context
                 .as_ref()
                 .unwrap()
@@ -3278,23 +3258,14 @@ mod test {
             blob1
         );
         assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            ctxs.block_context.encryption_context.as_ref().unwrap().tag,
             blob2
         );
-        assert_eq!(ctxs[0].block_context.hash, 1024);
+        assert_eq!(ctxs.block_context.hash, 1024);
 
-        let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-
-        assert_eq!(ctxs.len(), 1);
-
+        let ctxs = inner.get_block_contexts(0, 1)?[0].clone().unwrap();
         assert_eq!(
-            ctxs[0]
-                .block_context
+            ctxs.block_context
                 .encryption_context
                 .as_ref()
                 .unwrap()
@@ -3302,15 +3273,10 @@ mod test {
             blob1
         );
         assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            ctxs.block_context.encryption_context.as_ref().unwrap().tag,
             blob2
         );
-        assert_eq!(ctxs[0].block_context.hash, 1024);
+        assert_eq!(ctxs.block_context.hash, 1024);
 
         Ok(())
     }
@@ -3323,9 +3289,9 @@ mod test {
         region.extend(1).await?;
 
         let ext = region.get_opened_extent(0).await;
-        let mut inner = ext.inner.lock().await;
+        let mut inner = ext.db.lock().await;
 
-        assert!(inner.get_block_contexts(0, 1)?[0].is_empty());
+        assert!(inner.get_block_contexts(0, 1)?[0].is_none());
 
         // Submit the same contents for block 0 over and over, simulating a user
         // writing the same unencrypted contents to the same offset.
@@ -3343,7 +3309,7 @@ mod test {
         // Duplicate rows should not be inserted
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-        assert_eq!(ctxs.len(), 1);
+        assert!(ctxs.is_some());
 
         Ok(())
     }
@@ -3356,12 +3322,12 @@ mod test {
         region.extend(1).await?;
 
         let ext = region.get_opened_extent(0).await;
-        let mut inner = ext.inner.lock().await;
+        let mut inner = ext.db.lock().await;
 
         // Encryption context for blocks 0 and 1 should start blank
 
-        assert!(inner.get_block_contexts(0, 1)?[0].is_empty());
-        assert!(inner.get_block_contexts(1, 1)?[0].is_empty());
+        assert!(inner.get_block_contexts(0, 1)?[0].is_none());
+        assert!(inner.get_block_contexts(1, 1)?[0].is_none());
 
         // Set block 0's and 1's context
 
@@ -3390,13 +3356,10 @@ mod test {
 
         // Verify block 0's context
 
-        let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-
-        assert_eq!(ctxs.len(), 1);
+        let ctxs = inner.get_block_contexts(0, 1)?[0].clone().unwrap();
 
         assert_eq!(
-            ctxs[0]
-                .block_context
+            ctxs.block_context
                 .encryption_context
                 .as_ref()
                 .unwrap()
@@ -3404,25 +3367,17 @@ mod test {
             vec![1, 2, 3]
         );
         assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            ctxs.block_context.encryption_context.as_ref().unwrap().tag,
             vec![4, 5, 6, 7]
         );
-        assert_eq!(ctxs[0].block_context.hash, 123);
+        assert_eq!(ctxs.block_context.hash, 123);
 
         // Verify block 1's context
 
-        let ctxs = inner.get_block_contexts(1, 1)?[0].clone();
-
-        assert_eq!(ctxs.len(), 1);
+        let ctxs = inner.get_block_contexts(1, 1)?[0].clone().unwrap();
 
         assert_eq!(
-            ctxs[0]
-                .block_context
+            ctxs.block_context
                 .encryption_context
                 .as_ref()
                 .unwrap()
@@ -3430,61 +3385,36 @@ mod test {
             vec![4, 5, 6]
         );
         assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            ctxs.block_context.encryption_context.as_ref().unwrap().tag,
             vec![8, 9, 0, 1]
         );
-        assert_eq!(ctxs[0].block_context.hash, 9999);
+        assert_eq!(ctxs.block_context.hash, 9999);
 
         // Return both block 0's and block 1's context, and verify
 
         let ctxs = inner.get_block_contexts(0, 2)?;
 
-        assert_eq!(ctxs[0].len(), 1);
+        let c0 = ctxs[0].clone().unwrap();
         assert_eq!(
-            ctxs[0][0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .nonce,
+            c0.block_context.encryption_context.as_ref().unwrap().nonce,
             vec![1, 2, 3]
         );
         assert_eq!(
-            ctxs[0][0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            c0.block_context.encryption_context.as_ref().unwrap().tag,
             vec![4, 5, 6, 7]
         );
-        assert_eq!(ctxs[0][0].block_context.hash, 123);
+        assert_eq!(c0.block_context.hash, 123);
 
-        assert_eq!(ctxs[1].len(), 1);
+        let c1 = ctxs[1].clone().unwrap();
         assert_eq!(
-            ctxs[1][0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .nonce,
+            c1.block_context.encryption_context.as_ref().unwrap().nonce,
             vec![4, 5, 6]
         );
         assert_eq!(
-            ctxs[1][0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
+            c1.block_context.encryption_context.as_ref().unwrap().tag,
             vec![8, 9, 0, 1]
         );
-        assert_eq!(ctxs[1][0].block_context.hash, 9999);
+        assert_eq!(c1.block_context.hash, 9999);
 
         // Append a whole bunch of block context rows
 
@@ -3518,8 +3448,8 @@ mod test {
         }
 
         let ctxs = inner.get_block_contexts(0, 2)?;
-        assert_eq!(ctxs[0].len(), 1);
-        assert_eq!(ctxs[1].len(), 1);
+        assert!(ctxs[0].is_some());
+        assert!(ctxs[1].is_some());
 
         Ok(())
     }
@@ -4757,20 +4687,14 @@ mod test {
         let last_writes = writes.last().unwrap();
 
         let ext = region.get_opened_extent(0).await;
-        let inner = ext.inner.lock().await;
+        let inner = ext.db.lock().await;
 
         for (i, range) in ranges.iter().enumerate() {
             // Get the contexts for the range
             let ctxts = inner
                 .get_block_contexts(range.start, range.end - range.start)?;
 
-            // Every block should have at most 1 block
-            assert_eq!(
-                ctxts.iter().map(|block_ctxts| block_ctxts.len()).max(),
-                Some(1)
-            );
-
-            // Now that we've checked that, flatten out for an easier eq
+            // Flatten out for an easier eq
             let actual_ctxts: Vec<_> = ctxts
                 .iter()
                 .flatten()
@@ -4837,18 +4761,12 @@ mod test {
         let last_writes = writes.last().unwrap();
 
         let ext = region.get_opened_extent(0).await;
-        let inner = ext.inner.lock().await;
+        let inner = ext.db.lock().await;
 
         // Get the contexts for the range
         let ctxts = inner.get_block_contexts(0, EXTENT_SIZE)?;
 
-        // Every block should have at most 1 block
-        assert_eq!(
-            ctxts.iter().map(|block_ctxts| block_ctxts.len()).max(),
-            Some(1)
-        );
-
-        // Now that we've checked that, flatten out for an easier eq
+        // Flatten out for an easier eq
         let actual_ctxts: Vec<_> = ctxts
             .iter()
             .flatten()
