@@ -509,6 +509,7 @@ fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
     // value may be something we want to reduce further, tune, or scale with
     // extent size.
     conn.pragma_update(None, "cache_size", 16)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
 
     // rusqlite provides an LRU Cache (a cache which, when full, evicts the
     // least-recently-used value). This caches prepared statements, allowing
@@ -1128,6 +1129,7 @@ impl Extent {
         cdt::extent__flush__start!(|| { (job_id, self.number) });
 
         // XXX I think this is the only thing that actually needs to happen
+        inner.set_flush_number(new_flush, new_gen)?;
         inner
             .conn
             .execute("PRAGMA wal_checkpoint(FULL);", [])
