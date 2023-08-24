@@ -730,12 +730,11 @@ impl Extent {
             // database.
             metadb.execute(
                 "CREATE TABLE block_context (
-                    block INTEGER,
+                    block INTEGER PRIMARY KEY,
                     hash INTEGER,
                     nonce BLOB,
                     tag BLOB,
-                    data BLOB,
-                    PRIMARY KEY (block)
+                    data BLOB
                 )",
                 [],
             )?;
