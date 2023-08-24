@@ -1138,8 +1138,6 @@ impl Extent {
                 _ => Err(e),
             })?;
 
-        inner.set_flush_number(new_flush, new_gen)?;
-
         cdt::extent__flush__done!(|| { (job_id, self.number,) });
 
         Ok(())
