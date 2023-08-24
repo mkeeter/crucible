@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 use std::fs::{rename, File, OpenOptions};
-use std::io::{BufReader, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
@@ -13,8 +13,7 @@ use tokio::task::JoinHandle;
 use anyhow::{anyhow, bail, Result};
 use futures::TryStreamExt;
 use nix::unistd::{sysconf, SysconfVar};
-use rusqlite::{params, Connection, Transaction};
-
+use rusqlite::{params, types::ValueRef, Connection};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
@@ -22,8 +21,6 @@ use crucible_common::*;
 use crucible_protocol::{EncryptionContext, SnapshotDetails};
 use repair_client::types::FileType;
 use repair_client::Client;
-
-use std::os::fd::AsRawFd;
 
 use super::*;
 
@@ -41,18 +38,16 @@ pub struct Extent {
     pub inner: Mutex<Inner>,
 }
 
-/// BlockContext, with the addition of block index and on_disk_hash
+/// BlockContext, with the addition of block index
 #[derive(Clone)]
 pub struct DownstairsBlockContext {
     pub block_context: BlockContext,
 
     pub block: u64,
-    pub on_disk_hash: u64,
 }
 
 #[derive(Debug)]
 pub struct Inner {
-    file: File,
     metadb: Connection,
 
     /// Set of blocks that have been written since last flush.
@@ -152,17 +147,18 @@ impl Inner {
         Ok(())
     }
 
-    /// For a given block range, return all context rows since the last flush.
-    /// `get_block_contexts` returns a `Vec<Vec<DownstairsBlockContext>>` of
-    /// length equal to `count`. Each `Vec<DownstairsBlockContext>` inside this
-    /// parent Vec contains all contexts for a single block.
-    fn get_block_contexts(
+    /// For a given block range, return all context and data rows
+    /// `get_blocks` returns a `Vec<Vec<DownstairsBlockContext>>` of
+    /// length equal to `iovecs.len()` and populates `iovecs`.
+    ///
+    /// `iovecs` must be zero-initialized, to support empty blocks
+    fn get_blocks(
         &self,
         block: u64,
         count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>> {
-        let stmt =
-            "SELECT block, hash, nonce, tag, on_disk_hash FROM block_context \
+        iovecs: &mut [&mut [u8]],
+    ) -> Result<Vec<Option<DownstairsBlockContext>>> {
+        let stmt = "SELECT block, hash, nonce, tag, data FROM block_context \
              WHERE block BETWEEN ?1 AND ?2";
         let mut stmt = self.metadb.prepare_cached(stmt)?;
 
@@ -172,18 +168,21 @@ impl Inner {
                 let hash: i64 = row.get(1)?;
                 let nonce: Option<Vec<u8>> = row.get(2)?;
                 let tag: Option<Vec<u8>> = row.get(3)?;
-                let on_disk_hash: i64 = row.get(4)?;
+                if let ValueRef::Blob(s) = row.get_ref(4)? {
+                    let index = (block_index - block) as usize;
+                    iovecs[index].copy_from_slice(s);
+                }
 
-                Ok((block_index, hash, nonce, tag, on_disk_hash))
+                Ok((block_index, hash, nonce, tag))
             })?;
 
         let mut results = Vec::with_capacity(count as usize);
         for _i in 0..count {
-            results.push(Vec::new());
+            results.push(None);
         }
 
         for row in stmt_iter {
-            let (block_index, hash, nonce, tag, on_disk_hash) = row?;
+            let (block_index, hash, nonce, tag) = row?;
 
             let encryption_context = if let Some(nonce) = nonce {
                 tag.map(|tag| EncryptionContext { nonce, tag })
@@ -197,7 +196,59 @@ impl Inner {
                     encryption_context,
                 },
                 block: block_index,
-                on_disk_hash: on_disk_hash as u64,
+            };
+
+            let index = (ctx.block - block) as usize;
+            assert!(results[index].is_none());
+            results[index] = Some(ctx);
+        }
+
+        Ok(results)
+    }
+
+    /// For a given block range, return all context rows since the last flush.
+    /// `get_block_contexts` returns a `Vec<Vec<DownstairsBlockContext>>` of
+    /// length equal to `count`. Each `Vec<DownstairsBlockContext>` inside this
+    /// parent Vec contains all contexts for a single block.
+    fn get_block_contexts(
+        &self,
+        block: u64,
+        count: u64,
+    ) -> Result<Vec<Vec<DownstairsBlockContext>>> {
+        let stmt = "SELECT block, hash, nonce, tag FROM block_context \
+             WHERE block BETWEEN ?1 AND ?2";
+        let mut stmt = self.metadb.prepare_cached(stmt)?;
+
+        let stmt_iter =
+            stmt.query_map(params![block, block + count - 1], |row| {
+                let block_index: u64 = row.get(0)?;
+                let hash: i64 = row.get(1)?;
+                let nonce: Option<Vec<u8>> = row.get(2)?;
+                let tag: Option<Vec<u8>> = row.get(3)?;
+
+                Ok((block_index, hash, nonce, tag))
+            })?;
+
+        let mut results = Vec::with_capacity(count as usize);
+        for _i in 0..count {
+            results.push(Vec::new());
+        }
+
+        for row in stmt_iter {
+            let (block_index, hash, nonce, tag) = row?;
+
+            let encryption_context = if let Some(nonce) = nonce {
+                tag.map(|tag| EncryptionContext { nonce, tag })
+            } else {
+                None
+            };
+
+            let ctx = DownstairsBlockContext {
+                block_context: BlockContext {
+                    hash: hash as u64,
+                    encryption_context,
+                },
+                block: block_index,
             };
 
             results[(ctx.block - block) as usize].push(ctx);
@@ -212,9 +263,10 @@ impl Inner {
     pub fn tx_set_block_context(
         tx: &rusqlite::Transaction,
         block_context: &DownstairsBlockContext,
+        data: &[u8],
     ) -> Result<()> {
         let stmt =
-            "INSERT OR IGNORE INTO block_context (block, hash, nonce, tag, on_disk_hash) \
+            "REPLACE INTO block_context (block, hash, nonce, tag, data) \
              VALUES (?1, ?2, ?3, ?4, ?5)";
 
         let (nonce, tag) = if let Some(encryption_context) =
@@ -233,7 +285,7 @@ impl Inner {
             block_context.block_context.hash as i64,
             nonce,
             tag,
-            block_context.on_disk_hash as i64,
+            data,
         ])?;
 
         // We avoid INSERTing duplicate rows, so this should always be 0 or 1.
@@ -242,6 +294,9 @@ impl Inner {
         Ok(())
     }
 
+    /// Sets the contents of the block, along with empty data
+    ///
+    /// This will panic if you try to read the block data!
     #[cfg(test)]
     fn set_block_contexts(
         &mut self,
@@ -252,56 +307,8 @@ impl Inner {
         let tx = self.metadb.transaction()?;
 
         for block_context in block_contexts {
-            Self::tx_set_block_context(&tx, block_context)?;
+            Self::tx_set_block_context(&tx, block_context, &[])?;
         }
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
-    /// Get rid of all block context rows except those that match the on-disk
-    /// hash that is computed after a flush. For best performance, make sure
-    /// `extent_block_indexes_and_hashes` is sorted by block number before
-    /// calling this function.  Note that this takes an open transaction as
-    /// a parameter; if a caller does not have an open transaction, the
-    /// unadorned variant should be called instead.
-    fn truncate_encryption_contexts_and_hashes_with_tx(
-        &self,
-        extent_block_indexes_and_hashes: Vec<(usize, u64)>,
-        tx: &Transaction,
-    ) -> Result<()> {
-        let n_blocks = extent_block_indexes_and_hashes.len();
-        cdt::extent__context__truncate__start!(|| n_blocks as u64);
-
-        {
-            let stmt = "DELETE FROM block_context \
-                where block == ?1 and on_disk_hash != ?2";
-
-            let mut stmt = tx.prepare_cached(stmt)?;
-            for (block, on_disk_hash) in extent_block_indexes_and_hashes {
-                let _rows_affected =
-                    stmt.execute(params![block, on_disk_hash as i64])?;
-            }
-        }
-
-        cdt::extent__context__truncate__done!(|| ());
-
-        Ok(())
-    }
-
-    /// A wrapper around ['truncate_encryption_contexts_and_hashes_with_tx']
-    /// that calls it from within a transaction.
-    fn truncate_encryption_contexts_and_hashes(
-        &self,
-        extent_block_indexes_and_hashes: Vec<(usize, u64)>,
-    ) -> Result<()> {
-        let tx = self.metadb.unchecked_transaction()?;
-
-        self.truncate_encryption_contexts_and_hashes_with_tx(
-            extent_block_indexes_and_hashes,
-            &tx,
-        )?;
 
         tx.commit()?;
 
@@ -348,7 +355,6 @@ impl Default for ExtentMeta {
 #[derive(Debug, Clone)]
 #[allow(clippy::enum_variant_names)]
 pub enum ExtentType {
-    Data,
     Db,
     DbShm,
     DbWal,
@@ -357,7 +363,6 @@ pub enum ExtentType {
 impl fmt::Display for ExtentType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ExtentType::Data => Ok(()),
             ExtentType::Db => write!(f, "db"),
             ExtentType::DbShm => write!(f, "db-shm"),
             ExtentType::DbWal => write!(f, "db-wal"),
@@ -372,7 +377,6 @@ impl fmt::Display for ExtentType {
 impl ExtentType {
     fn to_file_type(&self) -> FileType {
         match self {
-            ExtentType::Data => FileType::Data,
             ExtentType::Db => FileType::Db,
             ExtentType::DbShm => FileType::DbShm,
             ExtentType::DbWal => FileType::DbWal,
@@ -385,13 +389,14 @@ impl ExtentType {
  */
 pub fn extent_file_name(number: u32, extent_type: ExtentType) -> String {
     match extent_type {
-        ExtentType::Data => {
-            format!("{:03X}", number & 0xFFF)
-        }
         ExtentType::Db | ExtentType::DbShm | ExtentType::DbWal => {
             format!("{:03X}.{}", number & 0xFFF, extent_type)
         }
     }
+}
+
+pub fn extent_file_basename(number: u32) -> String {
+    format!("{:03X}", number & 0xFFF)
 }
 
 /**
@@ -411,7 +416,7 @@ pub fn extent_dir<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
  */
 pub fn extent_path<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
     let mut out = extent_dir(dir, number);
-    out.push(extent_file_name(number, ExtentType::Data));
+    out.push(extent_file_basename(number));
     out
 }
 
@@ -423,7 +428,7 @@ pub fn extent_path<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
  */
 pub fn copy_dir<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
     let mut out = extent_dir(dir, number);
-    out.push(extent_file_name(number, ExtentType::Data));
+    out.push(extent_file_basename(number));
     out.set_extension("copy");
     out
 }
@@ -438,7 +443,7 @@ pub fn copy_dir<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
  */
 pub fn replace_dir<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
     let mut out = extent_dir(dir, number);
-    out.push(extent_file_name(number, ExtentType::Data));
+    out.push(extent_file_basename(number));
     out.set_extension("replace");
     out
 }
@@ -453,7 +458,7 @@ pub fn replace_dir<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
  */
 pub fn completed_dir<P: AsRef<Path>>(dir: P, number: u32) -> PathBuf {
     let mut out = extent_dir(dir, number);
-    out.push(extent_file_name(number, ExtentType::Data));
+    out.push(extent_file_basename(number));
     out.set_extension("completed");
     out
 }
@@ -482,16 +487,13 @@ pub fn remove_copy_cleanup_dir<P: AsRef<Path>>(dir: P, eid: u32) -> Result<()> {
 
 /**
  * Validate a list of sorted repair files.
- * There are either two or four files we expect to find, any more or less
+ * There are either one or three files we expect to find, any more or less
  * and we have a bad list.  No duplicates.
  */
 pub fn validate_repair_files(eid: usize, files: &[String]) -> bool {
     let eid = eid as u32;
 
-    let some = vec![
-        extent_file_name(eid, ExtentType::Data),
-        extent_file_name(eid, ExtentType::Db),
-    ];
+    let some = vec![extent_file_name(eid, ExtentType::Db)];
 
     let mut all = some.clone();
     all.extend(vec![
@@ -510,7 +512,7 @@ fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
 
     assert!(metadb.is_autocommit());
     metadb.pragma_update(None, "journal_mode", "WAL")?;
-    metadb.pragma_update(None, "synchronous", "FULL")?;
+    metadb.pragma_update(None, "synchronous", "NORMAL")?;
 
     // 16 page * 4KiB page size = 64KiB cache size
     // Value chosen somewhat arbitrarily as a guess at a good starting point.
@@ -577,10 +579,6 @@ impl Extent {
          * there are not too many files in any level of that hierarchy.
          */
         let mut path = extent_path(&dir, number);
-
-        let bcount = def.extent_size().value;
-        let size = def.block_size().checked_mul(bcount).unwrap();
-
         remove_copy_cleanup_dir(&dir, number)?;
 
         // If the replace directory exists for this extent, then it means
@@ -595,39 +593,6 @@ impl Extent {
             );
             move_replacement_extent(&dir, number as usize, log)?;
         }
-
-        /*
-         * Open the extent file and verify the size is as we expect.
-         */
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(!read_only)
-            .open(&path)
-        {
-            Err(e) => {
-                error!(
-                    log,
-                    "Open of {:?} for extent#{} returned: {}", path, number, e,
-                );
-                bail!(
-                    "Open of {:?} for extent#{} returned: {}",
-                    path,
-                    number,
-                    e,
-                );
-            }
-            Ok(f) => {
-                let cur_size = f.metadata().unwrap().len();
-                if size != cur_size {
-                    bail!(
-                        "File size {:?} does not match expected {:?}",
-                        size,
-                        cur_size
-                    );
-                }
-                f
-            }
-        };
 
         /*
          * Open a connection to the metadata db
@@ -660,17 +625,10 @@ impl Extent {
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
             inner: Mutex::new(Inner {
-                file,
                 metadb,
                 dirty_blocks: HashSet::new(),
             }),
         };
-
-        // Clean out any irrelevant block contexts, which may be present if
-        // downstairs crashed between a write() and a flush().
-        extent
-            .fully_rehash_and_clean_all_stale_contexts(false)
-            .await?;
 
         Ok(extent)
     }
@@ -717,19 +675,7 @@ impl Extent {
         }
         remove_copy_cleanup_dir(&dir, number)?;
 
-        let bcount = def.extent_size().value;
-        let size = def.block_size().checked_mul(bcount).unwrap();
-
         mkdir_for_file(&path)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)?;
-
-        file.set_len(size)?;
-        file.seek(SeekFrom::Start(0))?;
-
         let mut seed = dir.as_ref().to_path_buf();
         seed.push("seed");
         seed.set_extension("db");
@@ -785,47 +731,18 @@ impl Extent {
             // The Upstairs will send either an integrity hash, or an integrity
             // hash along with some encryption context (a nonce and tag).
             //
-            // The Downstairs will have to record multiple context rows for each
-            // block, because while what is committed to sqlite is durable (due
-            // to the write-ahead logging and the fact that we set PRAGMA
-            // SYNCHRONOUS), what is written to the extent file is not durable
-            // until a flush of that file is performed.
-            //
-            // Any of the context rows written between flushes could be valid
-            // until we call flush and remove context rows where the integrity
-            // hash does not match what was actually flushed to disk.
-
-            // in WITHOUT ROWID mode, SQLite arranges the tables on-disk ordered
-            // by the primary key. since we're always doing operations on
-            // contiguous ranges of blocks, this is great for us. The only catch
-            // is that you can actually see worse performance with large rows
-            // (not a problem for us).
-            //
-            // From https://www.sqlite.org/withoutrowid.html:
-            // > WITHOUT ROWID tables work best when individual rows are not too
-            // > large. A good rule-of-thumb is that the average size of a
-            // > single row in a WITHOUT ROWID table should be less than about
-            // > 1/20th the size of a database page. That means that rows should
-            // > not contain more than about 50 bytes each for a 1KiB page size
-            // > or about 200 bytes each for 4KiB page size.
-            //
-            // The default SQLite page size is 4KiB, per
-            // https://sqlite.org/pgszchng2016.html
-            //
-            // The primary key is also a uniqueness constraint. Because the
-            // on_disk_hash is a hash of the data AFTER encryption, we only need
-            // (block, on_disk_hash). A duplicate write with a different
-            // encryption context necessarily results in a different on disk
-            // hash.
+            // The Downstairs will record a single row for each block, because
+            // we're storing both the metadata and actual data BLOB in the
+            // database.
             metadb.execute(
                 "CREATE TABLE block_context (
                     block INTEGER,
                     hash INTEGER,
                     nonce BLOB,
                     tag BLOB,
-                    on_disk_hash INTEGER,
-                    PRIMARY KEY (block, on_disk_hash)
-                ) WITHOUT ROWID",
+                    data BLOB,
+                    PRIMARY KEY (block)
+                )",
                 [],
             )?;
 
@@ -853,7 +770,6 @@ impl Extent {
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
             inner: Mutex::new(Inner {
-                file,
                 metadb,
                 dirty_blocks: HashSet::new(),
             }),
@@ -887,15 +803,11 @@ impl Extent {
     fn create_copy_file(
         mut copy_dir: PathBuf,
         eid: usize,
-        extension: Option<ExtentType>,
+        extension: ExtentType,
     ) -> Result<File> {
         // Get the base extent name before we consider the actual Type
-        let name = extent_file_name(eid as u32, ExtentType::Data);
+        let name = extent_file_name(eid as u32, extension);
         copy_dir.push(name);
-        if let Some(extension) = extension {
-            let ext = format!("{}", extension);
-            copy_dir.set_extension(ext);
-        }
         let copy_path = copy_dir;
 
         if Path::new(&copy_path).exists() {
@@ -975,32 +887,17 @@ impl Extent {
             for resp in
                 &mut responses[resp_run_start..][..n_contiguous_requests]
             {
-                iovecs.push(IoSliceMut::new(&mut resp.data[..]));
+                iovecs.push(&mut resp.data[..]);
             }
-
-            // Finally we get to read the actual data. That's why we're here
-            cdt::extent__read__file__start!(|| {
-                (job_id, self.number, n_contiguous_requests as u64)
-            });
-
-            nix::sys::uio::preadv(
-                inner.file.as_raw_fd(),
-                &mut iovecs,
-                first_req.offset.value as i64 * self.block_size as i64,
-            )
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-
-            cdt::extent__read__file__done!(|| {
-                (job_id, self.number, n_contiguous_requests as u64)
-            });
 
             // Query the block metadata
             cdt::extent__read__get__contexts__start!(|| {
                 (job_id, self.number, n_contiguous_requests as u64)
             });
-            let block_contexts = inner.get_block_contexts(
+            let block_contexts = inner.get_blocks(
                 first_req.offset.value,
                 n_contiguous_requests as u64,
+                iovecs.as_mut_slice(),
             )?;
             cdt::extent__read__get__contexts__done!(|| {
                 (job_id, self.number, n_contiguous_requests as u64)
@@ -1187,13 +1084,6 @@ impl Extent {
             }
         }
 
-        // We do all of our metadb updates in a single transaction to minimize
-        // syncs.  (Note that the "unchecked" in the signature merely denotes
-        // that we are taking responsibility for assuring that we are not
-        // in a nested transaction, accepting that it will fail at run-time
-        // if we are.)
-        let tx = inner.metadb.unchecked_transaction()?;
-
         inner.set_dirty()?;
 
         // Write all the metadata to the DB
@@ -1202,24 +1092,20 @@ impl Extent {
         cdt::extent__write__sqlite__insert__start!(|| {
             (job_id, self.number, writes.len() as u64)
         });
-
+        let tx = inner.metadb.transaction()?;
         for write in writes {
             if writes_to_skip.contains(&write.offset.value) {
                 debug_assert!(only_write_unwritten);
                 continue;
             }
 
-            // TODO it would be nice if we could profile what % of time we're
-            // spending on hashes locally vs sqlite
-            let on_disk_hash = integrity_hash(&[&write.data[..]]);
-
             Inner::tx_set_block_context(
                 &tx,
                 &DownstairsBlockContext {
                     block_context: write.block_context.clone(),
                     block: write.offset.value,
-                    on_disk_hash,
                 },
+                &write.data,
             )?;
 
             // Worth some thought: this could happen inside
@@ -1236,56 +1122,6 @@ impl Extent {
         tx.commit()?;
 
         cdt::extent__write__sqlite__insert__done!(|| {
-            (job_id, self.number, writes.len() as u64)
-        });
-
-        // PERFORMANCE TODO:
-        //
-        // Something worth considering for small writes is that, based on
-        // my memory of conversations we had with propolis folks about what
-        // OSes expect out of an NVMe driver, I believe our contract with the
-        // upstairs doesn't require us to have the writes inside the file
-        // until after a flush() returns. If that is indeed true, we could
-        // buffer a certain amount of writes, only actually writing that
-        // buffer when either a flush is issued or the buffer exceeds some
-        // set size (based on our memory constraints). This would have
-        // benefits on any workload that frequently writes to the same block
-        // between flushes, would have benefits for small contiguous writes
-        // issued over multiple write commands by letting us batch them into
-        // a larger write, and (speculation) may benefit non-contiguous writes
-        // by cutting down the number of sqlite transactions. But, it
-        // introduces complexity. The time spent implementing that would
-        // probably better be spent switching to aio or something like that.
-        cdt::extent__write__file__start!(|| {
-            (job_id, self.number, writes.len() as u64)
-        });
-
-        // Now, batch writes into iovecs and use pwritev to write them all out.
-        let mut batched_pwritev = BatchedPwritev::new(
-            inner.file.as_raw_fd(),
-            writes.len(),
-            self.block_size,
-            self.iov_max,
-        );
-
-        for write in writes {
-            let block = write.offset.value;
-
-            // TODO, can this be `only_write_unwritten &&
-            // write_to_skip.contains()`?
-            if writes_to_skip.contains(&block) {
-                debug_assert!(only_write_unwritten);
-                batched_pwritev.perform_writes()?;
-                continue;
-            }
-
-            batched_pwritev.add_write(write)?;
-        }
-
-        // Write any remaining data
-        batched_pwritev.perform_writes()?;
-
-        cdt::extent__write__file__done!(|| {
             (job_id, self.number, writes.len() as u64)
         });
 
@@ -1314,6 +1150,9 @@ impl Extent {
             return Ok(());
         }
 
+        // XXX I think this is the only thing that actually needs to happen
+        inner.metadb.cache_flush()?;
+
         // Read only extents should never have the dirty bit set. If they do,
         // bail
         if self.read_only {
@@ -1329,28 +1168,6 @@ impl Extent {
             (job_id, self.number, n_dirty_blocks)
         });
 
-        /*
-         * We must first fsync to get any outstanding data written to disk.
-         * This must be done before we update the flush number.
-         */
-        cdt::extent__flush__file__start!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-        if let Err(e) = inner.file.sync_all() {
-            /*
-             * XXX Retry?  Mark extent as broken?
-             */
-            crucible_bail!(
-                IoError,
-                "extent {}: fsync 1 failure: {:?}",
-                self.number,
-                e
-            );
-        }
-        cdt::extent__flush__file__done!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
         // Clear old block contexts. In order to be crash consistent, only
         // perform this after the extent fsync is done. For each block
         // written since the last flush, remove all block context rows where
@@ -1363,10 +1180,6 @@ impl Extent {
             (job_id, self.number, n_dirty_blocks)
         });
 
-        // We'll fill this up in a moment
-        let mut extent_block_indexes_and_hashes: Vec<(usize, u64)> =
-            Vec::with_capacity(inner.dirty_blocks.len());
-
         // All blocks that may have changed since the last flush
         let mut dirty_blocks: Vec<usize> = inner.dirty_blocks.drain().collect();
 
@@ -1374,71 +1187,6 @@ impl Extent {
         // truncate_encryption_contexts_and_hashes() later. It also means we
         // can efficiently re-read only the dirty parts of the file.
         dirty_blocks.sort_unstable();
-
-        // Rehash any parts of the file that we wrote data to since the last
-        // flush
-        if !dirty_blocks.is_empty() {
-            // Rehashes a contiguous range of blocks
-            const BUFFER_SIZE: usize = 64 * 1024;
-            let mut buffer = [0u8; BUFFER_SIZE];
-            let mut dirty_block_iter = dirty_blocks.iter().copied();
-            let mut run_start = dirty_block_iter.next().unwrap();
-            let mut prev_block = run_start;
-
-            // Group blocks into contiguous runs for optimal IO, and rehash
-            loop {
-                let cur_block = dirty_block_iter.next();
-
-                // We rehash if there is either a run discontinuity, or when
-                // we hit the end of the iterator.
-                if cur_block == Some(prev_block + 1) {
-                    // Run is continuing
-                    prev_block += 1;
-                } else {
-                    // Discontinuity or end of iteration.
-
-                    // First, do the rehash
-                    inner.file.seek(SeekFrom::Start(
-                        run_start as u64 * self.block_size,
-                    ))?;
-
-                    let run_length = prev_block - run_start + 1;
-                    let mut remaining_bytes =
-                        run_length * self.block_size as usize;
-                    let mut block_being_hashed = run_start;
-                    while remaining_bytes > 0 {
-                        // A run may be larger than our IO buffer, in which
-                        // case we only process what fits in the buffer for
-                        // this iteration of the loop.
-                        let slice =
-                            &mut buffer[0..remaining_bytes.min(BUFFER_SIZE)];
-                        inner.file.read_exact(slice)?;
-                        for block_data in
-                            slice.chunks_exact(self.block_size as usize)
-                        {
-                            // Here's where we do the actual rehashing and
-                            // push it into our vec
-                            extent_block_indexes_and_hashes.push((
-                                block_being_hashed,
-                                integrity_hash(&[block_data]),
-                            ));
-                            block_being_hashed += 1;
-                        }
-                        remaining_bytes -= slice.len();
-                    }
-
-                    // Start a new run if there's more data to process, or
-                    // break out of the loop.
-                    match cur_block {
-                        None => break,
-                        Some(cur_block) => {
-                            run_start = cur_block;
-                            prev_block = cur_block;
-                        }
-                    }
-                }
-            }
-        }
 
         // We could shrink this to 0, but it's nice not to have to expand the
         // dirty_blocks HashMap on small writes. They have a hard enough time
@@ -1452,104 +1200,9 @@ impl Extent {
             (job_id, self.number, n_dirty_blocks)
         });
 
-        cdt::extent__flush__sqlite__insert__start!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
-        // We put all of our metadb updates into a single transaction to
-        // assure that we have a single sync.
-        let tx = inner.metadb.unchecked_transaction()?;
-
-        inner.truncate_encryption_contexts_and_hashes_with_tx(
-            extent_block_indexes_and_hashes,
-            &tx,
-        )?;
-
-        cdt::extent__flush__sqlite__insert__done!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
         inner.set_flush_number(new_flush, new_gen)?;
-        tx.commit()?;
-
-        // Finally, reset the file's seek offset to 0
-        inner.file.seek(SeekFrom::Start(0))?;
 
         cdt::extent__flush__done!(|| { (job_id, self.number, n_dirty_blocks) });
-
-        Ok(())
-    }
-
-    /// Rehash the entire file. Remove any stored hash/encryption contexts
-    /// that do not correlate to data currently stored on disk. This is
-    /// primarily when opening an extent after recovering from a crash, since
-    /// irrelevant hashes will normally be cleared out during a flush().
-    ///
-    /// By default this function will only do work if the extent is marked
-    /// dirty. Set `force_override_dirty` to `true` to override this behavior.
-    /// This override should generally not be necessary, as the dirty flag
-    /// is set before any contexts are written.
-    #[instrument]
-    async fn fully_rehash_and_clean_all_stale_contexts(
-        &self,
-        force_override_dirty: bool,
-    ) -> Result<(), CrucibleError> {
-        let mut inner = self.inner.lock().await;
-
-        if !force_override_dirty && !inner.dirty()? {
-            return Ok(());
-        }
-
-        // Just in case, let's be very sure that the file on disk is what it should be
-        if let Err(e) = inner.file.sync_all() {
-            crucible_bail!(
-                IoError,
-                "extent {}: fsync 1 failure during full rehash: {:?}",
-                self.number,
-                e
-            );
-        }
-
-        inner.file.seek(SeekFrom::Start(0))?;
-
-        // Buffer the file so we dont spend all day waiting on syscalls
-        let mut inner_file_buffered =
-            BufReader::with_capacity(64 * 1024, &inner.file);
-
-        // This gets filled one block at a time for hashing
-        let mut block = vec![0; self.block_size as usize];
-
-        // The vec of hashes that we'll pass off to truncate...()
-        let mut extent_block_indexes_and_hashes =
-            Vec::with_capacity(self.extent_size.value as usize);
-
-        // Stream the contents of the file and rehash them.
-        for i in 0..self.extent_size.value as usize {
-            inner_file_buffered.read_exact(&mut block)?;
-            extent_block_indexes_and_hashes
-                .push((i, integrity_hash(&[&block])));
-        }
-
-        // NOTE on safety: Unlike BufWriter, BufReader drop() does not have
-        // side-effects. There are no unhandled errors here.
-        drop(inner_file_buffered);
-
-        inner.truncate_encryption_contexts_and_hashes(
-            extent_block_indexes_and_hashes,
-        )?;
-
-        // Intentionally not clearing the dirty flag - we want to know that the
-        // extent is still considered dirty.
-
-        // Let's also clear out the internal map of hashes, in case it has any.
-        // This shouldn't be necessary, for two reasons
-        // 1. aside from tests, this function is only called before any writes
-        //    are issued.
-        // 2. this function should always produce results that match the state
-        //    of that map _anyway_.
-        // But, I never trust a cache, and may as well avoid keeping memory
-        // around at least right?
-        inner.dirty_blocks.clear();
 
         Ok(())
     }
@@ -2044,31 +1697,9 @@ impl Region {
             );
         }
 
-        // First, copy the main extent data file.
-        let extent_copy =
-            Extent::create_copy_file(copy_dir.clone(), eid, None)?;
-        let repair_stream = match repair_server
-            .get_extent_file(eid as u32, FileType::Data)
-            .await
-        {
-            Ok(rs) => rs,
-            Err(e) => {
-                crucible_bail!(
-                    RepairRequestError,
-                    "Failed to get extent {} data file: {:?}",
-                    eid,
-                    e,
-                );
-            }
-        };
-        save_stream_to_file(extent_copy, repair_stream.into_inner()).await?;
-
-        // The .db file is also required to exist for any valid extent.
-        let extent_db = Extent::create_copy_file(
-            copy_dir.clone(),
-            eid,
-            Some(ExtentType::Db),
-        )?;
+        // The .db file is required to exist for any valid extent.
+        let extent_db =
+            Extent::create_copy_file(copy_dir.clone(), eid, ExtentType::Db)?;
         let repair_stream = match repair_server
             .get_extent_file(eid as u32, FileType::Db)
             .await
@@ -2093,7 +1724,7 @@ impl Region {
                 let extent_shm = Extent::create_copy_file(
                     copy_dir.clone(),
                     eid,
-                    Some(opt_file.clone()),
+                    opt_file.clone(),
                 )?;
                 let repair_stream = match repair_server
                     .get_extent_file(eid as u32, opt_file.to_file_type())
@@ -2553,7 +2184,7 @@ pub fn move_replacement_extent<P: AsRef<Path>>(
     log: &Logger,
 ) -> Result<(), CrucibleError> {
     let destination_dir = extent_dir(&region_dir, eid as u32);
-    let extent_file_name = extent_file_name(eid as u32, ExtentType::Data);
+    let extent_file_name = extent_file_basename(eid as u32);
     let replace_dir = replace_dir(&region_dir, eid as u32);
     let completed_dir = completed_dir(&region_dir, eid as u32);
 
@@ -2571,19 +2202,6 @@ pub fn move_replacement_extent<P: AsRef<Path>>(
 
     let mut original_file = destination_dir.clone();
     original_file.push(extent_file_name);
-
-    // Copy the new file (the one we copied from the source side) on top
-    // of the original file.
-    if let Err(e) = std::fs::copy(new_file.clone(), original_file.clone()) {
-        crucible_bail!(
-            IoError,
-            "copy of {:?} to {:?} got: {:?}",
-            new_file,
-            original_file,
-            e
-        );
-    }
-    sync_path(&original_file, log)?;
 
     new_file.set_extension("db");
     original_file.set_extension("db");
@@ -2694,108 +2312,6 @@ pub async fn save_stream_to_file(
     Ok(())
 }
 
-struct BatchedPwritevState<'a> {
-    byte_offset: u64,
-    iovecs: Vec<IoSlice<'a>>,
-    next_block_in_run: u64,
-}
-
-struct BatchedPwritev<'a> {
-    fd: std::os::fd::RawFd,
-    capacity: usize,
-    state: Option<BatchedPwritevState<'a>>,
-    block_size: u64,
-    iov_max: usize,
-}
-
-impl<'a> BatchedPwritev<'a> {
-    pub fn new(
-        fd: std::os::fd::RawFd,
-        capacity: usize,
-        block_size: u64,
-        iov_max: usize,
-    ) -> Self {
-        Self {
-            fd,
-            capacity,
-            state: None,
-            block_size,
-            iov_max,
-        }
-    }
-
-    /// Add a write to the batch. If the write would cause the list of iovecs to
-    /// be larger than IOV_MAX, then `perform_writes` is called.
-    pub fn add_write(
-        &mut self,
-        write: &'a crucible_protocol::Write,
-    ) -> Result<(), CrucibleError> {
-        let block = write.offset.value;
-
-        let should_perform_writes = if let Some(state) = &self.state {
-            // Is this write contiguous with the last?
-            if block == state.next_block_in_run {
-                // If so, then add it to the list. Make sure to flush if the
-                // total size would become larger than IOV_MAX.
-                (state.iovecs.len() + 1) >= self.iov_max
-            } else {
-                // If not, then flush, and start the state all over.
-                true
-            }
-        } else {
-            false
-        };
-
-        if should_perform_writes {
-            self.perform_writes()?;
-        }
-
-        // If perform_writes was called above, then state will be None. If
-        // perform_writes was not called, then:
-        //
-        // - block == state.next_block_in_run, and
-        // - (state.iovecs.len() + 1) <= self.iov_max
-        //
-        // hence the assertion below.
-        if let Some(state) = &mut self.state {
-            assert_eq!(block, state.next_block_in_run);
-            state.iovecs.push(IoSlice::new(&write.data));
-            state.next_block_in_run += 1;
-        } else {
-            // start fresh
-            self.state = Some(BatchedPwritevState {
-                byte_offset: write.offset.value * self.block_size,
-                iovecs: {
-                    let mut iovecs = Vec::with_capacity(self.capacity);
-                    iovecs.push(IoSlice::new(&write.data));
-                    iovecs
-                },
-                next_block_in_run: block + 1,
-            });
-        }
-
-        Ok(())
-    }
-
-    // Write bytes out to file target
-    pub fn perform_writes(&mut self) -> Result<(), CrucibleError> {
-        if let Some(state) = &mut self.state {
-            assert!(!state.iovecs.is_empty());
-
-            nix::sys::uio::pwritev(
-                self.fd,
-                &state.iovecs[..],
-                state.byte_offset as i64,
-            )
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-
-            self.state = None;
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::fs::rename;
@@ -2815,10 +2331,7 @@ mod test {
     }
 
     fn new_extent(number: u32) -> Extent {
-        let ff = File::open("/dev/null").unwrap();
-
         let inn = Inner {
-            file: ff,
             metadb: Connection::open_in_memory().unwrap(),
             dirty_blocks: HashSet::new(),
         };
@@ -3136,11 +2649,10 @@ mod test {
         // We are simulating the copy of files from the "source" repair
         // extent by copying the files from extent zero into the copy
         // directory.
-        let dest_name = extent_file_name(1, ExtentType::Data);
+        let dest_name = extent_file_basename(1);
         let mut source_path = extent_path(&dir, 0);
         let mut dest_path = cp.clone();
         dest_path.push(dest_name);
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
 
         source_path.set_extension("db");
         dest_path.set_extension("db");
@@ -3203,15 +2715,14 @@ mod test {
         // We are simulating the copy of files from the "source" repair
         // extent by copying the files from extent zero into the copy
         // directory.
-        let dest_name = extent_file_name(1, ExtentType::Data);
+        let dest_name = extent_file_basename(1);
         let mut source_path = extent_path(&dir, 0);
         let mut dest_path = cp.clone();
         dest_path.push(dest_name);
-        println!("cp {:?} to {:?}", source_path, dest_path);
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
 
         source_path.set_extension("db");
         dest_path.set_extension("db");
+        println!("cp {:?} to {:?}", source_path, dest_path);
         std::fs::copy(source_path.clone(), dest_path.clone())?;
 
         let rd = replace_dir(&dir, 1);
@@ -3279,11 +2790,10 @@ mod test {
         // We are simulating the copy of files from the "source" repair
         // extent by copying the files from extent zero into the copy
         // directory.
-        let dest_name = extent_file_name(1, ExtentType::Data);
+        let dest_name = extent_file_basename(1);
         let mut source_path = extent_path(&dir, 0);
         let mut dest_path = cp.clone();
         dest_path.push(dest_name);
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
 
         source_path.set_extension("db");
         dest_path.set_extension("db");
@@ -3318,7 +2828,6 @@ mod test {
     fn validate_repair_files_good() {
         // This is an expected list of files for an extent
         let good_files: Vec<String> = vec![
-            "001".to_string(),
             "001.db".to_string(),
             "001.db-shm".to_string(),
             "001.db-wal".to_string(),
@@ -3330,8 +2839,7 @@ mod test {
     #[test]
     fn validate_repair_files_also_good() {
         // This is also an expected list of files for an extent
-        let good_files: Vec<String> =
-            vec!["001".to_string(), "001.db".to_string()];
+        let good_files: Vec<String> = vec!["001.db".to_string()];
         assert!(validate_repair_files(1, &good_files));
     }
 
@@ -3536,7 +3044,7 @@ mod test {
 
     #[test]
     fn extent_name_basic() {
-        assert_eq!(extent_file_name(4, ExtentType::Data), "004");
+        assert_eq!(extent_file_basename(4), "004");
     }
 
     #[test]
@@ -3556,22 +3064,22 @@ mod test {
 
     #[test]
     fn extent_name_basic_two() {
-        assert_eq!(extent_file_name(10, ExtentType::Data), "00A");
+        assert_eq!(extent_file_basename(10), "00A");
     }
 
     #[test]
     fn extent_name_basic_three() {
-        assert_eq!(extent_file_name(59, ExtentType::Data), "03B");
+        assert_eq!(extent_file_basename(59), "03B");
     }
 
     #[test]
     fn extent_name_max() {
-        assert_eq!(extent_file_name(u32::MAX, ExtentType::Data), "FFF");
+        assert_eq!(extent_file_basename(u32::MAX), "FFF");
     }
 
     #[test]
     fn extent_name_min() {
-        assert_eq!(extent_file_name(u32::MIN, ExtentType::Data), "000");
+        assert_eq!(extent_file_basename(u32::MIN), "000");
     }
 
     #[test]
@@ -3763,7 +3271,6 @@ mod test {
                 hash: 123,
             },
             block: 0,
-            on_disk_hash: 456,
         }])?;
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
@@ -3789,7 +3296,6 @@ mod test {
             vec![4, 5, 6, 7]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
-        assert_eq!(ctxs[0].on_disk_hash, 456);
 
         // Block 1 should still be blank
 
@@ -3809,38 +3315,15 @@ mod test {
                 hash: 1024,
             },
             block: 0,
-            on_disk_hash: 65536,
         }])?;
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
 
-        assert_eq!(ctxs.len(), 2);
-
-        // First context didn't change
-        assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .nonce,
-            vec![1, 2, 3]
-        );
-        assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
-            vec![4, 5, 6, 7]
-        );
-        assert_eq!(ctxs[0].block_context.hash, 123);
-        assert_eq!(ctxs[0].on_disk_hash, 456);
+        assert_eq!(ctxs.len(), 1);
 
         // Second context was appended
         assert_eq!(
-            ctxs[1]
+            ctxs[0]
                 .block_context
                 .encryption_context
                 .as_ref()
@@ -3849,7 +3332,7 @@ mod test {
             blob1
         );
         assert_eq!(
-            ctxs[1]
+            ctxs[0]
                 .block_context
                 .encryption_context
                 .as_ref()
@@ -3857,11 +3340,7 @@ mod test {
                 .tag,
             blob2
         );
-        assert_eq!(ctxs[1].block_context.hash, 1024);
-        assert_eq!(ctxs[1].on_disk_hash, 65536);
-
-        // "Flush", so only the rows that match should remain.
-        inner.truncate_encryption_contexts_and_hashes(vec![(0, 65536)])?;
+        assert_eq!(ctxs[0].block_context.hash, 1024);
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
 
@@ -3886,7 +3365,6 @@ mod test {
             blob2
         );
         assert_eq!(ctxs[0].block_context.hash, 1024);
-        assert_eq!(ctxs[0].on_disk_hash, 65536);
 
         Ok(())
     }
@@ -3913,18 +3391,10 @@ mod test {
                     hash: 123,
                 },
                 block: 0,
-                on_disk_hash: 123,
             }])?;
         }
 
         // Duplicate rows should not be inserted
-
-        let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-        assert_eq!(ctxs.len(), 1);
-
-        // Truncation should still work
-
-        inner.truncate_encryption_contexts_and_hashes(vec![(0, 123)])?;
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
         assert_eq!(ctxs.len(), 1);
@@ -3959,7 +3429,6 @@ mod test {
                     hash: 123,
                 },
                 block: 0,
-                on_disk_hash: 456,
             },
             &DownstairsBlockContext {
                 block_context: BlockContext {
@@ -3970,7 +3439,6 @@ mod test {
                     hash: 9999,
                 },
                 block: 1,
-                on_disk_hash: 1234567890,
             },
         ])?;
 
@@ -3999,7 +3467,6 @@ mod test {
             vec![4, 5, 6, 7]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
-        assert_eq!(ctxs[0].on_disk_hash, 456);
 
         // Verify block 1's context
 
@@ -4026,7 +3493,6 @@ mod test {
             vec![8, 9, 0, 1]
         );
         assert_eq!(ctxs[0].block_context.hash, 9999);
-        assert_eq!(ctxs[0].on_disk_hash, 1234567890);
 
         // Return both block 0's and block 1's context, and verify
 
@@ -4052,7 +3518,6 @@ mod test {
             vec![4, 5, 6, 7]
         );
         assert_eq!(ctxs[0][0].block_context.hash, 123);
-        assert_eq!(ctxs[0][0].on_disk_hash, 456);
 
         assert_eq!(ctxs[1].len(), 1);
         assert_eq!(
@@ -4074,11 +3539,10 @@ mod test {
             vec![8, 9, 0, 1]
         );
         assert_eq!(ctxs[1][0].block_context.hash, 9999);
-        assert_eq!(ctxs[1][0].on_disk_hash, 1234567890);
 
         // Append a whole bunch of block context rows
 
-        for i in 0..10 {
+        for _i in 0..10 {
             inner.set_block_contexts(&[
                 &DownstairsBlockContext {
                     block_context: BlockContext {
@@ -4091,7 +3555,6 @@ mod test {
                         hash: rand::thread_rng().gen::<u64>(),
                     },
                     block: 0,
-                    on_disk_hash: i,
                 },
                 &DownstairsBlockContext {
                     block_context: BlockContext {
@@ -4104,26 +3567,13 @@ mod test {
                         hash: rand::thread_rng().gen::<u64>(),
                     },
                     block: 1,
-                    on_disk_hash: i,
                 },
             ])?;
         }
 
         let ctxs = inner.get_block_contexts(0, 2)?;
-        assert_eq!(ctxs[0].len(), 11);
-        assert_eq!(ctxs[1].len(), 11);
-
-        // "Flush", so only the rows that match the on-disk hash should remain.
-
-        inner.truncate_encryption_contexts_and_hashes(vec![(0, 6), (1, 7)])?;
-
-        let ctxs = inner.get_block_contexts(0, 2)?;
-
         assert_eq!(ctxs[0].len(), 1);
-        assert_eq!(ctxs[0][0].on_disk_hash, 6);
-
         assert_eq!(ctxs[1].len(), 1);
-        assert_eq!(ctxs[1][0].on_disk_hash, 7);
 
         Ok(())
     }
@@ -4171,20 +3621,6 @@ mod test {
 
         region.region_write(&writes, 0, false).await?;
 
-        // read data into File, compare what was written to buffer
-
-        let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        for i in 0..ddef.extent_count() {
-            let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
-
-            read_from_files.append(&mut data);
-        }
-
-        assert_eq!(buffer.len(), read_from_files.len());
-        assert_eq!(buffer, read_from_files);
-
         // read all using region_read
 
         let mut requests: Vec<crucible_protocol::ReadRequest> =
@@ -4208,92 +3644,6 @@ mod test {
 
         assert_eq!(buffer.len(), read_from_region.len());
         assert_eq!(buffer, read_from_region);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_region_open_removes_partial_writes() -> Result<()> {
-        // Opening a dirty extent should fully rehash the extent to remove any
-        // contexts that don't correlate with data on disk. This is necessary
-        // for write_unwritten to work after a crash, and to move us into a
-        // good state for flushes (flushes only clear out contexts for blocks
-        // written since the last flush)
-        //
-        // Specifically, this test checks for the case where we had a brand new
-        // block and a write to that blocks that failed such that only the
-        // write's block context was persisted, leaving the data all zeros. In
-        // this case, there is no data, so we should remove the invalid block
-        // context row.
-
-        let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
-        region.extend(1).await?;
-
-        // A write of some sort only wrote a block context row
-        {
-            let ext = region.get_opened_extent(0).await;
-            let mut inner = ext.inner.lock().await;
-
-            inner.set_block_contexts(&[&DownstairsBlockContext {
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash: 1024,
-                },
-                block: 0,
-                on_disk_hash: 65536,
-            }])?;
-        }
-
-        // This should clear out the invalid contexts
-        for eid in 0..region.extents.len() {
-            region.close_extent(eid).await.unwrap();
-        }
-
-        region.reopen_all_extents().await?;
-
-        // Verify no block context rows exist
-        {
-            let ext = region.get_opened_extent(0).await;
-            let inner = ext.inner.lock().await;
-            assert!(inner.get_block_contexts(0, 1)?[0].is_empty());
-        }
-
-        // Assert write unwritten will write to the first block
-
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-
-        region
-            .region_write(
-                &[crucible_protocol::Write {
-                    eid: 0,
-                    offset: Block::new_512(0),
-                    data,
-                    block_context: BlockContext {
-                        encryption_context: None,
-                        hash,
-                    },
-                }],
-                124,
-                true, // only_write_unwritten
-            )
-            .await?;
-
-        let responses = region
-            .region_read(
-                &[crucible_protocol::ReadRequest {
-                    eid: 0,
-                    offset: Block::new_512(0),
-                }],
-                125,
-            )
-            .await?;
-
-        let response = &responses[0];
-
-        assert_eq!(response.data.to_vec(), vec![0x55; 512]);
 
         Ok(())
     }
@@ -4327,9 +3677,6 @@ mod test {
             };
             ext.write(10, &[&write], false).await?;
         }
-
-        // We haven't flushed, but this should leave our context in place.
-        ext.fully_rehash_and_clean_all_stale_contexts(false).await?;
 
         // Therefore, we expect that write_unwritten to the first block won't
         // do anything.
@@ -4396,78 +3743,6 @@ mod test {
                 vec![ReadResponse {
                     eid: 0,
                     offset: Block::new_512(1),
-                    data: BytesMut::from(data.as_ref()),
-                    block_contexts: vec![block_context]
-                }]
-            );
-        }
-
-        Ok(())
-    }
-
-    /// If a write successfully put a context into the database, but it never
-    /// actually got the data onto the disk, that block should revert back to
-    /// being "unwritten". After all, the data never was truly written.
-    ///
-    /// This test is very similar to test_region_open_removes_partial_writes,
-    /// but is distinct in that it call fully_rehash directly, without closing
-    /// and re-opening the extent.
-    #[tokio::test]
-    async fn test_fully_rehash_marks_blocks_unwritten_if_data_never_hit_disk(
-    ) -> Result<()> {
-        let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
-        region.extend(1).await?;
-
-        let ext = region.get_opened_extent(0).await;
-
-        // Partial write, the data never hits disk, but there's a context
-        // in the DB
-        {
-            let mut inner = ext.inner.lock().await;
-            inner.set_block_contexts(&[&DownstairsBlockContext {
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash: 1024,
-                },
-                block: 0,
-                on_disk_hash: 65536,
-            }])?;
-        }
-
-        // Run a full rehash, which should clear out that partial write.
-        ext.fully_rehash_and_clean_all_stale_contexts(false).await?;
-
-        // Writing to block 0 should succeed with only_write_unwritten
-        {
-            let data = Bytes::from(vec![0x66; 512]);
-            let hash = integrity_hash(&[&data[..]]);
-            let block_context = BlockContext {
-                encryption_context: None,
-                hash,
-            };
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(0),
-                data: data.clone(),
-                block_context: block_context.clone(),
-            };
-            ext.write(30, &[&write], true).await?;
-
-            let mut resp = Vec::new();
-            let read = ReadRequest {
-                eid: 0,
-                offset: Block::new_512(0),
-            };
-            ext.read(31, &[&read], &mut resp).await?;
-
-            // We should get back our data! Block 1 was never written.
-            assert_eq!(
-                resp,
-                vec![ReadResponse {
-                    eid: 0,
-                    offset: Block::new_512(0),
                     data: BytesMut::from(data.as_ref()),
                     block_contexts: vec![block_context]
                 }]
@@ -4750,18 +4025,6 @@ mod test {
 
         region.region_write(&writes, 0, true).await?;
 
-        // read data into File, compare what was written to buffer
-        let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        for i in 0..ddef.extent_count() {
-            let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
-
-            read_from_files.append(&mut data);
-        }
-
-        assert_eq!(buffer, read_from_files);
-
         // read all using region_read
         let mut requests: Vec<crucible_protocol::ReadRequest> =
             Vec::with_capacity(num_blocks);
@@ -4864,18 +4127,6 @@ mod test {
         for a_buf in buffer.iter_mut().take(512) {
             *a_buf = 9;
         }
-
-        // read data into File, compare what was written to buffer
-        let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        for i in 0..ddef.extent_count() {
-            let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
-
-            read_from_files.append(&mut data);
-        }
-
-        assert_eq!(buffer, read_from_files);
 
         // read all using region_read
         let mut requests: Vec<crucible_protocol::ReadRequest> =
@@ -4980,18 +4231,6 @@ mod test {
         for a_buf in buffer.iter_mut().take(1024).skip(512) {
             *a_buf = 9;
         }
-
-        // read data into File, compare what was written to buffer
-        let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        for i in 0..ddef.extent_count() {
-            let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
-
-            read_from_files.append(&mut data);
-        }
-
-        assert_eq!(buffer, read_from_files);
 
         // read all using region_read
         let mut requests: Vec<crucible_protocol::ReadRequest> =

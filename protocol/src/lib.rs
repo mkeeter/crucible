@@ -98,7 +98,7 @@ impl ReadResponse {
          */
         let sz = bs;
         let mut data = BytesMut::with_capacity(sz);
-        data.resize(sz, 1);
+        data.resize(sz, 0);
 
         ReadResponse {
             eid: request.eid,
