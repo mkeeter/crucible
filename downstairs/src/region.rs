@@ -136,9 +136,8 @@ impl Db {
         Ok(dirty_values[0])
     }
 
-    fn set_dirty(&self) -> Result<()> {
-        let _ = self
-            .conn
+    fn set_dirty(tx: &rusqlite::Transaction) -> Result<()> {
+        let _ = tx
             .prepare_cached("UPDATE metadata SET value=1 WHERE name='dirty'")?
             .execute([])?;
         Ok(())
@@ -293,10 +292,8 @@ impl Db {
         &mut self,
         block_contexts: &[&DownstairsBlockContext],
     ) -> Result<()> {
-        self.set_dirty()?;
-
         let tx = self.conn.transaction()?;
-
+        Self::set_dirty(&tx)?;
         for block_context in block_contexts {
             Self::tx_set_block(&tx, block_context, &[])?;
         }
@@ -1066,7 +1063,8 @@ impl Extent {
             }
         }
 
-        inner.set_dirty()?;
+        let tx = inner.conn.transaction()?;
+        Db::set_dirty(&tx)?;
 
         // Write all the metadata to the DB
         // TODO right now we're including the integrity_hash() time in the sqlite time. It's small in
@@ -1074,7 +1072,6 @@ impl Extent {
         cdt::extent__write__sqlite__insert__start!(|| {
             (job_id, self.number, writes.len() as u64)
         });
-        let tx = inner.conn.transaction()?;
         for write in writes {
             if writes_to_skip.contains(&write.offset.value) {
                 debug_assert!(only_write_unwritten);
