@@ -887,6 +887,7 @@ dependencies = [
  "slog-async",
  "slog-dtrace",
  "slog-term",
+ "smallvec",
  "tempfile",
  "tokio",
  "tokio-rustls 0.23.4",

@@ -4862,6 +4862,7 @@ impl EncryptionContext {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         ];
 
+        /*
         let filled = unsafe {
             libc::getrandom(
                 random_iv.as_mut_ptr() as *mut libc::c_void,
@@ -4871,6 +4872,7 @@ impl EncryptionContext {
         };
 
         assert_eq!(filled, 12);
+        */
 
         random_iv
     }
