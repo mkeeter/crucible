@@ -153,13 +153,13 @@ impl Db {
     ///
     /// `iovecs` must be zero-initialized, to support empty blocks
     fn get_blocks(
-        &self,
+        tx: &rusqlite::Transaction,
         block: u64,
         responses: &mut [ReadResponse],
     ) -> Result<()> {
         let stmt = "SELECT block, hash, nonce, tag, data FROM blocks \
              WHERE block BETWEEN ?1 AND ?2";
-        let mut stmt = self.conn.prepare_cached(stmt)?;
+        let mut stmt = tx.prepare_cached(stmt)?;
         let count = responses.len() as u64;
 
         let stmt_iter =
@@ -820,7 +820,8 @@ impl Extent {
             (job_id, self.number, requests.len() as u64)
         });
 
-        let inner = self.db.lock().await;
+        let mut inner = self.db.lock().await;
+        let tx = inner.conn.transaction()?;
 
         // This code batches up operations for contiguous regions of
         // ReadRequests, so we can perform larger read syscalls and sqlite
@@ -867,7 +868,8 @@ impl Extent {
                 (job_id, self.number, n_contiguous_requests as u64)
             });
             // TODO: put this all in a transaction?
-            inner.get_blocks(
+            Db::get_blocks(
+                &tx,
                 first_req.offset.value,
                 &mut responses[resp_run_start..][..n_contiguous_requests],
             )?;
