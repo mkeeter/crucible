@@ -3862,24 +3862,12 @@ impl Downstairs {
         response: &mut ReadResponse,
         log: &Logger,
     ) -> Result<Option<u64>, CrucibleError> {
-        // check integrity hashes - make sure at least one is correct.
-        let mut valid_hash = None;
-
-        if !response.block_contexts.is_empty() {
-            let mut successful_hash = false;
-
+        if let Some(context) = &response.block_contexts {
             let computed_hash = integrity_hash(&[&response.data[..]]);
 
-            // The most recent hash is probably going to be the right one.
-            for context in response.block_contexts.iter().rev() {
-                if computed_hash == context.hash {
-                    successful_hash = true;
-                    valid_hash = Some(context.hash);
-                    break;
-                }
-            }
-
-            if !successful_hash {
+            if computed_hash == context.hash {
+                Ok(Some(context.hash))
+            } else {
                 // No integrity hash was correct for this response
                 error!(log, "No match computed hash:0x{:x}", computed_hash,);
                 for context in response.block_contexts.iter().rev() {
@@ -3890,7 +3878,7 @@ impl Downstairs {
                     error!(log, "[{}]:{}", i, response.data[i]);
                 }
 
-                return Err(CrucibleError::HashMismatch);
+                Err(CrucibleError::HashMismatch)
             }
         } else {
             // No block context(s) in the response!
@@ -3904,9 +3892,8 @@ impl Downstairs {
             //
             // XXX if it's not a blank block, we may be under attack?
             assert!(response.data[..].iter().all(|&x| x == 0));
+            Ok(None)
         }
-
-        Ok(valid_hash)
     }
 
     /// Returns:
@@ -3930,7 +3917,7 @@ impl Downstairs {
         // check that this read response contains block contexts that contain
         // (at least one) encryption context.
 
-        if response.block_contexts.is_empty() {
+        if response.block_contexts.is_none() {
             // No block context(s) in the response!
             //
             // Either this is a read of an unwritten block, or an attacker
@@ -8867,7 +8854,7 @@ impl GtoS {
                         for i in &response.data {
                             vec[offset] = *i;
                             owned_vec[offset] =
-                                !response.block_contexts.is_empty();
+                                response.block_contexts.is_some();
                             offset += 1;
                         }
                     }

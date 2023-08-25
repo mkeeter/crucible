@@ -155,51 +155,44 @@ impl Db {
     fn get_blocks(
         &self,
         block: u64,
-        iovecs: &mut [&mut [u8]],
-    ) -> Result<Vec<Option<DownstairsBlockContext>>> {
+        responses: &mut [ReadResponse],
+    ) -> Result<()> {
         let stmt = "SELECT block, hash, nonce, tag, data FROM blocks \
              WHERE block BETWEEN ?1 AND ?2";
         let mut stmt = self.conn.prepare_cached(stmt)?;
-        let count = iovecs.len() as u64;
+        let count = responses.len() as u64;
 
         let stmt_iter =
             stmt.query_map(params![block, block + count - 1], |row| {
                 let block_index: u64 = row.get(0)?;
+                let index = (block_index - block) as usize;
                 let hash: i64 = row.get(1)?;
                 let nonce: Option<Vec<u8>> = row.get(2)?;
                 let tag: Option<Vec<u8>> = row.get(3)?;
                 if let ValueRef::Blob(s) = row.get_ref(4)? {
-                    let index = (block_index - block) as usize;
-                    iovecs[index].copy_from_slice(s);
+                    responses[index].data.copy_from_slice(s);
                 }
 
-                Ok((block_index, hash, nonce, tag))
-            })?;
+                let encryption_context = if let Some(nonce) = nonce {
+                    tag.map(|tag| EncryptionContext { nonce, tag })
+                } else {
+                    None
+                };
 
-        let mut results = vec![None; count as usize];
-        for row in stmt_iter {
-            let (block_index, hash, nonce, tag) = row?;
-
-            let encryption_context = if let Some(nonce) = nonce {
-                tag.map(|tag| EncryptionContext { nonce, tag })
-            } else {
-                None
-            };
-
-            let ctx = DownstairsBlockContext {
-                block_context: BlockContext {
+                let ctx = BlockContext {
                     hash: hash as u64,
                     encryption_context,
-                },
-                block: block_index,
-            };
+                };
 
-            let index = (ctx.block - block) as usize;
-            assert!(results[index].is_none());
-            results[index] = Some(ctx);
+                assert!(responses[index].block_contexts.is_none());
+                responses[index].block_contexts = Some(ctx);
+                Ok(())
+            })?;
+
+        for row in stmt_iter {
+            row?
         }
-
-        Ok(results)
+        Ok(())
     }
 
     /// For a given block range, return all context rows since the last flush.
@@ -861,7 +854,6 @@ impl Extent {
             // Create our responses and push them into the output. While we're
             // at it, check for overflows.
             let resp_run_start = responses.len();
-            let mut iovecs = Vec::with_capacity(n_contiguous_requests);
             for req in requests[req_run_start..][..n_contiguous_requests].iter()
             {
                 let resp =
@@ -870,36 +862,18 @@ impl Extent {
                 responses.push(resp);
             }
 
-            // Create what amounts to an iovec for each response data buffer.
-            for resp in
-                &mut responses[resp_run_start..][..n_contiguous_requests]
-            {
-                iovecs.push(&mut resp.data[..]);
-            }
-
             // Query the block metadata
             cdt::extent__read__get__contexts__start!(|| {
                 (job_id, self.number, n_contiguous_requests as u64)
             });
-            let block_contexts = inner
-                .get_blocks(first_req.offset.value, iovecs.as_mut_slice())?;
+            // TODO: put this all in a transaction?
+            inner.get_blocks(
+                first_req.offset.value,
+                &mut responses[resp_run_start..][..n_contiguous_requests],
+            )?;
             cdt::extent__read__get__contexts__done!(|| {
                 (job_id, self.number, n_contiguous_requests as u64)
             });
-
-            // Now it's time to put block contexts into the responses.
-            // We use into_iter here to move values out of enc_ctxts/hashes,
-            // avoiding a clone(). For code consistency, we use iters for the
-            // response and data chunks too. These iters will be the same length
-            // (equal to n_contiguous_requests) so zipping is fine
-            let resp_iter =
-                responses[resp_run_start..][..n_contiguous_requests].iter_mut();
-            let ctx_iter = block_contexts.into_iter();
-
-            for (resp, r_ctx) in resp_iter.zip(ctx_iter) {
-                resp.block_contexts =
-                    r_ctx.into_iter().map(|x| x.block_context).collect();
-            }
 
             req_run_start += n_contiguous_requests;
         }

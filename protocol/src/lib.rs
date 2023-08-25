@@ -39,7 +39,7 @@ pub struct ReadResponse {
     pub offset: Block,
 
     pub data: bytes::BytesMut,
-    pub block_contexts: Vec<BlockContext>,
+    pub block_contexts: Option<BlockContext>,
 }
 
 impl ReadResponse {
@@ -104,7 +104,7 @@ impl ReadResponse {
             eid: request.eid,
             offset: request.offset,
             data,
-            block_contexts: vec![],
+            block_contexts: None,
         }
     }
 
@@ -116,10 +116,10 @@ impl ReadResponse {
             eid: request.eid,
             offset: request.offset,
             data: BytesMut::from(data),
-            block_contexts: vec![BlockContext {
+            block_contexts: Some(BlockContext {
                 hash: crucible_common::integrity_hash(&[data]),
                 encryption_context: None,
-            }],
+            }),
         }
     }
 }
@@ -801,6 +801,9 @@ impl Decoder for CrucibleDecoder {
         src.advance(4);
 
         let message = bincode::deserialize_from(src.reader());
+        if message.is_err() {
+            println!("failed to decode {src:x?}");
+        }
 
         Ok(Some(message?))
     }
