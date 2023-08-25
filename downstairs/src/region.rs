@@ -69,9 +69,9 @@ pub enum ExtentState {
 
 impl Inner {
     pub fn gen_number(&self) -> Result<u64> {
-        let mut stmt = self.metadb.prepare_cached(
-            "SELECT value FROM metadata where name='gen_number'",
-        )?;
+        let mut stmt = self
+            .metadb
+            .prepare_cached("SELECT gen_number FROM foobar LIMIT 1")?;
         let gen_number_iter = stmt.query_map([], |row| row.get(0))?;
 
         let mut gen_number_values: Vec<u64> = vec![];
@@ -85,9 +85,9 @@ impl Inner {
     }
 
     pub fn flush_number(&self) -> Result<u64> {
-        let mut stmt = self.metadb.prepare_cached(
-            "SELECT value FROM metadata where name='flush_number'",
-        )?;
+        let mut stmt = self
+            .metadb
+            .prepare_cached("SELECT flush_number FROM foobar LIMIT 1")?;
         let flush_number_iter = stmt.query_map([], |row| row.get(0))?;
 
         let mut flush_number_values: Vec<u64> = vec![];
@@ -105,25 +105,10 @@ impl Inner {
      */
     fn set_flush_number(&self, new_flush: u64, new_gen: u64) -> Result<()> {
         let mut stmt = self.metadb.prepare_cached(
-            "UPDATE metadata SET value=?1 WHERE name='flush_number'",
+            "UPDATE foobar SET flush_number=?1, gen_number=?2, dirty=?3",
         )?;
 
-        let _rows_affected = stmt.execute([new_flush])?;
-
-        let mut stmt = self.metadb.prepare_cached(
-            "UPDATE metadata SET value=?1 WHERE name='gen_number'",
-        )?;
-
-        let _rows_affected = stmt.execute([new_gen])?;
-
-        /*
-         * When we write out the new flush number, the dirty bit should be
-         * set back to false.
-         */
-        let mut stmt = self
-            .metadb
-            .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
-        let _rows_affected = stmt.execute([])?;
+        let _rows_affected = stmt.execute([new_flush, new_gen, 0])?;
 
         Ok(())
     }
@@ -131,7 +116,7 @@ impl Inner {
     pub fn dirty(&self) -> Result<bool> {
         let mut stmt = self
             .metadb
-            .prepare_cached("SELECT value FROM metadata where name='dirty'")?;
+            .prepare_cached("SELECT dirty FROM foobar LIMIT 1")?;
         let dirty_iter = stmt.query_map([], |row| row.get(0))?;
 
         let mut dirty_values: Vec<bool> = vec![];
@@ -147,7 +132,7 @@ impl Inner {
     fn set_dirty(&self) -> Result<()> {
         let _ = self
             .metadb
-            .prepare_cached("UPDATE metadata SET value=1 WHERE name='dirty'")?
+            .prepare_cached("UPDATE foobar SET dirty=1")?
             .execute([])?;
         Ok(())
     }
@@ -766,18 +751,17 @@ impl Extent {
                 (name, value) VALUES (?1, ?2)",
                 params!["ext_version", meta.ext_version],
             )?;
+
             metadb.execute(
-                "INSERT INTO metadata
-                (name, value) VALUES (?1, ?2)",
-                params!["gen_number", meta.gen_number],
+                "CREATE TABLE foobar (
+                    flush_number INTEGER, gen_number INTEGER, dirty INTEGER
+                )",
+                [],
             )?;
             metadb.execute(
-                "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
-                params!["flush_number", meta.flush_number],
-            )?;
-            metadb.execute(
-                "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
-                params!["dirty", meta.dirty],
+                "INSERT INTO foobar
+                (gen_number, flush_number, dirty) VALUES (?1, ?2, ?3)",
+                params![meta.gen_number, meta.flush_number, meta.dirty],
             )?;
 
             // Within an extent, store a context row for each block.
