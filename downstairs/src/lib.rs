@@ -3262,6 +3262,7 @@ pub async fn start_downstairs(
 mod test {
     use super::*;
     use rand_chacha::ChaCha20Rng;
+    use smallvec::smallvec;
     use std::net::Ipv4Addr;
     use tempfile::{tempdir, TempDir};
     use tokio::net::TcpSocket;
@@ -3802,8 +3803,8 @@ mod test {
             block_context: BlockContext {
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext {
-                        nonce: vec![1, 2, 3],
-                        tag: vec![4, 5, 6],
+                        nonce: smallvec![1, 2, 3],
+                        tag: smallvec![4, 5, 6],
                     },
                 ),
                 hash: 4798852240582462654, // Hash for all 9s

@@ -15,6 +15,7 @@ pub(crate) mod up_test {
     use itertools::Itertools;
     use pseudo_file::IOSpan;
     use ringbuffer::RingBuffer;
+    use smallvec::SmallVec;
 
     fn hashset(data: &[u64]) -> HashSet<u64> {
         HashSet::from_iter(data.iter().cloned())
@@ -431,8 +432,8 @@ pub(crate) mod up_test {
                 hash: read_response_hash,
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext {
-                        nonce: nonce.to_vec(),
-                        tag: tag.to_vec(),
+                        nonce: nonce.into_iter().collect(),
+                        tag: tag.into_iter().collect(),
                     },
                 ),
             }],
@@ -490,8 +491,14 @@ pub(crate) mod up_test {
                     hash: thread_rng().gen(),
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: thread_rng().gen::<[u8; 12]>().to_vec(),
-                            tag: thread_rng().gen::<[u8; 16]>().to_vec(),
+                            nonce: thread_rng()
+                                .gen::<[u8; 12]>()
+                                .into_iter()
+                                .collect(),
+                            tag: thread_rng()
+                                .gen::<[u8; 16]>()
+                                .into_iter()
+                                .collect(),
                         },
                     ),
                 },
@@ -500,8 +507,8 @@ pub(crate) mod up_test {
                     hash: read_response_hash,
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: nonce.to_vec(),
-                            tag: tag.to_vec(),
+                            nonce: nonce.into_iter().collect(),
+                            tag: tag.into_iter().collect(),
                         },
                     ),
                 },
@@ -510,8 +517,14 @@ pub(crate) mod up_test {
                     hash: thread_rng().gen(),
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: thread_rng().gen::<[u8; 12]>().to_vec(),
-                            tag: thread_rng().gen::<[u8; 16]>().to_vec(),
+                            nonce: thread_rng()
+                                .gen::<[u8; 12]>()
+                                .into_iter()
+                                .collect(),
+                            tag: thread_rng()
+                                .gen::<[u8; 16]>()
+                                .into_iter()
+                                .collect(),
                         },
                     ),
                 },
@@ -5020,8 +5033,8 @@ pub(crate) mod up_test {
 
         let (nonce, tag, _) = context.encrypt_in_place(&mut data).unwrap();
 
-        let nonce = nonce.to_vec();
-        let mut tag = tag.to_vec();
+        let nonce: SmallVec<_> = nonce.into_iter().collect();
+        let mut tag: SmallVec<_> = tag.into_iter().collect();
 
         // alter tag
         if tag[3] == 0xFF {
@@ -5134,8 +5147,8 @@ pub(crate) mod up_test {
 
         let (nonce, tag, _) = context.encrypt_in_place(&mut data).unwrap();
 
-        let nonce = nonce.to_vec();
-        let tag = tag.to_vec();
+        let nonce: SmallVec<_> = nonce.into_iter().collect();
+        let tag: SmallVec<_> = tag.into_iter().collect();
 
         let response = Ok(vec![ReadResponse {
             eid: request.eid,

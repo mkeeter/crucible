@@ -83,6 +83,7 @@ slog-bunyan = "2.4.0"
 slog-dtrace = "0.2"
 slog-term = { version = "2.9" }
 statistical = "1.0.0"
+smallvec = { version = "1.10", features = ["serde", "union"] }
 subprocess = "0.2.9"
 tempfile = "3"
 test-strategy = "0.3.1"

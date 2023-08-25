@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use anyhow::{anyhow, bail, Result};
 use futures::TryStreamExt;
 use nix::unistd::{sysconf, SysconfVar};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, types::ValueRef, Connection, Transaction};
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -170,11 +170,34 @@ impl Inner {
             stmt.query_map(params![block, block + count - 1], |row| {
                 let block_index: u64 = row.get(0)?;
                 let hash: i64 = row.get(1)?;
-                let nonce: Option<Vec<u8>> = row.get(2)?;
-                let tag: Option<Vec<u8>> = row.get(3)?;
+                let nonce = row.get_ref(2)?;
+                let tag = row.get_ref(3)?;
+                let encryption_context = match (nonce, tag) {
+                    (ValueRef::Null, ValueRef::Null) => None,
+                    (ValueRef::Blob(nonce), ValueRef::Blob(tag)) => {
+                        Some(EncryptionContext {
+                            nonce: nonce.into(),
+                            tag: tag.into(),
+                        })
+                    }
+                    (v, ValueRef::Blob(..)) => {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            2,
+                            "nonce".to_owned(),
+                            v.data_type(),
+                        ));
+                    }
+                    (_, v) => {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            3,
+                            "tag".to_owned(),
+                            v.data_type(),
+                        ));
+                    }
+                };
                 let on_disk_hash: i64 = row.get(4)?;
 
-                Ok((block_index, hash, nonce, tag, on_disk_hash))
+                Ok((block_index, hash, encryption_context, on_disk_hash))
             })?;
 
         let mut results = Vec::with_capacity(count as usize);
@@ -183,13 +206,7 @@ impl Inner {
         }
 
         for row in stmt_iter {
-            let (block_index, hash, nonce, tag, on_disk_hash) = row?;
-
-            let encryption_context = if let Some(nonce) = nonce {
-                tag.map(|tag| EncryptionContext { nonce, tag })
-            } else {
-                None
-            };
+            let (block_index, hash, encryption_context, on_disk_hash) = row?;
 
             let ctx = DownstairsBlockContext {
                 block_context: BlockContext {
@@ -231,8 +248,8 @@ impl Inner {
         let rows_affected = tx.prepare_cached(stmt)?.execute(params![
             block_context.block,
             block_context.block_context.hash as i64,
-            nonce,
-            tag,
+            nonce.map(|s| s.as_slice()),
+            tag.map(|s| s.as_slice()),
             block_context.on_disk_hash as i64,
         ])?;
 
@@ -2803,6 +2820,7 @@ mod test {
 
     use bytes::{BufMut, BytesMut};
     use rand::{Rng, RngCore};
+    use smallvec::smallvec;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -3757,8 +3775,8 @@ mod test {
         inner.set_block_contexts(&[&DownstairsBlockContext {
             block_context: BlockContext {
                 encryption_context: Some(EncryptionContext {
-                    nonce: [1, 2, 3].to_vec(),
-                    tag: [4, 5, 6, 7].to_vec(),
+                    nonce: [1, 2, 3].into_iter().collect(),
+                    tag: [4, 5, 6, 7].into_iter().collect(),
                 }),
                 hash: 123,
             },
@@ -3776,8 +3794,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
-            vec![1, 2, 3]
+                .nonce
+                .as_slice(),
+            &[1, 2, 3]
         );
         assert_eq!(
             ctxs[0]
@@ -3785,8 +3804,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
-            vec![4, 5, 6, 7]
+                .tag
+                .as_slice(),
+            &[4, 5, 6, 7]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
         assert_eq!(ctxs[0].on_disk_hash, 456);
@@ -3803,8 +3823,8 @@ mod test {
         inner.set_block_contexts(&[&DownstairsBlockContext {
             block_context: BlockContext {
                 encryption_context: Some(EncryptionContext {
-                    nonce: blob1.to_vec(),
-                    tag: blob2.to_vec(),
+                    nonce: blob1.into_iter().collect(),
+                    tag: blob2.into_iter().collect(),
                 }),
                 hash: 1024,
             },
@@ -3823,8 +3843,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
-            vec![1, 2, 3]
+                .nonce
+                .as_slice(),
+            &[1, 2, 3]
         );
         assert_eq!(
             ctxs[0]
@@ -3832,8 +3853,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
-            vec![4, 5, 6, 7]
+                .tag
+                .as_slice(),
+            &[4, 5, 6, 7]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
         assert_eq!(ctxs[0].on_disk_hash, 456);
@@ -3845,7 +3867,8 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
+                .nonce
+                .as_slice(),
             blob1
         );
         assert_eq!(
@@ -3854,7 +3877,8 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
+                .tag
+                .as_slice(),
             blob2
         );
         assert_eq!(ctxs[1].block_context.hash, 1024);
@@ -3873,7 +3897,8 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
+                .nonce
+                .as_slice(),
             blob1
         );
         assert_eq!(
@@ -3882,7 +3907,8 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
+                .tag
+                .as_slice(),
             blob2
         );
         assert_eq!(ctxs[0].block_context.hash, 1024);
@@ -3953,8 +3979,8 @@ mod test {
             &DownstairsBlockContext {
                 block_context: BlockContext {
                     encryption_context: Some(EncryptionContext {
-                        nonce: [1, 2, 3].to_vec(),
-                        tag: [4, 5, 6, 7].to_vec(),
+                        nonce: [1, 2, 3].into_iter().collect(),
+                        tag: [4, 5, 6, 7].into_iter().collect(),
                     }),
                     hash: 123,
                 },
@@ -3964,8 +3990,8 @@ mod test {
             &DownstairsBlockContext {
                 block_context: BlockContext {
                     encryption_context: Some(EncryptionContext {
-                        nonce: [4, 5, 6].to_vec(),
-                        tag: [8, 9, 0, 1].to_vec(),
+                        nonce: [4, 5, 6].into_iter().collect(),
+                        tag: [8, 9, 0, 1].into_iter().collect(),
                     }),
                     hash: 9999,
                 },
@@ -3986,8 +4012,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
-            vec![1, 2, 3]
+                .nonce
+                .as_slice(),
+            &[1, 2, 3]
         );
         assert_eq!(
             ctxs[0]
@@ -3995,8 +4022,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
-            vec![4, 5, 6, 7]
+                .tag
+                .as_slice(),
+            &[4, 5, 6, 7]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
         assert_eq!(ctxs[0].on_disk_hash, 456);
@@ -4013,8 +4041,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
-            vec![4, 5, 6]
+                .nonce
+                .as_slice(),
+            &[4, 5, 6]
         );
         assert_eq!(
             ctxs[0]
@@ -4022,8 +4051,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
-            vec![8, 9, 0, 1]
+                .tag
+                .as_slice(),
+            &[8, 9, 0, 1]
         );
         assert_eq!(ctxs[0].block_context.hash, 9999);
         assert_eq!(ctxs[0].on_disk_hash, 1234567890);
@@ -4039,8 +4069,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
-            vec![1, 2, 3]
+                .nonce
+                .as_slice(),
+            &[1, 2, 3]
         );
         assert_eq!(
             ctxs[0][0]
@@ -4048,8 +4079,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
-            vec![4, 5, 6, 7]
+                .tag
+                .as_slice(),
+            &[4, 5, 6, 7]
         );
         assert_eq!(ctxs[0][0].block_context.hash, 123);
         assert_eq!(ctxs[0][0].on_disk_hash, 456);
@@ -4061,8 +4093,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .nonce,
-            vec![4, 5, 6]
+                .nonce
+                .as_slice(),
+            &[4, 5, 6]
         );
         assert_eq!(
             ctxs[1][0]
@@ -4070,8 +4103,9 @@ mod test {
                 .encryption_context
                 .as_ref()
                 .unwrap()
-                .tag,
-            vec![8, 9, 0, 1]
+                .tag
+                .as_slice(),
+            &[8, 9, 0, 1]
         );
         assert_eq!(ctxs[1][0].block_context.hash, 9999);
         assert_eq!(ctxs[1][0].on_disk_hash, 1234567890);
@@ -4085,8 +4119,12 @@ mod test {
                         encryption_context: Some(EncryptionContext {
                             nonce: rand::thread_rng()
                                 .gen::<[u8; 32]>()
-                                .to_vec(),
-                            tag: rand::thread_rng().gen::<[u8; 32]>().to_vec(),
+                                .into_iter()
+                                .collect(),
+                            tag: rand::thread_rng()
+                                .gen::<[u8; 32]>()
+                                .into_iter()
+                                .collect(),
                         }),
                         hash: rand::thread_rng().gen::<u64>(),
                     },
@@ -4098,8 +4136,12 @@ mod test {
                         encryption_context: Some(EncryptionContext {
                             nonce: rand::thread_rng()
                                 .gen::<[u8; 32]>()
-                                .to_vec(),
-                            tag: rand::thread_rng().gen::<[u8; 32]>().to_vec(),
+                                .into_iter()
+                                .collect(),
+                            tag: rand::thread_rng()
+                                .gen::<[u8; 32]>()
+                                .into_iter()
+                                .collect(),
                         }),
                         hash: rand::thread_rng().gen::<u64>(),
                     },
@@ -4494,8 +4536,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 5061083712412462836,
@@ -4529,8 +4571,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9's
@@ -4578,8 +4620,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9's
@@ -4598,8 +4640,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 5061083712412462836, // hash for all 1s
@@ -4647,8 +4689,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s
@@ -4676,8 +4718,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 5061083712412462836, // hash for all 1s
@@ -4817,8 +4859,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s
@@ -4932,8 +4974,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s,
@@ -5051,8 +5093,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s
@@ -5160,8 +5202,8 @@ mod test {
                     block_context: BlockContext {
                         encryption_context: Some(
                             crucible_protocol::EncryptionContext {
-                                nonce: vec![1, 2, 3],
-                                tag: vec![4, 5, 6],
+                                nonce: smallvec![1, 2, 3],
+                                tag: smallvec![4, 5, 6],
                             },
                         ),
                         hash: 4798852240582462654, // Hash for all 9s
@@ -5253,8 +5295,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s
@@ -5413,8 +5455,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s
@@ -5464,8 +5506,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 4798852240582462654, // Hash for all 9s
@@ -5699,8 +5741,8 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: smallvec![1, 2, 3],
+                            tag: smallvec![4, 5, 6],
                         },
                     ),
                     hash: 2398419238764,

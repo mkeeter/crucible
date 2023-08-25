@@ -6,6 +6,7 @@ use anyhow::bail;
 use bytes::{Buf, BufMut, BytesMut};
 use num_enum::IntoPrimitive;
 use serde::{Deserialize, Serialize};
+use smallvec::{smallvec, SmallVec};
 use tokio_util::codec::{Decoder, Encoder};
 use uuid::Uuid;
 
@@ -84,8 +85,8 @@ pub struct BlockContext {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct EncryptionContext {
-    pub nonce: Vec<u8>,
-    pub tag: Vec<u8>,
+    pub nonce: SmallVec<[u8; 12]>,
+    pub tag: SmallVec<[u8; 16]>,
 }
 
 impl ReadResponse {
@@ -585,8 +586,8 @@ impl CrucibleEncoder {
             block_context: BlockContext {
                 hash: 0,
                 encryption_context: Some(EncryptionContext {
-                    nonce: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    tag: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    nonce: smallvec![0; 12],
+                    tag: smallvec![0; 16],
                 }),
             },
         }

@@ -12,5 +12,6 @@ bytes.workspace = true
 crucible-common.workspace = true
 num_enum.workspace = true
 serde.workspace = true
+smallvec.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true

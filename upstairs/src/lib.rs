@@ -6018,8 +6018,8 @@ impl Upstairs {
                 (
                     Bytes::copy_from_slice(&mut_data),
                     Some(crucible_protocol::EncryptionContext {
-                        nonce: Vec::from(nonce.as_slice()),
-                        tag: Vec::from(tag.as_slice()),
+                        nonce: nonce.as_slice().into(),
+                        tag: tag.as_slice().into(),
                     }),
                     hash,
                 )
