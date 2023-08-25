@@ -167,17 +167,23 @@ impl Db {
                 let block_index: u64 = row.get(0)?;
                 let index = (block_index - block) as usize;
                 let hash: i64 = row.get(1)?;
-                let nonce: Option<Vec<u8>> = row.get(2)?;
-                let tag: Option<Vec<u8>> = row.get(3)?;
+
+                let nonce: ValueRef = row.get_ref(2)?;
+                let tag: ValueRef = row.get_ref(3)?;
+                let encryption_context = match (nonce, tag) {
+                    (ValueRef::Null, ValueRef::Null) => None,
+                    (ValueRef::Blob(nonce), ValueRef::Blob(tag)) => {
+                        Some(EncryptionContext {
+                            nonce: nonce.into(),
+                            tag: tag.into(),
+                        })
+                    }
+                    _ => panic!("invalid type"), // TODO
+                };
+
                 if let ValueRef::Blob(s) = row.get_ref(4)? {
                     responses[index].data.copy_from_slice(s);
                 }
-
-                let encryption_context = if let Some(nonce) = nonce {
-                    tag.map(|tag| EncryptionContext { nonce, tag })
-                } else {
-                    None
-                };
 
                 let ctx = BlockContext {
                     hash: hash as u64,
@@ -209,37 +215,41 @@ impl Db {
              WHERE block BETWEEN ?1 AND ?2";
         let mut stmt = self.conn.prepare_cached(stmt)?;
 
+        let mut results = vec![None; count as usize];
         let stmt_iter =
             stmt.query_map(params![block, block + count - 1], |row| {
                 let block_index: u64 = row.get(0)?;
+                let index = (block_index - block) as usize;
                 let hash: i64 = row.get(1)?;
-                let nonce: Option<Vec<u8>> = row.get(2)?;
-                let tag: Option<Vec<u8>> = row.get(3)?;
 
-                Ok((block_index, hash, nonce, tag))
+                let nonce: ValueRef = row.get_ref(2)?;
+                let tag: ValueRef = row.get_ref(3)?;
+                let encryption_context = match (nonce, tag) {
+                    (ValueRef::Null, ValueRef::Null) => None,
+                    (ValueRef::Blob(nonce), ValueRef::Blob(tag)) => {
+                        Some(EncryptionContext {
+                            nonce: nonce.into(),
+                            tag: tag.into(),
+                        })
+                    }
+                    _ => panic!("invalid type"), // TODO
+                };
+
+                let ctx = DownstairsBlockContext {
+                    block_context: BlockContext {
+                        hash: hash as u64,
+                        encryption_context,
+                    },
+                    block: block_index,
+                };
+
+                assert!(results[index].is_none());
+                results[index] = Some(ctx);
+                Ok(())
             })?;
 
-        let mut results = vec![None; count as usize];
         for row in stmt_iter {
-            let (block_index, hash, nonce, tag) = row?;
-
-            let encryption_context = if let Some(nonce) = nonce {
-                tag.map(|tag| EncryptionContext { nonce, tag })
-            } else {
-                None
-            };
-
-            let ctx = DownstairsBlockContext {
-                block_context: BlockContext {
-                    hash: hash as u64,
-                    encryption_context,
-                },
-                block: block_index,
-            };
-
-            let index = (ctx.block - block) as usize;
-            assert!(results[index].is_none());
-            results[index] = Some(ctx);
+            row?
         }
 
         Ok(results)
@@ -270,8 +280,8 @@ impl Db {
         let rows_affected = tx.prepare_cached(stmt)?.execute(params![
             block_context.block,
             block_context.block_context.hash as i64,
-            nonce,
-            tag,
+            nonce.as_ref().map(|s| s.as_slice()),
+            tag.as_ref().map(|s| s.as_slice()),
             data,
         ])?;
 

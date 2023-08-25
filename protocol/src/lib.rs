@@ -84,8 +84,8 @@ pub struct BlockContext {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct EncryptionContext {
-    pub nonce: Vec<u8>,
-    pub tag: Vec<u8>,
+    pub nonce: smallvec::SmallVec<[u8; 12]>,
+    pub tag: smallvec::SmallVec<[u8; 16]>,
 }
 
 impl ReadResponse {
@@ -585,8 +585,12 @@ impl CrucibleEncoder {
             block_context: BlockContext {
                 hash: 0,
                 encryption_context: Some(EncryptionContext {
-                    nonce: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    tag: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    nonce: smallvec::smallvec![
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                    ],
+                    tag: smallvec::smallvec![
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                    ],
                 }),
             },
         }

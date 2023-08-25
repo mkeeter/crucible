@@ -6005,8 +6005,8 @@ impl Upstairs {
                 (
                     Bytes::copy_from_slice(&mut_data),
                     Some(crucible_protocol::EncryptionContext {
-                        nonce: Vec::from(nonce.as_slice()),
-                        tag: Vec::from(tag.as_slice()),
+                        nonce: smallvec::SmallVec::from(nonce.as_slice()),
+                        tag: smallvec::SmallVec::from(tag.as_slice()),
                     }),
                     hash,
                 )
