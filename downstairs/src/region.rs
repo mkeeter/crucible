@@ -95,27 +95,31 @@ impl Db {
     /*
      * The flush and generation numbers will be updated at the same time.
      */
-    fn set_flush_number(&self, new_flush: u64, new_gen: u64) -> Result<()> {
-        let mut stmt = self.conn.prepare_cached(
-            "UPDATE metadata SET value=?1 WHERE name='flush_number'",
-        )?;
+    fn set_flush_number(&mut self, new_flush: u64, new_gen: u64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE metadata SET value=?1 WHERE name='flush_number'",
+            )?;
 
-        let _rows_affected = stmt.execute([new_flush])?;
+            let _rows_affected = stmt.execute([new_flush])?;
 
-        let mut stmt = self.conn.prepare_cached(
-            "UPDATE metadata SET value=?1 WHERE name='gen_number'",
-        )?;
+            let mut stmt = tx.prepare_cached(
+                "UPDATE metadata SET value=?1 WHERE name='gen_number'",
+            )?;
 
-        let _rows_affected = stmt.execute([new_gen])?;
+            let _rows_affected = stmt.execute([new_gen])?;
 
-        /*
-         * When we write out the new flush number, the dirty bit should be
-         * set back to false.
-         */
-        let mut stmt = self
-            .conn
-            .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
-        let _rows_affected = stmt.execute([])?;
+            /*
+             * When we write out the new flush number, the dirty bit should be
+             * set back to false.
+             */
+            let mut stmt = tx.prepare_cached(
+                "UPDATE metadata SET value=0 WHERE name='dirty'",
+            )?;
+            let _rows_affected = stmt.execute([])?;
+        }
+        tx.commit()?;
 
         Ok(())
     }
@@ -1109,7 +1113,7 @@ impl Extent {
         job_id: u64,
         log: &Logger,
     ) -> Result<(), CrucibleError> {
-        let inner = self.db.lock().await;
+        let mut inner = self.db.lock().await;
         if !inner.dirty()? {
             /*
              * If we have made no writes to this extent since the last flush,
