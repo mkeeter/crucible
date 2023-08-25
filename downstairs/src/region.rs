@@ -157,7 +157,7 @@ impl Db {
         block: u64,
         responses: &mut [ReadResponse],
     ) -> Result<()> {
-        let stmt = "SELECT block, hash, nonce, tag, data FROM blocks \
+        let stmt = "SELECT block, hash, nonce, tag FROM block_context \
              WHERE block BETWEEN ?1 AND ?2";
         let mut stmt = tx.prepare_cached(stmt)?;
         let count = responses.len() as u64;
@@ -180,10 +180,14 @@ impl Db {
                     }
                     _ => panic!("invalid type"), // TODO
                 };
-
-                if let ValueRef::Blob(s) = row.get_ref(4)? {
-                    responses[index].data.copy_from_slice(s);
-                }
+                let mut blob = tx.blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "blocks",
+                    "data",
+                    block_index as i64,
+                    false,
+                )?;
+                blob.read_exact(responses[index].data.as_mut()).unwrap();
 
                 let ctx = BlockContext {
                     hash: hash as u64,
@@ -211,7 +215,7 @@ impl Db {
         block: u64,
         count: u64,
     ) -> Result<Vec<Option<DownstairsBlockContext>>> {
-        let stmt = "SELECT block, hash, nonce, tag FROM blocks \
+        let stmt = "SELECT block, hash, nonce, tag FROM block_context \
              WHERE block BETWEEN ?1 AND ?2";
         let mut stmt = self.conn.prepare_cached(stmt)?;
 
@@ -263,8 +267,8 @@ impl Db {
         block_context: &DownstairsBlockContext,
         data: &[u8],
     ) -> Result<()> {
-        let stmt = "REPLACE INTO blocks (block, hash, nonce, tag, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5)";
+        let stmt = "REPLACE INTO block_context (block, hash, nonce, tag) \
+             VALUES (?1, ?2, ?3, ?4)";
 
         let (nonce, tag) = if let Some(encryption_context) =
             &block_context.block_context.encryption_context
@@ -282,11 +286,27 @@ impl Db {
             block_context.block_context.hash as i64,
             nonce.as_ref().map(|s| s.as_slice()),
             tag.as_ref().map(|s| s.as_slice()),
-            data,
         ])?;
-
         // We avoid INSERTing duplicate rows, so this should always be 0 or 1.
         assert!(rows_affected <= 1);
+
+        // This table is configured to ignore incoming data on conflicts, so
+        // this is cheap!
+        let stmt = "INSERT INTO blocks (block, data) \
+             VALUES (?1, ZEROBLOB(?2))";
+        let rows_affected = tx
+            .prepare_cached(stmt)?
+            .execute(params![block_context.block, data.len()])?;
+        assert!(rows_affected <= 1);
+
+        let mut blob = tx.blob_open(
+            rusqlite::DatabaseName::Main,
+            "blocks",
+            "data",
+            block_context.block as i64,
+            false,
+        )?;
+        blob.write_all_at(data, 0)?;
 
         Ok(())
     }
@@ -729,11 +749,19 @@ impl Extent {
             // we're storing both the metadata and actual data BLOB in the
             // database.
             conn.execute(
-                "CREATE TABLE blocks (
+                "CREATE TABLE block_context (
                     block INTEGER PRIMARY KEY,
                     hash INTEGER,
                     nonce BLOB,
-                    tag BLOB,
+                    tag BLOB
+                )",
+                [],
+            )?;
+
+            // We only modify the blobs table through the blob API
+            conn.execute(
+                "CREATE TABLE blocks (
+                    block INTEGER PRIMARY KEY ON CONFLICT IGNORE,
                     data BLOB
                 )",
                 [],
