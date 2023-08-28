@@ -504,7 +504,7 @@ fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
 
     assert!(conn.is_autocommit());
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
 
     // 16 page * 4KiB page size = 64KiB cache size
     // Value chosen somewhat arbitrarily as a guess at a good starting point.
@@ -1134,13 +1134,6 @@ impl Extent {
 
         // XXX I think this is the only thing that actually needs to happen
         inner.set_flush_number(new_flush, new_gen)?;
-        inner
-            .conn
-            .execute("PRAGMA wal_checkpoint(FULL);", [])
-            .or_else(|e| match e {
-                rusqlite::Error::ExecuteReturnedResults => Ok(0),
-                _ => Err(e),
-            })?;
 
         cdt::extent__flush__done!(|| { (job_id, self.number,) });
 
