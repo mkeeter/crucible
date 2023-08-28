@@ -1355,8 +1355,6 @@ impl Extent {
             (job_id, self.number, n_dirty_blocks)
         });
 
-        let dirty_blocks = std::mem::take(&mut inner.dirty_blocks);
-
         // Clear old block contexts. In order to be crash consistent, only
         // perform this after the extent fsync is done. For each block
         // written since the last flush, remove all block context rows where
@@ -1382,7 +1380,7 @@ impl Extent {
         let tx = inner.metadb.unchecked_transaction()?;
 
         inner.truncate_encryption_contexts_and_hashes_with_tx(
-            dirty_blocks.into_iter(),
+            inner.dirty_blocks.iter().map(|v| (*v.0, *v.1)),
             &tx,
         )?;
 
@@ -1392,6 +1390,9 @@ impl Extent {
 
         inner.set_flush_number(new_flush, new_gen)?;
         tx.commit()?;
+
+        // We've now flushed all of the dirty blocks, so remove our local list
+        inner.dirty_blocks.clear();
 
         // Finally, reset the file's seek offset to 0
         inner.file.seek(SeekFrom::Start(0))?;
