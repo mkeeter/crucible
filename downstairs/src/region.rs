@@ -1355,22 +1355,6 @@ impl Extent {
             (job_id, self.number, n_dirty_blocks)
         });
 
-        // Clear old block contexts. In order to be crash consistent, only
-        // perform this after the extent fsync is done. For each block
-        // written since the last flush, remove all block context rows where
-        // the integrity hash does not map the last-written value. This is
-        // safe, because we know the process has not crashed since those
-        // values were written. When the region is first opened, the entire
-        // file is rehashed, since in that case we don't have that luxury.
-
-        cdt::extent__flush__collect__hashes__start!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
-        cdt::extent__flush__collect__hashes__done!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
         cdt::extent__flush__sqlite__insert__start!(|| {
             (job_id, self.number, n_dirty_blocks)
         });
@@ -1379,6 +1363,13 @@ impl Extent {
         // assure that we have a single sync.
         let tx = inner.metadb.unchecked_transaction()?;
 
+        // Clear old block contexts. In order to be crash consistent, only
+        // perform this after the extent fsync is done. For each block
+        // written since the last flush, remove all block context rows where
+        // the integrity hash does not map the last-written value. This is
+        // safe, because we know the process has not crashed since those
+        // values were written. When the region is first opened, the entire
+        // file is rehashed, since in that case we don't have that luxury.
         inner.truncate_encryption_contexts_and_hashes_with_tx(
             inner.dirty_blocks.iter().map(|v| (*v.0, *v.1)),
             &tx,
