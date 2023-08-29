@@ -1,6 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 use std::fs::{rename, File, OpenOptions};
@@ -59,7 +59,7 @@ pub struct Inner {
     ///
     /// If the hash is known, then it's also recorded here.  It _should_ always
     /// be known, unless the write failed.
-    dirty_blocks: BTreeMap<usize, Option<u64>>,
+    dirty_blocks: HashMap<usize, Option<u64>>,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -271,8 +271,7 @@ impl Inner {
     /// unadorned variant should be called instead.
     fn truncate_encryption_contexts_and_hashes_with_tx(
         &self,
-        extent_block_indexes_and_hashes: impl Iterator<Item = (usize, u64)>
-            + ExactSizeIterator,
+        extent_block_indexes_and_hashes: Vec<(usize, u64)>,
         tx: &Transaction,
     ) -> Result<()> {
         let n_blocks = extent_block_indexes_and_hashes.len();
@@ -298,8 +297,7 @@ impl Inner {
     /// that calls it from within a transaction.
     fn truncate_encryption_contexts_and_hashes(
         &self,
-        extent_block_indexes_and_hashes: impl Iterator<Item = (usize, u64)>
-            + ExactSizeIterator,
+        extent_block_indexes_and_hashes: Vec<(usize, u64)>,
     ) -> Result<()> {
         let tx = self.metadb.unchecked_transaction()?;
 
@@ -321,20 +319,27 @@ impl Inner {
     ///
     /// Returns the number of blocks that needed to be rehashed.
     #[allow(clippy::read_zero_byte_vec)] // see rust-clippy#9274
-    fn rehash_dirty_blocks(&mut self, block_size: u64) -> Result<usize> {
-        let mut buffer = vec![]; // resized lazily if needed
-        let mut out = 0;
-        for (block, hash) in self.dirty_blocks.iter_mut() {
-            if hash.is_none() {
-                buffer.resize(block_size as usize, 0u8);
-                self.file
-                    .seek(SeekFrom::Start(*block as u64 * block_size))?;
-                self.file.read_exact(&mut buffer)?;
-                *hash = Some(integrity_hash(&[&buffer]));
-                out += 1;
-            }
-        }
-        Ok(out)
+    fn rehash_dirty_blocks(
+        &mut self,
+        block_size: u64,
+    ) -> Result<(Vec<(usize, u64)>, usize)> {
+        let mut buffer = vec![];
+        let mut n_rehashed = 0;
+        let dirty_blocks: Vec<(usize, u64)> = self
+            .dirty_blocks
+            .drain()
+            .map(|(block, hash)| {
+                hash.map(|v| Ok((block, v))).unwrap_or_else(|| {
+                    buffer.resize(block_size as usize, 0u8);
+                    self.file
+                        .seek(SeekFrom::Start(block as u64 * block_size))?;
+                    self.file.read_exact(&mut buffer)?;
+                    n_rehashed += 1;
+                    Ok((block, integrity_hash(&[&buffer])))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((dirty_blocks, n_rehashed))
     }
 }
 
@@ -691,7 +696,7 @@ impl Extent {
             inner: Mutex::new(Inner {
                 file,
                 metadb,
-                dirty_blocks: BTreeMap::new(),
+                dirty_blocks: HashMap::new(),
             }),
         };
 
@@ -884,7 +889,7 @@ impl Extent {
             inner: Mutex::new(Inner {
                 file,
                 metadb,
-                dirty_blocks: BTreeMap::new(),
+                dirty_blocks: HashMap::new(),
             }),
         })
     }
@@ -1411,7 +1416,20 @@ impl Extent {
         // Rehash any parts of the file that we *may have written* data to since
         // the last flush.  (If we know that we wrote the data, then we don't
         // bother rehashing)
-        let n_rehashed = inner.rehash_dirty_blocks(self.block_size)?;
+        let (mut dirty_blocks, n_rehashed) =
+            inner.rehash_dirty_blocks(self.block_size)?;
+
+        // Sorting here is extremely important to get good performance out of
+        // truncate_encryption_contexts_and_hashes() later.
+        dirty_blocks.sort_unstable();
+
+        // We could shrink this to 0, but it's nice not to have to expand the
+        // dirty_blocks HashMap on small writes. They have a hard enough time
+        // as it is. We don't want our maps to be keeping a lot of memory
+        // allocated though. With 16 entries max, even a 32TiB region of
+        // 128MiB extents would only be spending ~64MiB of ram on on this,
+        // across the entire region. There's potential for tuning here.
+        inner.dirty_blocks.shrink_to(16);
 
         cdt::extent__flush__collect__hashes__done!(|| {
             (job_id, self.number, n_rehashed as u64)
@@ -1426,10 +1444,7 @@ impl Extent {
         let tx = inner.metadb.unchecked_transaction()?;
 
         inner.truncate_encryption_contexts_and_hashes_with_tx(
-            inner
-                .dirty_blocks
-                .iter()
-                .map(|(block, hash)| (*block, hash.unwrap())),
+            dirty_blocks,
             &tx,
         )?;
 
@@ -1504,7 +1519,7 @@ impl Extent {
         drop(inner_file_buffered);
 
         inner.truncate_encryption_contexts_and_hashes(
-            extent_block_indexes_and_hashes.into_iter(),
+            extent_block_indexes_and_hashes,
         )?;
 
         // Intentionally not clearing the dirty flag - we want to know that the
@@ -2789,7 +2804,7 @@ mod test {
         let inn = Inner {
             file: ff,
             metadb: Connection::open_in_memory().unwrap(),
-            dirty_blocks: BTreeMap::new(),
+            dirty_blocks: HashMap::new(),
         };
 
         /*
@@ -3830,9 +3845,7 @@ mod test {
         assert_eq!(ctxs[1].on_disk_hash, 65536);
 
         // "Flush", so only the rows that match should remain.
-        inner.truncate_encryption_contexts_and_hashes(
-            vec![(0, 65536)].into_iter(),
-        )?;
+        inner.truncate_encryption_contexts_and_hashes(vec![(0, 65536)])?;
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
 
@@ -3895,9 +3908,7 @@ mod test {
 
         // Truncation should still work
 
-        inner.truncate_encryption_contexts_and_hashes(
-            vec![(0, 123)].into_iter(),
-        )?;
+        inner.truncate_encryption_contexts_and_hashes(vec![(0, 123)])?;
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
         assert_eq!(ctxs.len(), 1);
@@ -4088,9 +4099,7 @@ mod test {
 
         // "Flush", so only the rows that match the on-disk hash should remain.
 
-        inner.truncate_encryption_contexts_and_hashes(
-            vec![(0, 6), (1, 7)].into_iter(),
-        )?;
+        inner.truncate_encryption_contexts_and_hashes(vec![(0, 6), (1, 7)])?;
 
         let ctxs = inner.get_block_contexts(0, 2)?;
 
