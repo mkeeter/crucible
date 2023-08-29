@@ -57,9 +57,9 @@ pub struct Inner {
 
     /// Set of blocks that have been written since last flush.
     ///
-    /// If the hash is known, then it's also recorded here.  It _should_ always
-    /// be known, unless the write failed.
-    dirty_blocks: BTreeMap<usize, Option<u64>>,
+    /// We also record a tentative hash (as a `u64`) and a flag indicating
+    /// whether it was written.
+    dirty_blocks: BTreeMap<usize, (u64, bool)>,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -324,13 +324,14 @@ impl Inner {
     fn rehash_dirty_blocks(&mut self, block_size: u64) -> Result<usize> {
         let mut buffer = vec![]; // resized lazily if needed
         let mut out = 0;
-        for (block, hash) in self.dirty_blocks.iter_mut() {
-            if hash.is_none() {
+        for (block, (hash, written)) in self.dirty_blocks.iter_mut() {
+            if !*written {
                 buffer.resize(block_size as usize, 0u8);
                 self.file
                     .seek(SeekFrom::Start(*block as u64 * block_size))?;
                 self.file.read_exact(&mut buffer)?;
-                *hash = Some(integrity_hash(&[&buffer]));
+                *hash = integrity_hash(&[&buffer]);
+                *written = true;
                 out += 1;
             }
         }
@@ -1232,10 +1233,8 @@ impl Extent {
             (job_id, self.number, writes.len() as u64)
         });
 
-        let mut hashes_to_write = vec![];
         for write in writes {
             if writes_to_skip.contains(&write.offset.value) {
-                hashes_to_write.push(None);
                 continue;
             }
 
@@ -1261,8 +1260,9 @@ impl Extent {
             // lets us easily test specific edge-cases of the database state.
             // Could make another function that wraps tx_set_block_context
             // and handles this as well.
-            inner.dirty_blocks.insert(write.offset.value as usize, None);
-            hashes_to_write.push(Some(on_disk_hash));
+            inner
+                .dirty_blocks
+                .insert(write.offset.value as usize, (on_disk_hash, false));
         }
         tx.commit()?;
 
@@ -1320,14 +1320,12 @@ impl Extent {
         // must match the integrity hashes calculated above (and stored to
         // SQLite).  We can therefore store pre-computed hash values for these
         // dirty blocks, allowing us to skip rehashing during a flush operation.
-        for (write, hash) in writes.iter().zip(&hashes_to_write) {
-            if let Some(h) = hash {
-                // This overwrites the `None` value written above!
-                let prev = inner
-                    .dirty_blocks
-                    .insert(write.offset.value as usize, Some(*h));
-                assert_eq!(prev, Some(None));
-            }
+        for write in writes.iter() {
+            inner
+                .dirty_blocks
+                .get_mut(&(write.offset.value as usize))
+                .unwrap()
+                .1 = true;
         }
 
         cdt::extent__write__file__done!(|| {
@@ -1429,7 +1427,7 @@ impl Extent {
             inner
                 .dirty_blocks
                 .iter()
-                .map(|(block, hash)| (*block, hash.unwrap())),
+                .map(|(block, (hash, _b))| (*block, *hash)),
             &tx,
         )?;
 
