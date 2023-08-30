@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use anyhow::{anyhow, bail, Result};
 use futures::TryStreamExt;
 use nix::unistd::{sysconf, SysconfVar};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -60,6 +60,17 @@ pub struct Inner {
     /// If the hash is known, then it's also recorded here.  It _should_ always
     /// be known, unless the write failed.
     dirty_blocks: BTreeMap<usize, Option<u64>>,
+
+    /// Marks whether we need to perform SQLite cleanup.
+    ///
+    /// This is `true` if `dirty_blocks` represents the on-disk state (i.e. we
+    /// have flushed recently), but we have not yet performed `sqlite_cleanup`
+    /// (because we wanted to return quickly from a flush).
+    ///
+    /// If this is true, we must run `truncate_encryption_contexts_and_hashes`
+    /// before `dirty_blocks` is modified further, because it's currently
+    /// representative of the on-disk state.
+    needs_sqlite_cleanup: bool,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -266,15 +277,13 @@ impl Inner {
     /// Get rid of all block context rows except those that match the on-disk
     /// hash that is computed after a flush. For best performance, make sure
     /// `extent_block_indexes_and_hashes` is sorted by block number before
-    /// calling this function.  Note that this takes an open transaction as
-    /// a parameter; if a caller does not have an open transaction, the
-    /// unadorned variant should be called instead.
-    fn truncate_encryption_contexts_and_hashes_with_tx(
+    /// calling this function.
+    fn truncate_encryption_contexts_and_hashes(
         &self,
         extent_block_indexes_and_hashes: impl Iterator<Item = (usize, u64)>
             + ExactSizeIterator,
-        tx: &Transaction,
     ) -> Result<()> {
+        let tx = self.metadb.unchecked_transaction()?;
         let n_blocks = extent_block_indexes_and_hashes.len();
         cdt::extent__context__truncate__start!(|| n_blocks as u64);
 
@@ -290,24 +299,6 @@ impl Inner {
         }
 
         cdt::extent__context__truncate__done!(|| ());
-
-        Ok(())
-    }
-
-    /// A wrapper around ['truncate_encryption_contexts_and_hashes_with_tx']
-    /// that calls it from within a transaction.
-    fn truncate_encryption_contexts_and_hashes(
-        &self,
-        extent_block_indexes_and_hashes: impl Iterator<Item = (usize, u64)>
-            + ExactSizeIterator,
-    ) -> Result<()> {
-        let tx = self.metadb.unchecked_transaction()?;
-
-        self.truncate_encryption_contexts_and_hashes_with_tx(
-            extent_block_indexes_and_hashes,
-            &tx,
-        )?;
-
         tx.commit()?;
 
         Ok(())
@@ -335,6 +326,19 @@ impl Inner {
             }
         }
         Ok(out)
+    }
+
+    fn sqlite_cleanup(&mut self) -> Result<()> {
+        if self.needs_sqlite_cleanup {
+            self.truncate_encryption_contexts_and_hashes(
+                self.dirty_blocks
+                    .iter()
+                    .map(|(block, hash)| (*block, hash.unwrap())),
+            )?;
+            self.dirty_blocks.clear();
+            self.needs_sqlite_cleanup = false;
+        }
+        Ok(())
     }
 }
 
@@ -692,6 +696,7 @@ impl Extent {
                 file,
                 metadb,
                 dirty_blocks: BTreeMap::new(),
+                needs_sqlite_cleanup: false,
             }),
         };
 
@@ -885,6 +890,7 @@ impl Extent {
                 file,
                 metadb,
                 dirty_blocks: BTreeMap::new(),
+                needs_sqlite_cleanup: false,
             }),
         })
     }
@@ -1115,6 +1121,8 @@ impl Extent {
         // borrow-checker do its job.
         let inner = &mut *inner_guard;
 
+        inner.sqlite_cleanup()?;
+
         for write in writes {
             self.check_input(write.offset, &write.data)?;
         }
@@ -1343,7 +1351,7 @@ impl Extent {
 
     #[instrument]
     pub async fn flush(
-        &self,
+        self: Arc<Self>,
         new_flush: u64,
         new_gen: u64,
         job_id: u64,
@@ -1358,6 +1366,9 @@ impl Extent {
              */
             return Ok(());
         }
+
+        // Perform SQLite cleanup if necessary
+        inner.sqlite_cleanup()?;
 
         // Read only extents should never have the dirty bit set. If they do,
         // bail
@@ -1411,38 +1422,28 @@ impl Extent {
         // Rehash any parts of the file that we *may have written* data to since
         // the last flush.  (If we know that we wrote the data, then we don't
         // bother rehashing)
+        //
+        // TODO: move this to `sqlite_cleanup` as well?
         let n_rehashed = inner.rehash_dirty_blocks(self.block_size)?;
 
         cdt::extent__flush__collect__hashes__done!(|| {
             (job_id, self.number, n_rehashed as u64)
         });
 
-        cdt::extent__flush__sqlite__insert__start!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
-        // We put all of our metadb updates into a single transaction to
-        // assure that we have a single sync.
-        let tx = inner.metadb.unchecked_transaction()?;
-
-        inner.truncate_encryption_contexts_and_hashes_with_tx(
-            inner
-                .dirty_blocks
-                .iter()
-                .map(|(block, hash)| (*block, hash.unwrap())),
-            &tx,
-        )?;
-
-        cdt::extent__flush__sqlite__insert__done!(|| {
-            (job_id, self.number, n_dirty_blocks)
-        });
-
         inner.set_flush_number(new_flush, new_gen)?;
-        tx.commit()?;
-        inner.dirty_blocks.clear();
+        inner.needs_sqlite_cleanup = true;
 
         // Finally, reset the file's seek offset to 0
         inner.file.seek(SeekFrom::Start(0))?;
+
+        // Schedule SQLite cleanup for later
+        let s = Arc::downgrade(&self);
+        tokio::spawn(async move {
+            if let Some(s) = s.upgrade() {
+                let mut inner = s.inner.lock().await;
+                inner.sqlite_cleanup().unwrap(); // TODO
+            }
+        });
 
         cdt::extent__flush__done!(|| { (job_id, self.number, n_dirty_blocks) });
 
@@ -2790,6 +2791,7 @@ mod test {
             file: ff,
             metadb: Connection::open_in_memory().unwrap(),
             dirty_blocks: BTreeMap::new(),
+            needs_sqlite_cleanup: false,
         };
 
         /*
