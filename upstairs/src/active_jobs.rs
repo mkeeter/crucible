@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug)]
 pub(crate) struct ActiveJobs {
     jobs: BTreeMap<u64, DownstairsIO>,
+    block_to_active: BlockToActive,
     ackable: BTreeSet<u64>,
 }
 
@@ -27,6 +28,7 @@ impl ActiveJobs {
         Self {
             jobs: BTreeMap::new(),
             ackable: BTreeSet::new(),
+            block_to_active: BlockToActive::new(),
         }
     }
 
@@ -62,6 +64,18 @@ impl ActiveJobs {
         for (job_id, job) in self.jobs.iter_mut() {
             let handle = DownstairsIOHandle::new(job, &mut self.ackable);
             f(job_id, handle.job);
+        }
+    }
+
+    /// Sets the region definition
+    ///
+    /// # Panics
+    /// If the region was already set to a different value
+    pub fn set_ddef(&mut self, ddef: RegionDefinition) {
+        if let Some(prev) = self.block_to_active.ddef {
+            assert_eq!(ddef, prev);
+        } else {
+            self.block_to_active.ddef = Some(ddef);
         }
     }
 
@@ -132,11 +146,7 @@ impl ActiveJobs {
         dep
     }
 
-    pub fn deps_for_write(
-        &self,
-        impacted_blocks: ImpactedBlocks,
-        _ddef: RegionDefinition,
-    ) -> Vec<u64> {
+    pub fn deps_for_write(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
         /*
          * To build the dependency list for this write, iterate from the end
          * of the downstairs work active list in reverse order and
@@ -192,11 +202,7 @@ impl ActiveJobs {
         dep
     }
 
-    pub fn deps_for_read(
-        &self,
-        impacted_blocks: ImpactedBlocks,
-        _ddef: RegionDefinition,
-    ) -> Vec<u64> {
+    pub fn deps_for_read(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
         /*
          * To build the dependency list for this read, iterate from the end
          * of the downstairs work active list in reverse order and
@@ -348,4 +354,37 @@ impl<'a> std::ops::Drop for DownstairsIOHandle<'a> {
             }
         }
     }
+}
+
+/// Acceleration data structure to quickly look up dependencies
+#[derive(Debug)]
+struct BlockToActive {
+    /// Mapping from an exclusive block range to a set of dependencies
+    ///
+    /// The data structure must maintain the invariant that block ranges never
+    /// overlap.
+    lba_to_jobs: BTreeMap<(u64, u64), DependencySet>,
+
+    /// The region definition allows us to go from extent + block to LBA
+    ///
+    /// This must always be populated by the time we call any functions;
+    /// unfortunately, making it populated by construction requires a more
+    /// significant refactoring of the upstairs loop to use the typestate
+    /// pattern.
+    ddef: Option<RegionDefinition>,
+}
+
+impl BlockToActive {
+    fn new() -> Self {
+        Self {
+            lba_to_jobs: BTreeMap::new(),
+            ddef: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DependencySet {
+    blocking: Option<u64>,
+    nonblocking: Vec<u64>,
 }

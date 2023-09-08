@@ -5843,8 +5843,7 @@ impl Upstairs {
          * Create the list of downstairs request numbers (ds_id) we created
          * on behalf of this guest job.
          */
-        let mut dep =
-            downstairs.ds_active.deps_for_write(impacted_blocks, ddef);
+        let mut dep = downstairs.ds_active.deps_for_write(impacted_blocks);
         cdt::gw__write__deps!(|| (
             downstairs.ds_active.len() as u64,
             dep.len() as u64
@@ -6074,7 +6073,7 @@ impl Upstairs {
         let gw_id: u64 = gw.next_gw_id();
         cdt::gw__read__start!(|| (gw_id));
 
-        let mut dep = downstairs.ds_active.deps_for_read(impacted_blocks, ddef);
+        let mut dep = downstairs.ds_active.deps_for_read(impacted_blocks);
 
         let mut future_repair = false;
         let mut deps_to_add: BTreeSet<u32> = BTreeSet::new();
@@ -7185,6 +7184,7 @@ impl Upstairs {
         }
 
         *ddef = RegionDefinitionStatus::Received(client_ddef);
+        ds.ds_active.set_ddef(client_ddef);
         Ok(())
     }
 
