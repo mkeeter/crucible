@@ -78,7 +78,16 @@ impl ActiveJobs {
             IOop::Read { .. } => false,
             _ => panic!("unexpected io work {:?}", io.work),
         };
-        let r = self.to_lba_range(io.impacted_blocks);
+        let r = match (&io.work, &io.impacted_blocks) {
+            (IOop::Flush { .. }, ImpactedBlocks::Empty) => 0..u64::MAX,
+            (IOop::Flush { .. }, ImpactedBlocks::InclusiveRange(..)) => {
+                panic!("cannot have flush with impacted blocks")
+            }
+            (_, ImpactedBlocks::Empty) => 0..0, // TODO is this avlid?
+            (_, ImpactedBlocks::InclusiveRange(..)) => {
+                self.to_lba_range(io.impacted_blocks)
+            }
+        };
         self.block_to_active.insert_range(r, job_id, blocking);
         self.jobs.insert(job_id, io);
     }

@@ -7312,7 +7312,7 @@ pub(crate) mod up_test {
         // ----|-------|-----
         //   0 | W     |
         //   1 | W     | 0
-        //   2 | W     | 0,1
+        //   2 | W     | 1
 
         let upstairs = make_upstairs();
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -7362,10 +7362,7 @@ pub(crate) mod up_test {
 
         assert!(jobs[0].work.deps().is_empty());
         assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
-        assert_eq!(
-            hashset(jobs[2].work.deps()),
-            hashset(&[jobs[0].ds_id, jobs[1].ds_id]),
-        );
+        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id],);
     }
 
     #[tokio::test]
@@ -7563,9 +7560,9 @@ pub(crate) mod up_test {
         //   1 | W     | 0
         //   2 |   W   | 0
         //   3 |     W | 0
-        //   4 | W     | 0,1
-        //   5 |   W   | 0,2
-        //   6 |     W | 0,3
+        //   4 | W     | 1
+        //   5 |   W   | 2
+        //   6 |     W | 3
 
         let upstairs = make_upstairs();
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -7624,16 +7621,16 @@ pub(crate) mod up_test {
         assert_eq!(jobs[3].work.deps(), &[jobs[0].ds_id]); // write @ 2
 
         assert_eq!(
-            hashset(jobs[4].work.deps()), // second write @ 0
-            hashset(&[jobs[0].ds_id, jobs[1].ds_id]),
+            jobs[4].work.deps(), // second write @ 0
+            &[jobs[1].ds_id],
         );
         assert_eq!(
-            hashset(jobs[5].work.deps()), // second write @ 1
-            hashset(&[jobs[0].ds_id, jobs[2].ds_id]),
+            jobs[5].work.deps(), // second write @ 1
+            &[jobs[2].ds_id],
         );
         assert_eq!(
-            hashset(jobs[6].work.deps()), // second write @ 2
-            hashset(&[jobs[0].ds_id, jobs[3].ds_id]),
+            jobs[6].work.deps(), // second write @ 2
+            &[jobs[3].ds_id],
         );
     }
 
@@ -8548,7 +8545,7 @@ pub(crate) mod up_test {
         //   1 |     W  W  W  W |  W  W  W        | 0
         //   2 |                |     W           | 1
         //   3 |              Wu|  Wu Wu          | 1,2
-        //   4 |              R |                 | 1,3
+        //   4 |              R |                 | 3
 
         let upstairs = make_upstairs();
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -8642,10 +8639,7 @@ pub(crate) mod up_test {
             hashset(jobs[3].work.deps()),
             hashset(&[jobs[1].ds_id, jobs[2].ds_id])
         ); // op 3
-        assert_eq!(
-            hashset(jobs[4].work.deps()),
-            hashset(&[jobs[1].ds_id, jobs[3].ds_id])
-        ); // op 4
+        assert_eq!(jobs[4].work.deps(), &[jobs[3].ds_id]); // op 4
     }
 
     #[tokio::test]
