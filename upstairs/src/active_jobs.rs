@@ -512,15 +512,17 @@ mod test {
     use super::*;
     use proptest::prelude::*;
 
-    struct Oracle(
-        BTreeMap<u64, DependencySet>,
-        BTreeMap<u64, std::ops::Range<u64>>,
-    );
+    /// The Oracle is similar to a [`BlockToActive`], but doesn't do range stuff
+    ///
+    /// Instead, it stores a dependency set at every single point.  This is used
+    /// for property-based testing.
+    #[derive(Default)]
+    struct Oracle {
+        lba_to_jobs: BTreeMap<u64, DependencySet>,
+        job_to_range: BTreeMap<u64, std::ops::Range<u64>>,
+    }
 
     impl Oracle {
-        fn new() -> Self {
-            Self(BTreeMap::new(), BTreeMap::new())
-        }
         fn insert_range(
             &mut self,
             r: std::ops::Range<u64>,
@@ -528,14 +530,14 @@ mod test {
             blocking: bool,
         ) {
             for i in r.clone() {
-                let v = self.0.entry(i).or_default();
+                let v = self.lba_to_jobs.entry(i).or_default();
                 if blocking {
                     v.insert_blocking(job)
                 } else {
                     v.insert_nonblocking(job)
                 }
             }
-            self.1.insert(job, r);
+            self.job_to_range.insert(job, r);
         }
         fn check_range(
             &self,
@@ -544,16 +546,16 @@ mod test {
         ) -> Vec<u64> {
             let mut out = BTreeSet::new();
             for i in r {
-                if let Some(s) = self.0.get(&i) {
+                if let Some(s) = self.lba_to_jobs.get(&i) {
                     out.extend(s.iter_jobs(blocking));
                 }
             }
             out.into_iter().collect()
         }
         fn remove_job(&mut self, job: u64) {
-            let r = self.1.remove(&job).unwrap();
+            let r = self.job_to_range.remove(&job).unwrap();
             for i in r {
-                if let Some(s) = self.0.get_mut(&i) {
+                if let Some(s) = self.lba_to_jobs.get_mut(&i) {
                     s.remove(job);
                 }
             }
@@ -576,7 +578,7 @@ mod test {
             dut.insert_range(b_start..(b_start + b_size), 1001, b_type);
             dut.insert_range(c_start..(c_start + c_size), 1002, c_type);
 
-            let mut oracle = Oracle::new();
+            let mut oracle = Oracle::default();
             oracle.insert_range(a_start..(a_start + a_size), 1000, a_type);
             oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
             oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
@@ -599,7 +601,7 @@ mod test {
             dut.insert_range(b_start..(b_start + b_size), 1001, b_type);
             dut.insert_range(c_start..(c_start + c_size), 1002, c_type);
 
-            let mut oracle = Oracle::new();
+            let mut oracle = Oracle::default();
             oracle.insert_range(a_start..(a_start + a_size), 1000, a_type);
             oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
             oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
