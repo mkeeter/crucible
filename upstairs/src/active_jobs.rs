@@ -468,7 +468,9 @@ impl DependencySet {
             }
         }
         for prev in &self.nonblocking {
-            assert!(job > *prev);
+            if job < *prev {
+                break;
+            }
         }
         self.blocking = Some(job);
         self.nonblocking.clear();

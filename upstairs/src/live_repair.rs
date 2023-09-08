@@ -4176,7 +4176,7 @@ pub mod repair_test {
         // same extent.
         assert_eq!(
             jobs[3].work.deps(),
-            &[jobs[2].ds_id, jobs[1].ds_id, jobs[0].ds_id]
+            &[jobs[0].ds_id, jobs[1].ds_id, jobs[2].ds_id]
         );
     }
 
@@ -4229,7 +4229,7 @@ pub mod repair_test {
         // same extent.
         assert_eq!(
             jobs[3].work.deps(),
-            &[jobs[2].ds_id, jobs[1].ds_id, jobs[0].ds_id]
+            &[jobs[0].ds_id, jobs[1].ds_id, jobs[2].ds_id]
         );
     }
 
@@ -4242,7 +4242,7 @@ pub mod repair_test {
         // ----|-------|-----
         //   0 | R     |
         //   1 |   W   |
-        //   2 | F F F | 1
+        //   2 | F F F | 0,1
         //   3 |RpRpRp | 2
 
         let up = create_test_upstairs(1).await;
@@ -4289,7 +4289,7 @@ pub mod repair_test {
         assert!(jobs[0].work.deps().is_empty());
         assert!(jobs[1].work.deps().is_empty());
         // The flush requires the read and the write
-        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id, jobs[0].ds_id]);
+        assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
         // The repair will have just the flush
         assert_eq!(jobs[3].work.deps(), &[jobs[2].ds_id]);
     }
@@ -4526,7 +4526,7 @@ pub mod repair_test {
 
         assert!(jobs[0].work.deps().is_empty());
         assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
-        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id, jobs[0].ds_id]);
+        assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
     }
 
     #[tokio::test]
@@ -4569,8 +4569,8 @@ pub mod repair_test {
         // op# | 0 1 2 | deps
         // ----|-------|-----
         //   0 | RpRpRp|
-        //   1 | RpRpRp| 1
-        //   2 | RpRpRp| 0,1
+        //   1 | RpRpRp| 0
+        //   2 | RpRpRp| 1
 
         let up = create_test_upstairs(1).await;
         create_and_enqueue_repair_op(&up, 0).await;
@@ -4585,7 +4585,7 @@ pub mod repair_test {
 
         assert!(jobs[0].work.deps().is_empty());
         assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
-        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id, jobs[0].ds_id]);
+        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id]);
     }
 
     #[tokio::test]
@@ -4949,7 +4949,7 @@ pub mod repair_test {
 
         assert!(jobs[0].work.deps().is_empty());
         assert!(jobs[1].work.deps().is_empty());
-        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id, jobs[0].ds_id]);
+        assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
     }
 
     #[tokio::test]
@@ -5083,7 +5083,7 @@ pub mod repair_test {
 
         assert!(jobs[0].work.deps().is_empty());
         assert!(jobs[1].work.deps().is_empty());
-        assert_eq!(jobs[2].work.deps(), &[1001, 1000]);
+        assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
         // Check that the IOs were skipped on downstairs 1.
         assert_eq!(jobs[0].state[&1], IOState::Skipped);
         assert_eq!(jobs[1].state[&1], IOState::Skipped);
@@ -5526,7 +5526,7 @@ pub mod repair_test {
         let job = ds.ds_active.get(&1003).unwrap();
         let current_deps = job.work.deps().to_vec();
 
-        assert_eq!(&current_deps, &[1002, 1001, 1000]);
+        assert_eq!(&current_deps, &[1002]);
         // No dependencies are valid for live repair
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, cv);
@@ -5535,14 +5535,14 @@ pub mod repair_test {
         let current_deps = job.work.deps().to_vec();
 
         // Job 1001 is not a dep for 1004
-        assert_eq!(&current_deps, &[1003, 1002, 1000]);
+        assert_eq!(&current_deps, &[1003]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, cv);
 
         let job = ds.ds_active.get(&1005).unwrap();
         let current_deps = job.work.deps().to_vec();
 
-        assert_eq!(&current_deps, &[1004, 1003, 1002, 1001, 1000]);
+        assert_eq!(&current_deps, &[1004]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, cv);
     }
@@ -5618,26 +5618,23 @@ pub mod repair_test {
         let job = ds.ds_active.get(&1006).unwrap();
         let current_deps = job.work.deps().to_vec();
 
-        assert_eq!(&current_deps, &[1005, 1004, 1003, 1002, 1001, 1000]);
+        assert_eq!(&current_deps, &[1005]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, cv);
 
         let job = ds.ds_active.get(&1007).unwrap();
         let current_deps = job.work.deps().to_vec();
 
-        assert_eq!(&current_deps, &[1006, 1005, 1003, 1002, 1000]);
+        assert_eq!(&current_deps, &[1006]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, &[1006]);
 
         let job = ds.ds_active.get(&1008).unwrap();
         let current_deps = job.work.deps().to_vec();
 
-        assert_eq!(
-            &current_deps,
-            &[1007, 1006, 1005, 1004, 1003, 1002, 1001, 1000]
-        );
+        assert_eq!(&current_deps, &[1007]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
-        assert_eq!(new_deps, &[1007, 1006]);
+        assert_eq!(new_deps, &[1007]);
     }
 
     #[tokio::test]
@@ -5757,7 +5754,7 @@ pub mod repair_test {
         assert_eq!(job.state[&2], IOState::New);
 
         let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1002, 1001, 1000]);
+        assert_eq!(&current_deps, &[1002]);
 
         // Verify that the Skipped job on the LiveRepair downstairs do not
         // have any dependencies, as, technically, this IO is the first IO to
@@ -5766,16 +5763,15 @@ pub mod repair_test {
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1007);
         assert_eq!(new_deps, empty);
 
-        // This second write after starting a repair should require jobs 0,4
-        // on Active downstairs, and only require the repair on the
-        // LiveRepair downstairs.
+        // This second write after starting a repair should require job 4 on
+        // both the Active and LiveRepair downstairs, since it masks job 0
         let job = ds.ds_active.get(&1008).unwrap();
         assert_eq!(job.state[&0], IOState::New);
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
         let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1004, 1000]);
+        assert_eq!(&current_deps, &[1004]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1008);
         // LiveRepair downstairs won't see past the repair.
@@ -5788,16 +5784,16 @@ pub mod repair_test {
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
-        // All the current operations, plus four future repair operations
-        // that don't exist yet.
+        // All the current operations, plus the Reopen operation that doesn't
+        // exist yet
         let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1008, 1007, 1004, 1002, 1001, 1000, 1012]);
+        assert_eq!(&current_deps, &[1001, 1004, 1007, 1008, 1012]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1013);
         // LiveRepair downstairs won't see past the repair, and it won't
         // include the skipped IO at 1007, but will have the future repair
         // close operation that doesn't yet exist.
-        assert_eq!(new_deps, &[1008, 1004, 1012]);
+        assert_eq!(new_deps, &[1004, 1008, 1012]);
     }
 
     #[tokio::test]
