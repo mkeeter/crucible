@@ -472,7 +472,7 @@ impl BlockToActive {
             }
             if r.end >= *start && r.end < *end {
                 assert!(split_end.is_none());
-                split_end = Some(*end);
+                split_end = Some(*start);
             }
         }
 
@@ -495,6 +495,8 @@ impl BlockToActive {
             self.lba_to_jobs.insert(r.end, v);
         }
 
+        // Iterate over the range covered by our new job, either modifying
+        // existing ranges or inserting new ranges as needed.
         let mut pos = r.start;
         while pos != r.end {
             let mut next_start = self
@@ -504,13 +506,33 @@ impl BlockToActive {
                 .map(|(start, _)| *start)
                 .unwrap_or(u64::MAX);
             if next_start == pos {
-                pos = next_start;
                 // Modify existing range
+                let (next_end, v) =
+                    self.lba_to_jobs.get_mut(&next_start).unwrap();
+                assert!(*next_end <= r.end);
+                assert!(*next_end > pos);
+                if blocking {
+                    v.insert_blocking(job)
+                } else {
+                    v.insert_nonblocking(job)
+                }
+                pos = *next_end;
             } else {
+                // Insert a new range
                 assert!(next_start > pos);
                 next_start = next_start.min(r.end);
                 assert!(next_start > pos);
-                self.lba_to_jobs.insert(pos, (next_start, todo!()));
+                self.lba_to_jobs.insert(
+                    pos,
+                    (
+                        next_start,
+                        if blocking {
+                            DependencySet::new_blocking(job)
+                        } else {
+                            DependencySet::new_nonblocking(job)
+                        },
+                    ),
+                );
                 pos = next_start;
             }
         }
@@ -526,11 +548,26 @@ impl BlockToActive {
             .rev()
             .next()
             .map(|(start, _)| *start)
-            .unwrap_or(u64::MAX);
+            .unwrap_or(r.start);
         self.lba_to_jobs
             .range(start..)
             .skip_while(move |(_start, (end, _set))| *end <= r.start)
             .take_while(move |(start, (_end, _set))| **start < r.end)
+    }
+
+    /// Removes the given job from its range
+    fn remove_range(
+        &mut self,
+        r: std::ops::Range<u64>,
+        job: u64,
+    ) {
+        let mut start = r.start;
+        while start != r.end {
+            let (end, v) = self.lba_to_jobs.get_mut(&start).unwrap();
+            v.remove(job);
+            start = *end;
+        }
+        self.lba_to_jobs.retain(|_start, (_end, v)| !v.is_empty());
     }
 }
 
@@ -538,7 +575,7 @@ impl BlockToActive {
 ///
 /// Each dependency set has 0-1 blocking dependencies (e.g. writes), and any
 /// number of non-blocking dependencies.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct DependencySet {
     blocking: Option<u64>,
     nonblocking: Vec<u64>,
@@ -574,5 +611,103 @@ impl DependencySet {
             }
         }
         self.nonblocking.retain(|&v| v != job);
+    }
+    fn is_empty(&self) -> bool {
+        self.blocking.is_none() && self.nonblocking.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use proptest::prelude::*;
+
+    struct Oracle(BTreeMap<u64, DependencySet>);
+
+    impl Oracle {
+        fn new() -> Self {
+            Self(BTreeMap::new())
+        }
+        fn insert_range(&mut self, r: std::ops::Range<u64>, job: u64, blocking: bool) {
+            for i in r {
+                let v = self.0.entry(i).or_default();
+                if blocking {
+                    v.insert_blocking(job)
+                } else {
+                    v.insert_nonblocking(job)
+                }
+            }
+        }
+        fn check_range(&self, r: std::ops::Range<u64>) -> Vec<u64> {
+            let mut out = BTreeSet::new();
+            for i in r {
+                if let Some(s) = self.0.get(&i) {
+                    out.extend(s.nonblocking.iter().cloned());
+                    out.extend(s.blocking.iter().cloned());
+                }
+            }
+            out.into_iter().collect()
+        }
+        fn remove_range(&mut self, r: std::ops::Range<u64>, job: u64) {
+            for i in r {
+                if let Some(s) = self.0.get_mut(&i) {
+                    s.remove(job);
+                }
+            }
+        }
+    }
+
+    // write, write, write, read
+    // each write is a range + bool
+    // read is a range
+    proptest! {
+        #[test]
+        fn test_active_jobs_insert(
+            a_start in 0u64..100, a_size in 1u64..50, a_type in any::<bool>(),
+            b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
+            c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
+            read_start in 0u64..100, read_size in 1u64..50
+        ) {
+            let mut dut = BlockToActive::new();
+            dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
+            dut.insert_range(b_start..(b_start + b_size), 1001, b_type);
+            dut.insert_range(c_start..(c_start + c_size), 1002, c_type);
+
+            let mut oracle = Oracle::new();
+            oracle.insert_range(a_start..(a_start + a_size), 1000, a_type);
+            oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
+            oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
+
+            let read_dut = dut.check_range(read_start..(read_start + read_size));
+            let read_oracle = oracle.check_range(read_start..(read_start + read_size));
+            assert_eq!(read_dut, read_oracle);
+        }
+
+        #[test]
+        fn test_active_jobs_insert_remove(
+            a_start in 0u64..100, a_size in 1u64..50, a_type in any::<bool>(),
+            b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
+            c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
+            remove in 0usize..3,
+            read_start in 0u64..100, read_size in 1u64..50
+        ) {
+            let mut dut = BlockToActive::new();
+            dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
+            dut.insert_range(b_start..(b_start + b_size), 1001, b_type);
+            dut.insert_range(c_start..(c_start + c_size), 1002, c_type);
+
+            let mut oracle = Oracle::new();
+            oracle.insert_range(a_start..(a_start + a_size), 1000, a_type);
+            oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
+            oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
+
+            let (start, size) = [(a_start, a_size), (b_start, b_size), (c_start, c_size)][remove];
+            dut.remove_range(start..(start + size), 1000 + remove as u64);
+            oracle.remove_range(start..(start + size), 1000 + remove as u64);
+
+            let read_dut = dut.check_range(read_start..(read_start + read_size));
+            let read_oracle = oracle.check_range(read_start..(read_start + read_size));
+            assert_eq!(read_dut, read_oracle);
+        }
     }
 }
