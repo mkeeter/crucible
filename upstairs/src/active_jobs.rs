@@ -277,9 +277,14 @@ impl BlockToActive {
     fn check_range(&self, r: std::ops::Range<u64>, blocking: bool) -> Vec<u64> {
         let mut out = BTreeSet::new();
         for (_start, (_end, set)) in self.iter_overlapping(r) {
-            out.extend(set.blocking.iter().cloned());
             if blocking {
-                out.extend(set.nonblocking.iter().cloned());
+                if set.nonblocking.is_empty() {
+                    out.extend(set.blocking.iter().cloned());
+                } else {
+                    out.extend(set.nonblocking.iter().cloned());
+                }
+            } else {
+                out.extend(set.blocking.iter().cloned());
             }
         }
         out.into_iter().collect()
@@ -530,9 +535,15 @@ mod test {
             let mut out = BTreeSet::new();
             for i in r {
                 if let Some(s) = self.0.get(&i) {
-                    out.extend(s.blocking.iter().cloned());
+                    // TODO: refactor this into a DependencySet function?
                     if blocking {
-                        out.extend(s.nonblocking.iter().cloned());
+                        if s.nonblocking.is_empty() {
+                            out.extend(s.blocking.iter().cloned());
+                        } else {
+                            out.extend(s.nonblocking.iter().cloned());
+                        }
+                    } else {
+                        out.extend(s.blocking.iter().cloned());
                     }
                 }
             }

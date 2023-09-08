@@ -2963,10 +2963,11 @@ pub mod repair_test {
         //   1 |       |       | RpRpRp|
         //   2 |       |       | RpRpRp|
         //   3 |       |       | RpRpRp|
-        //   4 | W W W | W W W | W W W | 0,1,2,3
-        //   5 | R R R | R R R | R R R | 0,1,2,3,4
-        //   6 | WuWuWu| WuWuWu| WuWuWu| 0,1,2,3,4,5
+        //   4 | W W W | W W W | W W W | 3
+        //   5 | R R R | R R R | R R R | 3,4
+        //   6 | WuWuWu| WuWuWu| WuWuWu| 3,5
         //
+        // TODO: this has superfluous dependencies
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
@@ -3020,7 +3021,7 @@ pub mod repair_test {
 
         assert_eq!(jobs[0].work.deps(), &[1003]);
         assert_eq!(jobs[1].work.deps(), &[1004, 1003]);
-        assert_eq!(jobs[2].work.deps(), &[1005, 1004, 1003]);
+        assert_eq!(jobs[2].work.deps(), &[1005, 1003]);
     }
 
     #[tokio::test]
@@ -3053,7 +3054,7 @@ pub mod repair_test {
         //   1 |       |       | RpRpRp|
         //   2 |       |       | RpRpRp|
         //   3 |       |       | RpRpRp|
-        //   4 | R R R | R R R | R R R | 0,1,2,3
+        //   4 | R R R | R R R | R R R | 3
         //
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -3119,7 +3120,7 @@ pub mod repair_test {
         //   1 |       |       | RpRpRp|
         //   2 |       |       | RpRpRp|
         //   3 |       |       | RpRpRp|
-        //   4 | W W W | W W W | W W W | 0,1,2,3
+        //   4 | W W W | W W W | W W W | 3
 
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -3191,7 +3192,7 @@ pub mod repair_test {
         //   5 |       |       | RpRpRp|
         //   6 |       |       | RpRpRp|
         //   7 |       |       | RpRpRp|
-        //   8 | W W W | W W W | W W W | 0,1,2,3,4,5,6,7
+        //   8 | W W W | W W W | W W W | 3,7
         //
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -4833,7 +4834,7 @@ pub mod repair_test {
         //   5 |       | Rrep  |
         //   6 |       | Rnoop |
         //   7 |       | Ropen |
-        //   5 |     W | W W   | 0,1,2,3
+        //   5 |     W | W W   | 0,1,2,3 XXX This is wrong?
         //
         // We also verify that the job IDs make sense for our repair id
         // reservation that happens when we need to insert a job like this.
@@ -5115,7 +5116,7 @@ pub mod repair_test {
         //   1 |       | RpRpRp|
         //   2 |       | RpRpRp|
         //   3 |       | RpRpRp|
-        //   4 |     W | W W   | 0,1,2
+        //   4 |     W | W W   | 3
 
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -5169,8 +5170,8 @@ pub mod repair_test {
         //   0 |       | RpRpRp|
         //   1 |       | RpRpRp|
         //   2 |       | RpRpRp|
-        //   2 |       | RpRpRp|
-        //   3 |     R | R R   | 0,1,2
+        //   3 |       | RpRpRp|
+        //   4 |     R | R R   | 3
 
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
