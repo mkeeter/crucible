@@ -562,16 +562,14 @@ mod test {
         }
     }
 
-    // write, write, write, read
-    // each write is a range + bool
-    // read is a range
     proptest! {
         #[test]
         fn test_active_jobs_insert(
             a_start in 0u64..100, a_size in 1u64..50, a_type in any::<bool>(),
             b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
             c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
-            read_start in 0u64..100, read_size in 1u64..50, read_type in any::<bool>(),
+            read_start in 0u64..100, read_size in 1u64..50,
+            read_type in any::<bool>(),
         ) {
             let mut dut = BlockToActive::new();
             dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
@@ -583,8 +581,10 @@ mod test {
             oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
             oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
 
-            let read_dut = dut.check_range(read_start..(read_start + read_size), read_type);
-            let read_oracle = oracle.check_range(read_start..(read_start + read_size), read_type);
+            let read_dut = dut.check_range(
+                read_start..(read_start + read_size), read_type);
+            let read_oracle = oracle.check_range(
+                read_start..(read_start + read_size), read_type);
             assert_eq!(read_dut, read_oracle);
         }
 
@@ -594,7 +594,8 @@ mod test {
             b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
             c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
             remove in 0usize..3,
-            read_start in 0u64..100, read_size in 1u64..50, read_type in any::<bool>()
+            read_start in 0u64..100, read_size in 1u64..50,
+            read_type in any::<bool>()
         ) {
             let mut dut = BlockToActive::new();
             dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
@@ -606,11 +607,13 @@ mod test {
             oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
             oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
 
-            dut.remove_job( 1000 + remove as u64);
-            oracle.remove_job( 1000 + remove as u64);
+            dut.remove_job(1000 + remove as u64);
+            oracle.remove_job(1000 + remove as u64);
 
-            let read_dut = dut.check_range(read_start..(read_start + read_size), read_type);
-            let read_oracle = oracle.check_range(read_start..(read_start + read_size), read_type);
+            let read_dut = dut.check_range(
+                read_start..(read_start + read_size), read_type);
+            let read_oracle = oracle.check_range(
+                read_start..(read_start + read_size), read_type);
             assert_eq!(read_dut, read_oracle);
         }
     }
