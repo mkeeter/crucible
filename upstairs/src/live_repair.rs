@@ -863,8 +863,7 @@ impl Upstairs {
             let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
             let deps =
-                ds.ds_active
-                    .deps_for_live_repair(impacted_blocks, ds_id, ddef);
+                ds.ds_active.deps_for_live_repair(impacted_blocks, ds_id);
 
             warn!(
                 self.log,
@@ -1079,8 +1078,7 @@ impl Upstairs {
         // that we skipped or finished for that specific downstairs before
         // we send the repair IO over the wire.
         let mut deps =
-            ds.ds_active
-                .deps_for_live_repair(impacted_blocks, close_id, ddef);
+            ds.ds_active.deps_for_live_repair(impacted_blocks, close_id);
 
         info!(
             self.log,
@@ -4064,9 +4062,7 @@ pub mod repair_test {
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = gw.next_gw_id();
         let close_id = ds.next_id();
-        let deps =
-            ds.ds_active
-                .deps_for_live_repair(impacted_blocks, close_id, ddef);
+        let deps = ds.ds_active.deps_for_live_repair(impacted_blocks, close_id);
 
         // let repair = vec![0, 2];
         let _reopen_brw = create_and_enqueue_close_io(
@@ -4105,9 +4101,9 @@ pub mod repair_test {
         let gw_repair_id: u64 = gw.next_gw_id();
         let extent_repair_ids = ds.get_repair_ids(eid);
         let repair_id = extent_repair_ids.repair_id;
-        let deps =
-            ds.ds_active
-                .deps_for_live_repair(impacted_blocks, repair_id, ddef);
+        let deps = ds
+            .ds_active
+            .deps_for_live_repair(impacted_blocks, repair_id);
 
         let _repair_brw = create_and_enqueue_noop_io(
             &mut ds,
@@ -5879,8 +5875,7 @@ pub mod repair_test {
         let reopen_id = extent_repair_ids.reopen_id;
 
         let mut deps =
-            ds.ds_active
-                .deps_for_live_repair(impacted_blocks, close_id, ddef);
+            ds.ds_active.deps_for_live_repair(impacted_blocks, close_id);
 
         // The initial close IO has the base set of dependencies.
         // Each additional job will depend on the previous.

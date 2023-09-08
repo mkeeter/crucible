@@ -4669,7 +4669,7 @@ impl Downstairs {
             }
             // Now that we've collected jobs to retire, remove them from the map
             for &id in &retired {
-                self.ds_active.remove(&id).unwrap();
+                let _ = self.ds_active.remove(&id);
             }
 
             debug!(self.log, "[rc] retire {} clears {:?}", ds_id, retired);
@@ -7184,7 +7184,6 @@ impl Upstairs {
         }
 
         *ddef = RegionDefinitionStatus::Received(client_ddef);
-        ds.ds_active.set_ddef(client_ddef);
         Ok(())
     }
 

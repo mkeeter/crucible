@@ -1,8 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 
-use crucible_common::RegionDefinition;
-
-use crate::{AckStatus, DownstairsIO, ImpactedAddr, ImpactedBlocks};
+use crate::{AckStatus, DownstairsIO, IOop, ImpactedAddr, ImpactedBlocks};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `ActiveJobs` tracks active jobs by ID
@@ -21,14 +19,6 @@ pub(crate) struct ActiveJobs {
     jobs: BTreeMap<u64, DownstairsIO>,
     block_to_active: BlockToActive,
     ackable: BTreeSet<u64>,
-
-    /// The region definition allows us to go from extent + block to LBA
-    ///
-    /// This must always be populated by the time we call any functions;
-    /// unfortunately, making it populated by construction requires a more
-    /// significant refactoring of the upstairs loop to use the typestate
-    /// pattern.
-    ddef: Option<RegionDefinition>,
 }
 
 impl ActiveJobs {
@@ -37,7 +27,6 @@ impl ActiveJobs {
             jobs: BTreeMap::new(),
             ackable: BTreeSet::new(),
             block_to_active: BlockToActive::new(),
-            ddef: None,
         }
     }
 
@@ -76,32 +65,33 @@ impl ActiveJobs {
         }
     }
 
-    /// Sets the region definition
-    ///
-    /// # Panics
-    /// If the region was already set to a different value
-    pub fn set_ddef(&mut self, ddef: RegionDefinition) {
-        if let Some(prev) = &self.ddef {
-            assert_eq!(&ddef, prev);
-        } else {
-            self.ddef = Some(ddef);
-        }
-    }
-
     /// Inserts a new job ID and its associated IO work
     #[inline]
-    pub fn insert(
-        &mut self,
-        job_id: u64,
-        io: DownstairsIO,
-    ) -> Option<DownstairsIO> {
-        self.jobs.insert(job_id, io)
+    pub fn insert(&mut self, job_id: u64, io: DownstairsIO) {
+        let blocking = match &io.work {
+            IOop::Write { .. }
+            | IOop::WriteUnwritten { .. }
+            | IOop::Flush { .. }
+            | IOop::ExtentLiveNoOp { .. }
+            | IOop::ExtentFlushClose { .. }
+            | IOop::ExtentLiveReopen { .. } => true,
+            IOop::Read { .. } => false,
+            _ => panic!("unexpected io work {:?}", io.work),
+        };
+        let r = self.to_lba_range(io.impacted_blocks);
+        self.block_to_active.insert_range(r, job_id, blocking);
+        self.jobs.insert(job_id, io);
     }
 
     /// Removes a job by ID, returning its IO work
+    ///
+    /// # Panics
+    /// If the job was not inserted
     #[inline]
-    pub fn remove(&mut self, job_id: &u64) -> Option<DownstairsIO> {
-        self.jobs.remove(job_id)
+    pub fn remove(&mut self, job_id: &u64) -> DownstairsIO {
+        let io = self.jobs.remove(job_id).unwrap();
+        self.block_to_active.remove_job(*job_id);
+        io
     }
 
     /// Returns an iterator over job IDs
@@ -119,130 +109,18 @@ impl ActiveJobs {
         self.jobs.values()
     }
 
-    #[inline]
-    pub fn iter(&self) -> std::collections::btree_map::Iter<u64, DownstairsIO> {
-        self.jobs.iter()
-    }
-
     pub fn deps_for_flush(&self) -> Vec<u64> {
-        /*
-         * To build the dependency list for this flush, iterate from the end of
-         * the downstairs work active list in reverse order and check each job
-         * in that list to see if this new flush must depend on it.
-         *
-         * We can safely ignore everything before the last flush, because the
-         * last flush will depend on jobs before it. But this flush must depend
-         * on the last flush - flush and gen numbers downstairs need to be
-         * sequential and the same for each downstairs.
-         *
-         * The downstairs currently assumes that all jobs previous to the last
-         * flush have completed, so the Upstairs must set that flushes depend on
-         * all jobs. It's currently important that flushes depend on everything,
-         * and everything depends on flushes.
-         */
-        let num_jobs = self.len();
-        let mut dep: Vec<u64> = Vec::with_capacity(num_jobs);
-
-        for (id, job) in self.iter().rev() {
-            // Flushes must depend on everything
-            dep.push(*id);
-
-            // Depend on the last flush, but then bail out
-            if job.work.is_flush() {
-                break;
-            }
-        }
-        dep
+        self.block_to_active.check_range(0..u64::MAX, true)
     }
 
     pub fn deps_for_write(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
-        /*
-         * To build the dependency list for this write, iterate from the end
-         * of the downstairs work active list in reverse order and
-         * check each job in that list to see if this new write must
-         * depend on it.
-         *
-         * Construct a list of dependencies for this write based on the
-         * following rules:
-         *
-         * - writes have to depend on the last flush completing (because
-         *   currently everything has to depend on flushes)
-         * - any overlap of impacted blocks before the flush requires a
-         *   dependency
-         *
-         * It's important to remember that jobs may arrive at different
-         * Downstairs in different orders but they should still complete in job
-         * dependency order.
-         *
-         * TODO: any overlap of impacted blocks will create a dependency.
-         * take this an example (this shows three writes, all to the
-         * same block, along with the dependency list for each
-         * write):
-         *
-         *       block
-         * op# | 0 1 2 | deps
-         * ----|-------------
-         *   0 | W     |
-         *   1 | W     | 0
-         *   2 | W     | 0,1
-         *
-         * op 2 depends on both op 1 and op 0. If dependencies are transitive
-         * with an existing job, it would be nice if those were removed from
-         * this job's dependencies.
-         */
-        let num_jobs = self.len();
-        let mut dep: Vec<u64> = Vec::with_capacity(num_jobs);
-
-        // Search backwards in the list of active jobs
-        for (id, job) in self.iter().rev() {
-            // Depend on the last flush - flushes are a barrier for
-            // all writes.
-            if job.work.is_flush() {
-                dep.push(*id);
-                break;
-            }
-
-            // If this job impacts the same blocks as something already active,
-            // create a dependency.
-            if impacted_blocks.conflicts(&job.impacted_blocks) {
-                dep.push(*id);
-            }
-        }
-        dep
+        let r = self.to_lba_range(impacted_blocks);
+        self.block_to_active.check_range(r, true)
     }
 
     pub fn deps_for_read(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
-        /*
-         * To build the dependency list for this read, iterate from the end
-         * of the downstairs work active list in reverse order and
-         * check each job in that list to see if this new read must
-         * depend on it.
-         *
-         * Construct a list of dependencies for this read based on the
-         * following rules:
-         *
-         * - reads depend on flushes (because currently everything has to depend
-         *   on flushes)
-         * - any write with an overlap of impacted blocks requires a
-         *   dependency
-         */
-        let num_jobs = self.len();
-        let mut dep: Vec<u64> = Vec::with_capacity(num_jobs);
-
-        // Search backwards in the list of active jobs
-        for (id, job) in self.iter().rev() {
-            if job.work.is_flush() {
-                dep.push(*id);
-                break;
-            } else if (job.work.is_write() | job.work.is_repair())
-                && impacted_blocks.conflicts(&job.impacted_blocks)
-            {
-                // If this is a write or repair and it impacts the same blocks
-                // as something already active, create a dependency.
-                dep.push(*id);
-            }
-        }
-        dep
+        let r = self.to_lba_range(impacted_blocks);
+        self.block_to_active.check_range(r, false)
     }
 
     // Build the list of dependencies for a live repair job.  These are jobs that
@@ -254,37 +132,10 @@ impl ActiveJobs {
         &self,
         impacted_blocks: ImpactedBlocks,
         close_id: u64,
-        _ddef: RegionDefinition,
     ) -> Vec<u64> {
-        let num_jobs = self.len();
-        let mut deps: Vec<u64> = Vec::with_capacity(num_jobs);
-
-        // Search backwards in the list of active jobs, stop at the
-        // last flush
-        for (id, job) in self.iter().rev() {
-            // We are finding dependencies based on impacted blocks.
-            // We may have reserved future job IDs for repair, and it's possible
-            // that this job we are finding dependencies for now is actually a
-            // future repair job we reserved.  If so, don't include ourself in
-            // our own list of dependencies.
-            if job.ds_id > close_id {
-                continue;
-            }
-            // If this operation impacts the same blocks as something
-            // already active, create a dependency.
-            if impacted_blocks.conflicts(&job.impacted_blocks) {
-                deps.push(*id);
-            }
-
-            // A flush job won't show impacted blocks. We can stop looking
-            // for dependencies beyond the last flush.
-            if job.work.is_flush() {
-                deps.push(*id);
-                break;
-            }
-        }
-
-        deps
+        let mut out = self.deps_for_write(impacted_blocks);
+        out.retain(|v| *v <= close_id);
+        out
     }
 
     pub fn ackable_work(&self) -> Vec<u64> {
@@ -294,12 +145,11 @@ impl ActiveJobs {
     /// Converts from an extent + relative block to a global block
     ///
     /// # Panics
-    /// If the global block address overflows a `u64`, or `self.ddef` has not
-    /// yet been assigned.
+    /// If the global block address overflows a `u64`
     fn to_lba(&self, block: ImpactedAddr) -> u64 {
         block
             .extent_id
-            .checked_mul(self.ddef.unwrap().extent_size().value)
+            .checked_mul(1 << 32)
             .unwrap()
             .checked_add(block.block)
             .unwrap()
@@ -308,8 +158,7 @@ impl ActiveJobs {
     /// Converts from an (inclusive) block range to an (exclusive) LBA range
     ///
     /// # Panics
-    /// If any address overflows a `u64`, or `self.ddef` has not yet been
-    /// assigned.
+    /// If any address overflows a `u64`
     fn to_lba_range(&self, block: ImpactedBlocks) -> std::ops::Range<u64> {
         match block {
             ImpactedBlocks::Empty => 0..0,
@@ -404,21 +253,25 @@ struct BlockToActive {
     /// The data structure must maintain the invariant that block ranges never
     /// overlap.
     lba_to_jobs: BTreeMap<u64, (u64, DependencySet)>,
+    job_to_range: BTreeMap<u64, std::ops::Range<u64>>,
 }
 
 impl BlockToActive {
     fn new() -> Self {
         Self {
             lba_to_jobs: BTreeMap::new(),
+            job_to_range: BTreeMap::new(),
         }
     }
 
     /// Returns all dependencies that are active across the given range
-    fn check_range(&self, r: std::ops::Range<u64>) -> Vec<u64> {
+    fn check_range(&self, r: std::ops::Range<u64>, blocking: bool) -> Vec<u64> {
         let mut out = BTreeSet::new();
         for (_start, (_end, set)) in self.iter_overlapping(r) {
             out.extend(set.blocking.iter().cloned());
-            out.extend(set.nonblocking.iter().cloned());
+            if blocking {
+                out.extend(set.nonblocking.iter().cloned());
+            }
         }
         out.into_iter().collect()
     }
@@ -536,6 +389,7 @@ impl BlockToActive {
                 pos = next_start;
             }
         }
+        self.job_to_range.insert(job, r);
     }
 
     fn iter_overlapping(
@@ -556,11 +410,8 @@ impl BlockToActive {
     }
 
     /// Removes the given job from its range
-    fn remove_range(
-        &mut self,
-        r: std::ops::Range<u64>,
-        job: u64,
-    ) {
+    fn remove_job(&mut self, job: u64) {
+        let r = self.job_to_range.remove(&job).unwrap();
         let mut start = r.start;
         while start != r.end {
             let (end, v) = self.lba_to_jobs.get_mut(&start).unwrap();
@@ -596,11 +447,26 @@ impl DependencySet {
     }
 
     fn insert_blocking(&mut self, job: u64) {
+        if let Some(prev) = self.blocking {
+            // Skip backfilling older jobs
+            if job < prev {
+                return;
+            }
+        }
+        for prev in &self.nonblocking {
+            assert!(job > *prev);
+        }
         self.blocking = Some(job);
         self.nonblocking.clear();
     }
 
     fn insert_nonblocking(&mut self, job: u64) {
+        if let Some(prev) = self.blocking {
+            assert!(job > prev);
+        }
+        for prev in &self.nonblocking {
+            assert!(job > *prev);
+        }
         self.nonblocking.push(job);
     }
 
@@ -622,14 +488,22 @@ mod test {
     use super::*;
     use proptest::prelude::*;
 
-    struct Oracle(BTreeMap<u64, DependencySet>);
+    struct Oracle(
+        BTreeMap<u64, DependencySet>,
+        BTreeMap<u64, std::ops::Range<u64>>,
+    );
 
     impl Oracle {
         fn new() -> Self {
-            Self(BTreeMap::new())
+            Self(BTreeMap::new(), BTreeMap::new())
         }
-        fn insert_range(&mut self, r: std::ops::Range<u64>, job: u64, blocking: bool) {
-            for i in r {
+        fn insert_range(
+            &mut self,
+            r: std::ops::Range<u64>,
+            job: u64,
+            blocking: bool,
+        ) {
+            for i in r.clone() {
                 let v = self.0.entry(i).or_default();
                 if blocking {
                     v.insert_blocking(job)
@@ -637,18 +511,26 @@ mod test {
                     v.insert_nonblocking(job)
                 }
             }
+            self.1.insert(job, r);
         }
-        fn check_range(&self, r: std::ops::Range<u64>) -> Vec<u64> {
+        fn check_range(
+            &self,
+            r: std::ops::Range<u64>,
+            blocking: bool,
+        ) -> Vec<u64> {
             let mut out = BTreeSet::new();
             for i in r {
                 if let Some(s) = self.0.get(&i) {
-                    out.extend(s.nonblocking.iter().cloned());
                     out.extend(s.blocking.iter().cloned());
+                    if blocking {
+                        out.extend(s.nonblocking.iter().cloned());
+                    }
                 }
             }
             out.into_iter().collect()
         }
-        fn remove_range(&mut self, r: std::ops::Range<u64>, job: u64) {
+        fn remove_job(&mut self, job: u64) {
+            let r = self.1.remove(&job).unwrap();
             for i in r {
                 if let Some(s) = self.0.get_mut(&i) {
                     s.remove(job);
@@ -666,7 +548,7 @@ mod test {
             a_start in 0u64..100, a_size in 1u64..50, a_type in any::<bool>(),
             b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
             c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
-            read_start in 0u64..100, read_size in 1u64..50
+            read_start in 0u64..100, read_size in 1u64..50, read_type in any::<bool>(),
         ) {
             let mut dut = BlockToActive::new();
             dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
@@ -678,8 +560,8 @@ mod test {
             oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
             oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
 
-            let read_dut = dut.check_range(read_start..(read_start + read_size));
-            let read_oracle = oracle.check_range(read_start..(read_start + read_size));
+            let read_dut = dut.check_range(read_start..(read_start + read_size), read_type);
+            let read_oracle = oracle.check_range(read_start..(read_start + read_size), read_type);
             assert_eq!(read_dut, read_oracle);
         }
 
@@ -689,7 +571,7 @@ mod test {
             b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
             c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
             remove in 0usize..3,
-            read_start in 0u64..100, read_size in 1u64..50
+            read_start in 0u64..100, read_size in 1u64..50, read_type in any::<bool>()
         ) {
             let mut dut = BlockToActive::new();
             dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
@@ -701,12 +583,11 @@ mod test {
             oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
             oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
 
-            let (start, size) = [(a_start, a_size), (b_start, b_size), (c_start, c_size)][remove];
-            dut.remove_range(start..(start + size), 1000 + remove as u64);
-            oracle.remove_range(start..(start + size), 1000 + remove as u64);
+            dut.remove_job( 1000 + remove as u64);
+            oracle.remove_job( 1000 + remove as u64);
 
-            let read_dut = dut.check_range(read_start..(read_start + read_size));
-            let read_oracle = oracle.check_range(read_start..(read_start + read_size));
+            let read_dut = dut.check_range(read_start..(read_start + read_size), read_type);
+            let read_oracle = oracle.check_range(read_start..(read_start + read_size), read_type);
             assert_eq!(read_dut, read_oracle);
         }
     }
