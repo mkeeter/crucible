@@ -2,7 +2,7 @@
 
 use crucible_common::RegionDefinition;
 
-use crate::{AckStatus, DownstairsIO, ImpactedBlocks};
+use crate::{AckStatus, DownstairsIO, ImpactedAddr, ImpactedBlocks};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `ActiveJobs` tracks active jobs by ID
@@ -21,6 +21,14 @@ pub(crate) struct ActiveJobs {
     jobs: BTreeMap<u64, DownstairsIO>,
     block_to_active: BlockToActive,
     ackable: BTreeSet<u64>,
+
+    /// The region definition allows us to go from extent + block to LBA
+    ///
+    /// This must always be populated by the time we call any functions;
+    /// unfortunately, making it populated by construction requires a more
+    /// significant refactoring of the upstairs loop to use the typestate
+    /// pattern.
+    ddef: Option<RegionDefinition>,
 }
 
 impl ActiveJobs {
@@ -29,6 +37,7 @@ impl ActiveJobs {
             jobs: BTreeMap::new(),
             ackable: BTreeSet::new(),
             block_to_active: BlockToActive::new(),
+            ddef: None,
         }
     }
 
@@ -72,10 +81,10 @@ impl ActiveJobs {
     /// # Panics
     /// If the region was already set to a different value
     pub fn set_ddef(&mut self, ddef: RegionDefinition) {
-        if let Some(prev) = self.block_to_active.ddef {
-            assert_eq!(ddef, prev);
+        if let Some(prev) = &self.ddef {
+            assert_eq!(&ddef, prev);
         } else {
-            self.block_to_active.ddef = Some(ddef);
+            self.ddef = Some(ddef);
         }
     }
 
@@ -281,6 +290,34 @@ impl ActiveJobs {
     pub fn ackable_work(&self) -> Vec<u64> {
         self.ackable.iter().cloned().collect()
     }
+
+    /// Converts from an extent + relative block to a global block
+    ///
+    /// # Panics
+    /// If the global block address overflows a `u64`, or `self.ddef` has not
+    /// yet been assigned.
+    fn to_lba(&self, block: ImpactedAddr) -> u64 {
+        block
+            .extent_id
+            .checked_mul(self.ddef.unwrap().extent_size().value)
+            .unwrap()
+            .checked_add(block.block)
+            .unwrap()
+    }
+
+    /// Converts from an (inclusive) block range to an (exclusive) LBA range
+    ///
+    /// # Panics
+    /// If any address overflows a `u64`, or `self.ddef` has not yet been
+    /// assigned.
+    fn to_lba_range(&self, block: ImpactedBlocks) -> std::ops::Range<u64> {
+        match block {
+            ImpactedBlocks::Empty => 0..0,
+            ImpactedBlocks::InclusiveRange(start, end) => {
+                self.to_lba(start)..self.to_lba(end).checked_add(1).unwrap()
+            }
+        }
+    }
 }
 
 impl<'a> IntoIterator for &'a ActiveJobs {
@@ -361,30 +398,181 @@ impl<'a> std::ops::Drop for DownstairsIOHandle<'a> {
 struct BlockToActive {
     /// Mapping from an exclusive block range to a set of dependencies
     ///
+    /// The start of the range is the key; the end of the range is the first
+    /// item in the value tuple.
+    ///
     /// The data structure must maintain the invariant that block ranges never
     /// overlap.
-    lba_to_jobs: BTreeMap<(u64, u64), DependencySet>,
-
-    /// The region definition allows us to go from extent + block to LBA
-    ///
-    /// This must always be populated by the time we call any functions;
-    /// unfortunately, making it populated by construction requires a more
-    /// significant refactoring of the upstairs loop to use the typestate
-    /// pattern.
-    ddef: Option<RegionDefinition>,
+    lba_to_jobs: BTreeMap<u64, (u64, DependencySet)>,
 }
 
 impl BlockToActive {
     fn new() -> Self {
         Self {
             lba_to_jobs: BTreeMap::new(),
-            ddef: None,
         }
+    }
+
+    /// Returns all dependencies that are active across the given range
+    fn check_range(&self, r: std::ops::Range<u64>) -> Vec<u64> {
+        let mut out = BTreeSet::new();
+        for (_start, (_end, set)) in self.iter_overlapping(r) {
+            out.extend(set.blocking.iter().cloned());
+            out.extend(set.nonblocking.iter().cloned());
+        }
+        out.into_iter().collect()
+    }
+
+    fn insert_range(
+        &mut self,
+        r: std::ops::Range<u64>,
+        job: u64,
+        blocking: bool,
+    ) {
+        // Okay, this is a tricky one.  The incoming range `r` can overlap with
+        // existing ranges in a variety of ways.
+        //
+        // The first operation is to split existing ranges at the incoming
+        // endpoints.  There are three possibilities, with splits marked by X:
+        //
+        // existing range:   |-------|
+        // new range:            |===========|
+        // result:           |---X---|
+        //                   ^ split_start
+        //
+        // existing range:      |-----------|
+        // new range:        |===========|
+        // result:              |--------X--|
+        //                      ^ split_end
+        //
+        // existing range:   |-------------------|
+        // new range:            |===========|
+        // result:           |---X-----------X---|
+        //                   ^ split_start
+        //                   ^ split_end (initially)
+        //                       ^ split_end (after split_start is done)
+        //
+        // The `split_start` and `split_end` variables represent the starting
+        // point of an existing range that should be split.
+        //
+        // Notice that we only split a _maximum_ of two existing ranges here;
+        // it's not unbounded.  Also note that a block which is entirely
+        // contained within the new range does not require any splits:
+        //
+        // existing range:       |--------|
+        // new range:          |============|
+        // result:               |--------|
+
+        let mut split_start = None;
+        let mut split_end = None;
+        for (start, (end, _set)) in self.iter_overlapping(r.clone()) {
+            if r.start >= *start && r.start < *end {
+                assert!(split_start.is_none());
+                split_start = Some(*start);
+            }
+            if r.end >= *start && r.end < *end {
+                assert!(split_end.is_none());
+                split_end = Some(*end);
+            }
+        }
+
+        // Now, we apply those splits
+        if let Some(s) = split_start {
+            let prev = self.lba_to_jobs.get_mut(&s).unwrap();
+            let v = prev.clone();
+            prev.0 = r.start;
+            self.lba_to_jobs.insert(r.start, v);
+            // Correct for the case where split_start and split_end point into
+            // the same existing range (see the diagram above!)
+            if split_start == split_end {
+                split_end = Some(r.start);
+            }
+        }
+        if let Some(s) = split_end {
+            let prev = self.lba_to_jobs.get_mut(&s).unwrap();
+            let v = prev.clone();
+            prev.0 = r.end;
+            self.lba_to_jobs.insert(r.end, v);
+        }
+
+        let mut pos = r.start;
+        while pos != r.end {
+            let mut next_start = self
+                .lba_to_jobs
+                .range_mut(pos..)
+                .next()
+                .map(|(start, _)| *start)
+                .unwrap_or(u64::MAX);
+            if next_start == pos {
+                pos = next_start;
+                // Modify existing range
+            } else {
+                assert!(next_start > pos);
+                next_start = next_start.min(r.end);
+                assert!(next_start > pos);
+                self.lba_to_jobs.insert(pos, (next_start, todo!()));
+                pos = next_start;
+            }
+        }
+    }
+
+    fn iter_overlapping(
+        &self,
+        r: std::ops::Range<u64>,
+    ) -> impl Iterator<Item = (&u64, &(u64, DependencySet))> {
+        let start = self
+            .lba_to_jobs
+            .range(0..=r.start)
+            .rev()
+            .next()
+            .map(|(start, _)| *start)
+            .unwrap_or(u64::MAX);
+        self.lba_to_jobs
+            .range(start..)
+            .skip_while(move |(_start, (end, _set))| *end <= r.start)
+            .take_while(move |(start, (_end, _set))| **start < r.end)
     }
 }
 
-#[derive(Debug)]
+/// A set of dependencies, associated with a range in a [`BlockToActive`]
+///
+/// Each dependency set has 0-1 blocking dependencies (e.g. writes), and any
+/// number of non-blocking dependencies.
+#[derive(Clone, Debug)]
 struct DependencySet {
     blocking: Option<u64>,
     nonblocking: Vec<u64>,
+}
+
+impl DependencySet {
+    fn new_blocking(job: u64) -> Self {
+        Self {
+            blocking: Some(job),
+            nonblocking: vec![],
+        }
+    }
+    fn new_nonblocking(job: u64) -> Self {
+        Self {
+            blocking: None,
+            nonblocking: vec![job],
+        }
+    }
+
+    fn insert_blocking(&mut self, job: u64) {
+        self.blocking = Some(job);
+        self.nonblocking.clear();
+    }
+
+    fn insert_nonblocking(&mut self, job: u64) {
+        self.nonblocking.push(job);
+    }
+
+    fn remove(&mut self, job: u64) {
+        if let Some(v) = self.blocking {
+            if v == job {
+                self.blocking = None;
+            }
+        }
+        self.nonblocking.retain(|&v| v != job);
+    }
 }
