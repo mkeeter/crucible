@@ -278,15 +278,7 @@ impl BlockToActive {
     fn check_range(&self, r: std::ops::Range<u64>, blocking: bool) -> Vec<u64> {
         let mut out = BTreeSet::new();
         for (_start, (_end, set)) in self.iter_overlapping(r) {
-            if blocking {
-                if set.nonblocking.is_empty() {
-                    out.extend(set.blocking.iter().cloned());
-                } else {
-                    out.extend(set.nonblocking.iter().cloned());
-                }
-            } else {
-                out.extend(set.blocking.iter().cloned());
-            }
+            out.extend(set.iter_jobs(blocking));
         }
         out.into_iter().collect()
     }
@@ -498,6 +490,21 @@ impl DependencySet {
     fn is_empty(&self) -> bool {
         self.blocking.is_none() && self.nonblocking.is_empty()
     }
+
+    /// Returns jobs that must be treated as dependencies
+    ///
+    /// If this is a blocking job, then it inherently depends on all jobs;
+    /// however, our non-blocking jobs _already_ depend on the existing blocking
+    /// job, so we can return them if present.
+    ///
+    /// If this is a non-blocking job, then it only depends on our blocking job
+    fn iter_jobs(&self, blocking: bool) -> impl Iterator<Item = u64> + '_ {
+        self.blocking
+            .iter()
+            .filter(move |_| self.nonblocking.is_empty() | !blocking)
+            .chain(self.nonblocking.iter().filter(move |_| blocking))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -538,16 +545,7 @@ mod test {
             let mut out = BTreeSet::new();
             for i in r {
                 if let Some(s) = self.0.get(&i) {
-                    // TODO: refactor this into a DependencySet function?
-                    if blocking {
-                        if s.nonblocking.is_empty() {
-                            out.extend(s.blocking.iter().cloned());
-                        } else {
-                            out.extend(s.nonblocking.iter().cloned());
-                        }
-                    } else {
-                        out.extend(s.blocking.iter().cloned());
-                    }
+                    out.extend(s.iter_jobs(blocking));
                 }
             }
             out.into_iter().collect()
