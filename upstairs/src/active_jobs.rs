@@ -395,8 +395,6 @@ impl BlockToActive {
     }
 
     fn merge_adjacent_sections(&mut self, r: std::ops::Range<u64>) {
-        println!();
-        println!("running with range {r:?}");
         let mut pos = self
             .lba_to_jobs
             .range(..r.start)
@@ -404,7 +402,6 @@ impl BlockToActive {
             .next()
             .map(|(start, _)| *start)
             .unwrap_or(r.start);
-        println!("starting loop at {pos} with {:?}", self.lba_to_jobs);
         while pos < r.end {
             let (end, value) = self.lba_to_jobs.get(&pos).unwrap();
             let end = *end;
@@ -418,11 +415,9 @@ impl BlockToActive {
                     // Leave pos at the existing position, so that we can
                     // continue merging later blocks
                 } else {
-                    println!("  not merging");
                     pos = end;
                 }
             } else {
-                println!("  assigning to {end}");
                 pos = end;
             }
             pos = self
