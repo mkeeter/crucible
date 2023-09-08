@@ -74,7 +74,8 @@ impl ActiveJobs {
             | IOop::Flush { .. }
             | IOop::ExtentLiveNoOp { .. }
             | IOop::ExtentFlushClose { .. }
-            | IOop::ExtentLiveReopen { .. } => true,
+            | IOop::ExtentLiveReopen { .. }
+            | IOop::ExtentLiveRepair { .. } => true,
             IOop::Read { .. } => false,
             _ => panic!("unexpected io work {:?}", io.work),
         };
@@ -83,7 +84,7 @@ impl ActiveJobs {
             (IOop::Flush { .. }, ImpactedBlocks::InclusiveRange(..)) => {
                 panic!("cannot have flush with impacted blocks")
             }
-            (_, ImpactedBlocks::Empty) => 0..0, // TODO is this avlid?
+            (_, ImpactedBlocks::Empty) => 0..0, // TODO is this valid?
             (_, ImpactedBlocks::InclusiveRange(..)) => {
                 self.to_lba_range(io.impacted_blocks)
             }
