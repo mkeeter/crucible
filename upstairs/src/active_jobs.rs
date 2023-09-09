@@ -398,6 +398,9 @@ impl BlockToActive {
     }
 
     fn merge_adjacent_sections(&mut self, r: std::ops::Range<ImpactedAddr>) {
+        // Pick a start position that's right below our modified range if
+        // possible; otherwise, pick the first value in the map (or return if
+        // the entire map is empty).
         let Some(mut pos) = self
             .addr_to_jobs
             .range(..r.start)
