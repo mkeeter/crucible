@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Default)]
 pub(crate) struct ActiveJobs {
     jobs: BTreeMap<u64, DownstairsIO>,
-    block_to_active: BlockToActive,
+    block_to_active: BlockMap,
     ackable: BTreeSet<u64>,
 }
 
@@ -241,7 +241,7 @@ impl<'a> std::ops::Drop for DownstairsIOHandle<'a> {
 
 /// Acceleration data structure to quickly look up dependencies
 #[derive(Debug, Default)]
-struct BlockToActive {
+struct BlockMap {
     /// Mapping from an exclusive block range to a set of dependencies
     ///
     /// The start of the range is the key; the end of the range is the first
@@ -253,7 +253,7 @@ struct BlockToActive {
     job_to_range: BTreeMap<u64, std::ops::Range<ImpactedAddr>>,
 }
 
-impl BlockToActive {
+impl BlockMap {
     /// Returns all dependencies that are active across the given range
     fn check_range(&self, r: ImpactedBlocks, blocking: bool) -> Vec<u64> {
         let mut out = BTreeSet::new();
@@ -519,7 +519,7 @@ impl BlockToActive {
     }
 }
 
-/// A set of dependencies, associated with a range in a [`BlockToActive`]
+/// A set of dependencies, associated with a range in a [`BlockMap`]
 ///
 /// Each dependency set has 0-1 blocking dependencies (e.g. writes), and any
 /// number of non-blocking dependencies.
@@ -604,7 +604,7 @@ mod test {
     use crate::{Block, RegionDefinition};
     use proptest::prelude::*;
 
-    /// The Oracle is similar to a [`BlockToActive`], but doesn't do range stuff
+    /// The Oracle is similar to a [`BlockMap`], but doesn't do range stuff
     ///
     /// Instead, it stores a dependency set at every single impacted block.
     /// This is much less efficient, but provides a ground-truth oracle for
@@ -707,7 +707,7 @@ mod test {
             c in block_strat(), c_type in any::<bool>(),
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockToActive::default();
+            let mut dut = BlockMap::default();
             dut.self_check();
             dut.insert_range(a, 1000, a_type);
             dut.self_check();
@@ -734,7 +734,7 @@ mod test {
             remove in 1000u64..1003,
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockToActive::default();
+            let mut dut = BlockMap::default();
             dut.insert_range(a, 1000, a_type);
             dut.insert_range(b, 1001, b_type);
             dut.insert_range(c, 1002, c_type);
@@ -759,7 +759,7 @@ mod test {
             a in block_strat(), a_type in any::<bool>(),
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockToActive::default();
+            let mut dut = BlockMap::default();
             dut.insert_range(a, 1000, a_type);
             dut.self_check();
             dut.remove_job(1000);
@@ -784,7 +784,7 @@ mod test {
             order in Just([1000, 1001, 1002]).prop_shuffle(),
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockToActive::default();
+            let mut dut = BlockMap::default();
             dut.insert_range(a, 1000, a_type);
             dut.insert_range(b, 1001, b_type);
             dut.insert_range(c, 1002, c_type);
@@ -816,7 +816,7 @@ mod test {
             c in block_strat(), c_type in any::<bool>(),
             order in Just([1000, 1001, 1002]).prop_shuffle()
         ) {
-            let mut dut = BlockToActive::default();
+            let mut dut = BlockMap::default();
             dut.insert_range(a, 1000, a_type);
             dut.insert_range(b, 1001, b_type);
             dut.insert_range(c, 1002, c_type);
@@ -848,7 +848,7 @@ mod test {
                 },
             );
 
-            let mut dut = BlockToActive::default();
+            let mut dut = BlockMap::default();
             dut.insert_range(a, 1000, a_type);
             dut.insert_range(b, 1001, b_type);
             dut.insert_range(flush_range, 1002, true);
