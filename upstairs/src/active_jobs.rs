@@ -84,7 +84,7 @@ impl ActiveJobs {
                     },
                     ImpactedAddr {
                         extent_id: u64::MAX,
-                        block: u64::MAX - 1,
+                        block: u64::MAX,
                     },
                 )
             }
@@ -128,7 +128,7 @@ impl ActiveJobs {
             },
             ImpactedAddr {
                 extent_id: u64::MAX,
-                block: u64::MAX - 1,
+                block: u64::MAX,
             },
         );
         self.block_to_active.check_range(r, true)
@@ -273,7 +273,7 @@ impl BlockToActive {
             ImpactedBlocks::InclusiveRange(first, last) => Some(
                 first..ImpactedAddr {
                     extent_id: last.extent_id,
-                    block: last.block + 1,
+                    block: last.block.saturating_add(1),
                 },
             ),
         }
@@ -293,10 +293,7 @@ impl BlockToActive {
                 .range_mut(pos..)
                 .next()
                 .map(|(start, _)| *start)
-                .unwrap_or(ImpactedAddr {
-                    extent_id: u64::MAX,
-                    block: u64::MAX,
-                });
+                .unwrap_or(r.end);
             if next_start == pos {
                 // Modify existing range
                 let (next_end, v) =
@@ -830,6 +827,30 @@ mod test {
 
             assert!(dut.addr_to_jobs.is_empty());
             assert!(dut.job_to_range.is_empty());
+        }
+
+        #[test]
+        fn test_active_jobs_flush(
+            a in block_strat(), a_type in any::<bool>(),
+            b in block_strat(), b_type in any::<bool>(),
+        ) {
+            let flush_range = ImpactedBlocks::InclusiveRange(
+                ImpactedAddr {
+                    extent_id: 0,
+                    block: 0,
+                },
+                ImpactedAddr {
+                    extent_id: u64::MAX,
+                    block: u64::MAX,
+                },
+            );
+
+            let mut dut = BlockToActive::default();
+            dut.insert_range(a, 1000, a_type);
+            dut.insert_range(b, 1001, b_type);
+            dut.insert_range(flush_range, 1002, true);
+
+            assert_eq!(dut.addr_to_jobs.len(), 1);
         }
     }
 }
