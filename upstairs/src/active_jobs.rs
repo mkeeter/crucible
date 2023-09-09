@@ -76,14 +76,19 @@ impl ActiveJobs {
             _ => panic!("unexpected io work {:?}", io.work),
         };
         let r = match (&io.work, &io.impacted_blocks) {
-            (IOop::Flush { .. }, ImpactedBlocks::Empty) => 0..u64::MAX,
-            (IOop::Flush { .. }, ImpactedBlocks::InclusiveRange(..)) => {
-                panic!("cannot have flush with impacted blocks")
+            (IOop::Flush { .. }, ImpactedBlocks::Empty) => {
+                ImpactedBlocks::InclusiveRange(
+                    ImpactedAddr {
+                        extent_id: 0,
+                        block: 0,
+                    },
+                    ImpactedAddr {
+                        extent_id: u64::MAX,
+                        block: u64::MAX - 1,
+                    },
+                )
             }
-            (_, ImpactedBlocks::Empty) => 0..0, // TODO is this valid?
-            (_, ImpactedBlocks::InclusiveRange(..)) => {
-                self.to_lba_range(io.impacted_blocks)
-            }
+            (_, b) => *b,
         };
         self.block_to_active.insert_range(r, job_id, blocking);
         self.jobs.insert(job_id, io);
@@ -116,17 +121,25 @@ impl ActiveJobs {
     }
 
     pub fn deps_for_flush(&self) -> Vec<u64> {
-        self.block_to_active.check_range(0..u64::MAX, true)
-    }
-
-    pub fn deps_for_write(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
-        let r = self.to_lba_range(impacted_blocks);
+        let r = ImpactedBlocks::InclusiveRange(
+            ImpactedAddr {
+                extent_id: 0,
+                block: 0,
+            },
+            ImpactedAddr {
+                extent_id: u64::MAX,
+                block: u64::MAX - 1,
+            },
+        );
         self.block_to_active.check_range(r, true)
     }
 
+    pub fn deps_for_write(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
+        self.block_to_active.check_range(impacted_blocks, true)
+    }
+
     pub fn deps_for_read(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
-        let r = self.to_lba_range(impacted_blocks);
-        self.block_to_active.check_range(r, false)
+        self.block_to_active.check_range(impacted_blocks, false)
     }
 
     // Build the list of dependencies for a live repair job.  These are jobs that
@@ -147,32 +160,6 @@ impl ActiveJobs {
     pub fn ackable_work(&self) -> Vec<u64> {
         self.ackable.iter().cloned().collect()
     }
-
-    /// Converts from an extent + relative block to a global block
-    ///
-    /// # Panics
-    /// If the global block address overflows a `u64`
-    fn to_lba(&self, block: ImpactedAddr) -> u64 {
-        block
-            .extent_id
-            .checked_mul(1 << 32)
-            .unwrap()
-            .checked_add(block.block)
-            .unwrap()
-    }
-
-    /// Converts from an (inclusive) block range to an (exclusive) LBA range
-    ///
-    /// # Panics
-    /// If any address overflows a `u64`
-    fn to_lba_range(&self, block: ImpactedBlocks) -> std::ops::Range<u64> {
-        match block {
-            ImpactedBlocks::Empty => 0..0,
-            ImpactedBlocks::InclusiveRange(start, end) => {
-                self.to_lba(start)..self.to_lba(end).checked_add(1).unwrap()
-            }
-        }
-    }
 }
 
 impl<'a> IntoIterator for &'a ActiveJobs {
@@ -183,6 +170,8 @@ impl<'a> IntoIterator for &'a ActiveJobs {
         self.jobs.iter()
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 /// Handle for a `DownstairsIO` that keeps secondary data in sync
 ///
@@ -248,6 +237,8 @@ impl<'a> std::ops::Drop for DownstairsIOHandle<'a> {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
 /// Acceleration data structure to quickly look up dependencies
 #[derive(Debug, Default)]
 struct BlockToActive {
@@ -258,26 +249,40 @@ struct BlockToActive {
     ///
     /// The data structure must maintain the invariant that block ranges never
     /// overlap.
-    lba_to_jobs: BTreeMap<u64, (u64, DependencySet)>,
-    job_to_range: BTreeMap<u64, std::ops::Range<u64>>,
+    addr_to_jobs: BTreeMap<ImpactedAddr, (ImpactedAddr, DependencySet)>,
+    job_to_range: BTreeMap<u64, ImpactedBlocks>,
 }
 
 impl BlockToActive {
     /// Returns all dependencies that are active across the given range
-    fn check_range(&self, r: std::ops::Range<u64>, blocking: bool) -> Vec<u64> {
+    fn check_range(&self, r: ImpactedBlocks, blocking: bool) -> Vec<u64> {
         let mut out = BTreeSet::new();
-        for (_start, (_end, set)) in self.iter_overlapping(r) {
-            out.extend(set.iter_jobs(blocking));
+        if let Some(r) = Self::blocks_to_range(r) {
+            for (_start, (_end, set)) in self.iter_overlapping(r) {
+                out.extend(set.iter_jobs(blocking));
+            }
         }
         out.into_iter().collect()
     }
 
-    fn insert_range(
-        &mut self,
-        r: std::ops::Range<u64>,
-        job: u64,
-        blocking: bool,
-    ) {
+    fn blocks_to_range(
+        r: ImpactedBlocks,
+    ) -> Option<std::ops::Range<ImpactedAddr>> {
+        match r {
+            ImpactedBlocks::Empty => None,
+            ImpactedBlocks::InclusiveRange(first, last) => Some(
+                first..ImpactedAddr {
+                    extent_id: last.extent_id,
+                    block: last.block + 1,
+                },
+            ),
+        }
+    }
+
+    fn insert_range(&mut self, r: ImpactedBlocks, job: u64, blocking: bool) {
+        self.job_to_range.insert(job, r);
+        let Some(r) = Self::blocks_to_range(r) else { return; };
+
         self.insert_splits(r.clone());
 
         // Iterate over the range covered by our new job, either modifying
@@ -285,15 +290,18 @@ impl BlockToActive {
         let mut pos = r.start;
         while pos != r.end {
             let mut next_start = self
-                .lba_to_jobs
+                .addr_to_jobs
                 .range_mut(pos..)
                 .next()
                 .map(|(start, _)| *start)
-                .unwrap_or(u64::MAX);
+                .unwrap_or(ImpactedAddr {
+                    extent_id: u64::MAX,
+                    block: u64::MAX,
+                });
             if next_start == pos {
                 // Modify existing range
                 let (next_end, v) =
-                    self.lba_to_jobs.get_mut(&next_start).unwrap();
+                    self.addr_to_jobs.get_mut(&next_start).unwrap();
                 assert!(*next_end <= r.end);
                 assert!(*next_end > pos);
                 if blocking {
@@ -307,7 +315,7 @@ impl BlockToActive {
                 assert!(next_start > pos);
                 next_start = next_start.min(r.end);
                 assert!(next_start > pos);
-                self.lba_to_jobs.insert(
+                self.addr_to_jobs.insert(
                     pos,
                     (
                         next_start,
@@ -322,11 +330,10 @@ impl BlockToActive {
             }
         }
 
-        self.merge_adjacent_sections(r.clone());
-        self.job_to_range.insert(job, r);
+        self.merge_adjacent_sections(r);
     }
 
-    fn insert_splits(&mut self, r: std::ops::Range<u64>) {
+    fn insert_splits(&mut self, r: std::ops::Range<ImpactedAddr>) {
         // Okay, this is a tricky one.  The incoming range `r` can overlap with
         // existing ranges in a variety of ways.
         //
@@ -376,10 +383,10 @@ impl BlockToActive {
 
         // Now, we apply those splits
         if let Some(s) = split_start {
-            let prev = self.lba_to_jobs.get_mut(&s).unwrap();
+            let prev = self.addr_to_jobs.get_mut(&s).unwrap();
             let v = prev.clone();
             prev.0 = r.start;
-            self.lba_to_jobs.insert(r.start, v);
+            self.addr_to_jobs.insert(r.start, v);
             // Correct for the case where split_start and split_end point into
             // the same existing range (see the diagram above!)
             if split_start == split_end {
@@ -387,31 +394,32 @@ impl BlockToActive {
             }
         }
         if let Some(s) = split_end {
-            let prev = self.lba_to_jobs.get_mut(&s).unwrap();
+            let prev = self.addr_to_jobs.get_mut(&s).unwrap();
             let v = prev.clone();
             prev.0 = r.end;
-            self.lba_to_jobs.insert(r.end, v);
+            self.addr_to_jobs.insert(r.end, v);
         }
     }
 
-    fn merge_adjacent_sections(&mut self, r: std::ops::Range<u64>) {
-        let mut pos = self
-            .lba_to_jobs
+    fn merge_adjacent_sections(&mut self, r: std::ops::Range<ImpactedAddr>) {
+        let Some(mut pos) = self
+            .addr_to_jobs
             .range(..r.start)
             .rev()
             .next()
             .map(|(start, _)| *start)
-            .unwrap_or(r.start);
+            .or_else(|| self.addr_to_jobs.first_key_value().map(|(k, _)| *k))
+            else { return; };
         while pos < r.end {
-            let (end, value) = self.lba_to_jobs.get(&pos).unwrap();
+            let (end, value) = self.addr_to_jobs.get(&pos).unwrap();
             let end = *end;
             // Check if the next range is adjacent
-            if let Some((new_end, next)) = self.lba_to_jobs.get(&end) {
+            if let Some((new_end, next)) = self.addr_to_jobs.get(&end) {
                 // Check if the adjacent range is the same :O
                 let new_end = *new_end;
                 if value == next {
-                    self.lba_to_jobs.get_mut(&pos).unwrap().0 = new_end;
-                    self.lba_to_jobs.remove(&end).unwrap();
+                    self.addr_to_jobs.get_mut(&pos).unwrap().0 = new_end;
+                    self.addr_to_jobs.remove(&end).unwrap();
                     // Leave pos at the existing position, so that we can
                     // continue merging later blocks
                 } else {
@@ -421,7 +429,7 @@ impl BlockToActive {
                 pos = end;
             }
             pos = self
-                .lba_to_jobs
+                .addr_to_jobs
                 .range(pos..)
                 .next()
                 .map(|(start, _)| *start)
@@ -431,16 +439,17 @@ impl BlockToActive {
 
     fn iter_overlapping(
         &self,
-        r: std::ops::Range<u64>,
-    ) -> impl Iterator<Item = (&u64, &(u64, DependencySet))> {
+        r: std::ops::Range<ImpactedAddr>,
+    ) -> impl Iterator<Item = (&ImpactedAddr, &(ImpactedAddr, DependencySet))>
+    {
         let start = self
-            .lba_to_jobs
-            .range(0..=r.start)
+            .addr_to_jobs
+            .range(..=r.start)
             .rev()
             .next()
             .map(|(start, _)| *start)
             .unwrap_or(r.start);
-        self.lba_to_jobs
+        self.addr_to_jobs
             .range(start..)
             .skip_while(move |(_start, (end, _set))| *end <= r.start)
             .take_while(move |(start, (_end, _set))| **start < r.end)
@@ -449,15 +458,66 @@ impl BlockToActive {
     /// Removes the given job from its range
     fn remove_job(&mut self, job: u64) {
         let r = self.job_to_range.remove(&job).unwrap();
-        self.insert_splits(r.clone());
-        let mut start = r.start;
-        while &start != &r.end {
-            let (end, v) = self.lba_to_jobs.get_mut(&start).unwrap();
-            v.remove(job);
-            start = *end;
+        if let Some(r) = Self::blocks_to_range(r) {
+            self.insert_splits(r.clone());
+
+            // Iterate over the range covered by our new job, either modifying
+            // existing ranges or inserting new ranges as needed.
+            let mut pos = r.start;
+            while pos != r.end {
+                let mut next_start = self
+                    .addr_to_jobs
+                    .range_mut(pos..)
+                    .next()
+                    .map(|(start, _)| *start)
+                    .unwrap_or(ImpactedAddr {
+                        extent_id: u64::MAX,
+                        block: u64::MAX,
+                    });
+                if next_start == pos {
+                    // Remove ourself from the existing range
+                    let (next_end, v) =
+                        self.addr_to_jobs.get_mut(&next_start).unwrap();
+                    v.remove(job);
+                    pos = *next_end;
+                } else {
+                    // This range is already gone; it was probably overwritten
+                    // and then the overwritten range was removed.
+                    assert!(next_start > pos);
+                    next_start = next_start.min(r.end);
+                    assert!(next_start > pos);
+                    pos = next_start;
+                }
+            }
+            self.merge_adjacent_sections(r);
         }
-        self.merge_adjacent_sections(r);
-        self.lba_to_jobs.retain(|_start, (_end, v)| !v.is_empty());
+        self.addr_to_jobs.retain(|_start, (_end, v)| !v.is_empty());
+    }
+
+    /// Self-check routine for invariants
+    #[cfg(test)]
+    fn self_check(&self) {
+        // Adjacent ranges with equal values should be merged
+        for a @ (_, (end, va)) in self.addr_to_jobs.iter() {
+            if let Some(b @ (_, vb)) = self.addr_to_jobs.get(end) {
+                assert!(
+                    va != vb,
+                    "neighboring sections {a:?} {:?} should be merged",
+                    (end, b)
+                );
+            }
+        }
+        // Ranges must be non-overlapping
+        for ((_, (ae, _)), (b, _)) in self
+            .addr_to_jobs
+            .iter()
+            .zip(self.addr_to_jobs.iter().skip(1))
+        {
+            assert!(b >= ae, "ranges must not overlap");
+        }
+        for (a, (ae, _)) in self.addr_to_jobs.iter() {
+            assert!(ae > a, "ranges must not be empty");
+        }
     }
 }
 
@@ -519,6 +579,7 @@ impl DependencySet {
         }
         self.nonblocking.retain(|&v| v != job);
     }
+
     fn is_empty(&self) -> bool {
         self.blocking.is_none() && self.nonblocking.is_empty()
     }
@@ -527,7 +588,7 @@ impl DependencySet {
     ///
     /// If this is a blocking job, then it inherently depends on all jobs;
     /// however, our non-blocking jobs _already_ depend on the existing blocking
-    /// job, so we can return them if present.
+    /// job, so we can return them if present and skip the blocking job.
     ///
     /// If this is a non-blocking job, then it only depends on our blocking job
     fn iter_jobs(&self, blocking: bool) -> impl Iterator<Item = u64> + '_ {
@@ -542,27 +603,47 @@ impl DependencySet {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{Block, RegionDefinition};
     use proptest::prelude::*;
 
     /// The Oracle is similar to a [`BlockToActive`], but doesn't do range stuff
     ///
-    /// Instead, it stores a dependency set at every single point.  This is used
-    /// for property-based testing.
-    #[derive(Default)]
+    /// Instead, it stores a dependency set at every single impacted block.
+    /// This is much less efficient, but provides a ground-truth oracle for
+    /// property-based testing.
     struct Oracle {
-        lba_to_jobs: BTreeMap<u64, DependencySet>,
-        job_to_range: BTreeMap<u64, std::ops::Range<u64>>,
+        addr_to_jobs: BTreeMap<ImpactedAddr, DependencySet>,
+        job_to_range: BTreeMap<u64, ImpactedBlocks>,
+        ddef: RegionDefinition,
     }
 
     impl Oracle {
+        fn new() -> Self {
+            let mut ddef = RegionDefinition::default();
+            // TODO these must be kept in sync manually, which seems bad
+            ddef.set_extent_size(Block {
+                value: BLOCKS_PER_EXTENT,
+                shift: crucible_common::MIN_SHIFT, // unused
+            });
+            ddef.set_block_size(crucible_common::MIN_BLOCK_SIZE as u64);
+            Self {
+                addr_to_jobs: BTreeMap::new(),
+                job_to_range: BTreeMap::new(),
+                ddef,
+            }
+        }
         fn insert_range(
             &mut self,
-            r: std::ops::Range<u64>,
+            r: ImpactedBlocks,
             job: u64,
             blocking: bool,
         ) {
-            for i in r.clone() {
-                let v = self.lba_to_jobs.entry(i).or_default();
+            for (i, b) in r.blocks(&self.ddef) {
+                let addr = ImpactedAddr {
+                    extent_id: i,
+                    block: b.value,
+                };
+                let v = self.addr_to_jobs.entry(addr).or_default();
                 if blocking {
                     v.insert_blocking(job)
                 } else {
@@ -571,14 +652,14 @@ mod test {
             }
             self.job_to_range.insert(job, r);
         }
-        fn check_range(
-            &self,
-            r: std::ops::Range<u64>,
-            blocking: bool,
-        ) -> Vec<u64> {
+        fn check_range(&self, r: ImpactedBlocks, blocking: bool) -> Vec<u64> {
             let mut out = BTreeSet::new();
-            for i in r {
-                if let Some(s) = self.lba_to_jobs.get(&i) {
+            for (i, b) in r.blocks(&self.ddef) {
+                let addr = ImpactedAddr {
+                    extent_id: i,
+                    block: b.value,
+                };
+                if let Some(s) = self.addr_to_jobs.get(&addr) {
                     out.extend(s.iter_jobs(blocking));
                 }
             }
@@ -586,85 +667,170 @@ mod test {
         }
         fn remove_job(&mut self, job: u64) {
             let r = self.job_to_range.remove(&job).unwrap();
-            for i in r {
-                if let Some(s) = self.lba_to_jobs.get_mut(&i) {
+            // TODO: why does `blocks` not return an ImpactedAddr?
+            for (i, b) in r.blocks(&self.ddef) {
+                let addr = ImpactedAddr {
+                    extent_id: i,
+                    block: b.value,
+                };
+                if let Some(s) = self.addr_to_jobs.get_mut(&addr) {
                     s.remove(job);
                 }
             }
         }
     }
 
-    fn assert_not_overlapping(dut: &BlockToActive) {
-        for a @ (_, (end, va)) in dut.lba_to_jobs.iter() {
-            if let Some(b @ (_, vb)) = dut.lba_to_jobs.get(end) {
-                assert!(
-                    va != vb,
-                    "neighboring sections {a:?} {:?} should be merged",
-                    (end, b)
-                );
+    const BLOCKS_PER_EXTENT: u64 = 8;
+
+    fn block_strat() -> impl Strategy<Value = ImpactedBlocks> {
+        (0u64..100, 0u64..100).prop_map(|(start, len)| {
+            if len == 0 {
+                ImpactedBlocks::Empty
+            } else {
+                ImpactedBlocks::InclusiveRange(
+                    ImpactedAddr {
+                        extent_id: start / BLOCKS_PER_EXTENT,
+                        block: start % BLOCKS_PER_EXTENT,
+                    },
+                    ImpactedAddr {
+                        extent_id: (start + len - 1) / BLOCKS_PER_EXTENT,
+                        block: (start + len - 1) % BLOCKS_PER_EXTENT,
+                    },
+                )
             }
-        }
+        })
     }
 
     proptest! {
         #[test]
         fn test_active_jobs_insert(
-            a_start in 0u64..100, a_size in 1u64..50, a_type in any::<bool>(),
-            b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
-            c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
-            read_start in 0u64..100, read_size in 1u64..50,
-            read_type in any::<bool>(),
+            a in block_strat(), a_type in any::<bool>(),
+            b in block_strat(), b_type in any::<bool>(),
+            c in block_strat(), c_type in any::<bool>(),
+            read in block_strat(), read_type in any::<bool>(),
         ) {
             let mut dut = BlockToActive::default();
-            assert_not_overlapping(&dut);
-            dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
-            assert_not_overlapping(&dut);
-            dut.insert_range(b_start..(b_start + b_size), 1001, b_type);
-            assert_not_overlapping(&dut);
-            dut.insert_range(c_start..(c_start + c_size), 1002, c_type);
-            assert_not_overlapping(&dut);
+            dut.self_check();
+            dut.insert_range(a, 1000, a_type);
+            dut.self_check();
+            dut.insert_range(b, 1001, b_type);
+            dut.self_check();
+            dut.insert_range(c, 1002, c_type);
+            dut.self_check();
 
-            let mut oracle = Oracle::default();
-            oracle.insert_range(a_start..(a_start + a_size), 1000, a_type);
-            oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
-            oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
+            let mut oracle = Oracle::new();
+            oracle.insert_range(a, 1000, a_type);
+            oracle.insert_range(b, 1001, b_type);
+            oracle.insert_range(c, 1002, c_type);
 
-            let read_dut = dut.check_range(
-                read_start..(read_start + read_size), read_type);
-            let read_oracle = oracle.check_range(
-                read_start..(read_start + read_size), read_type);
+            let read_dut = dut.check_range(read, read_type);
+            let read_oracle = oracle.check_range(read, read_type);
             assert_eq!(read_dut, read_oracle);
         }
 
         #[test]
         fn test_active_jobs_remove(
-            a_start in 0u64..100, a_size in 1u64..50, a_type in any::<bool>(),
-            b_start in 0u64..100, b_size in 1u64..50, b_type in any::<bool>(),
-            c_start in 0u64..100, c_size in 1u64..50, c_type in any::<bool>(),
-            remove in 0usize..3,
-            read_start in 0u64..100, read_size in 1u64..50,
-            read_type in any::<bool>()
+            a in block_strat(), a_type in any::<bool>(),
+            b in block_strat(), b_type in any::<bool>(),
+            c in block_strat(), c_type in any::<bool>(),
+            remove in 1000u64..1003,
+            read in block_strat(), read_type in any::<bool>(),
         ) {
             let mut dut = BlockToActive::default();
-            dut.insert_range(a_start..(a_start + a_size), 1000, a_type);
-            dut.insert_range(b_start..(b_start + b_size), 1001, b_type);
-            dut.insert_range(c_start..(c_start + c_size), 1002, c_type);
+            dut.insert_range(a, 1000, a_type);
+            dut.insert_range(b, 1001, b_type);
+            dut.insert_range(c, 1002, c_type);
 
-            let mut oracle = Oracle::default();
-            oracle.insert_range(a_start..(a_start + a_size), 1000, a_type);
-            oracle.insert_range(b_start..(b_start + b_size), 1001, b_type);
-            oracle.insert_range(c_start..(c_start + c_size), 1002, c_type);
+            let mut oracle = Oracle::new();
+            oracle.insert_range(a, 1000, a_type);
+            oracle.insert_range(b, 1001, b_type);
+            oracle.insert_range(c, 1002, c_type);
 
-            dut.remove_job(1000 + remove as u64);
-            oracle.remove_job(1000 + remove as u64);
+            dut.remove_job(remove);
+            oracle.remove_job(remove);
 
-            let read_dut = dut.check_range(
-                read_start..(read_start + read_size), read_type);
-            let read_oracle = oracle.check_range(
-                read_start..(read_start + read_size), read_type);
+            let read_dut = dut.check_range(read, read_type);
+            let read_oracle = oracle.check_range(read, read_type);
             assert_eq!(read_dut, read_oracle);
 
-            assert_not_overlapping(&dut);
+            dut.self_check();
+        }
+
+        #[test]
+        fn test_active_jobs_remove_single(
+            a in block_strat(), a_type in any::<bool>(),
+            read in block_strat(), read_type in any::<bool>(),
+        ) {
+            let mut dut = BlockToActive::default();
+            dut.insert_range(a, 1000, a_type);
+            dut.self_check();
+            dut.remove_job(1000);
+
+            let mut oracle = Oracle::new();
+            oracle.insert_range(a, 1000, a_type);
+            oracle.remove_job(1000);
+
+            assert!(dut.addr_to_jobs.is_empty());
+            assert!(dut.job_to_range.is_empty());
+
+            let read_dut = dut.check_range(read, read_type);
+            let read_oracle = oracle.check_range(read, read_type);
+            assert_eq!(read_dut, read_oracle);
+        }
+
+        #[test]
+        fn test_active_jobs_remove_two(
+            a in block_strat(), a_type in any::<bool>(),
+            b in block_strat(), b_type in any::<bool>(),
+            c in block_strat(), c_type in any::<bool>(),
+            order in Just([1000, 1001, 1002]).prop_shuffle(),
+            read in block_strat(), read_type in any::<bool>(),
+        ) {
+            let mut dut = BlockToActive::default();
+            dut.insert_range(a, 1000, a_type);
+            dut.insert_range(b, 1001, b_type);
+            dut.insert_range(c, 1002, c_type);
+            dut.remove_job(order[0]);
+            dut.remove_job(order[1]);
+            dut.self_check();
+
+            let mut oracle = Oracle::new();
+            oracle.insert_range(a, 1000, a_type);
+            oracle.insert_range(b, 1001, b_type);
+            oracle.insert_range(c, 1002, c_type);
+            oracle.remove_job(order[0]);
+            oracle.remove_job(order[1]);
+
+            let read_dut = dut.check_range(read, read_type);
+            let read_oracle = oracle.check_range(read, read_type);
+            assert_eq!(read_dut, read_oracle);
+
+            dut.remove_job(order[2]);
+            assert!(dut.addr_to_jobs.is_empty());
+            assert!(dut.job_to_range.is_empty());
+        }
+
+        #[test]
+        fn test_active_jobs_remove_all(
+            a in block_strat(), a_type in any::<bool>(),
+            b in block_strat(), b_type in any::<bool>(),
+            c in block_strat(), c_type in any::<bool>(),
+            order in Just([1000, 1001, 1002]).prop_shuffle()
+        ) {
+            let mut dut = BlockToActive::default();
+            dut.insert_range(a, 1000, a_type);
+            dut.insert_range(b, 1001, b_type);
+            dut.insert_range(c, 1002, c_type);
+
+            dut.remove_job(order[0]);
+            dut.self_check();
+            dut.remove_job(order[1]);
+            dut.self_check();
+            dut.remove_job(order[2]);
+            dut.self_check();
+
+            assert!(dut.addr_to_jobs.is_empty());
+            assert!(dut.job_to_range.is_empty());
         }
     }
 }

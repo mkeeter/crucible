@@ -5936,20 +5936,19 @@ pub mod repair_test {
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1004);
         assert_eq!(new_deps, &[1001, 1002, 1003]);
 
-        // This second write after starting a repair should require jobs 0,1,4
-        // on Active downstairs, and only require the repair on the
-        // LiveRepair downstairs.
+        // This second write after starting a repair should only require the
+        // repair job on all downstairs
         let job = ds.ds_active.get(&1005).unwrap();
         assert_eq!(job.state[&0], IOState::New);
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
         let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1004, 1001, 1000]);
+        assert_eq!(&current_deps, &[1004]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1005);
         // LiveRepair downstairs won't see past the repair.
-        assert_eq!(new_deps, &[1004, 1001]);
+        assert_eq!(new_deps, &[1004]);
     }
     //       block   block
     // op# | 0 1 2 | 3 4 5 |
