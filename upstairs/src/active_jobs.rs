@@ -250,7 +250,7 @@ struct BlockToActive {
     /// The data structure must maintain the invariant that block ranges never
     /// overlap.
     addr_to_jobs: BTreeMap<ImpactedAddr, (ImpactedAddr, DependencySet)>,
-    job_to_range: BTreeMap<u64, ImpactedBlocks>,
+    job_to_range: BTreeMap<u64, std::ops::Range<ImpactedAddr>>,
 }
 
 impl BlockToActive {
@@ -280,10 +280,9 @@ impl BlockToActive {
     }
 
     fn insert_range(&mut self, r: ImpactedBlocks, job: u64, blocking: bool) {
-        self.job_to_range.insert(job, r);
         let Some(r) = Self::blocks_to_range(r) else { return; };
-
         self.insert_splits(r.clone());
+        self.job_to_range.insert(job, r.clone());
 
         // Iterate over the range covered by our new job, either modifying
         // existing ranges or inserting new ranges as needed.
@@ -457,8 +456,7 @@ impl BlockToActive {
 
     /// Removes the given job from its range
     fn remove_job(&mut self, job: u64) {
-        let r = self.job_to_range.remove(&job).unwrap();
-        if let Some(r) = Self::blocks_to_range(r) {
+        if let Some(r) = self.job_to_range.remove(&job) {
             self.insert_splits(r.clone());
 
             // Iterate over the range covered by our new job, either modifying
