@@ -806,6 +806,7 @@ mod test {
             dut.remove_job(order[2]);
             assert!(dut.addr_to_jobs.is_empty());
             assert!(dut.job_to_range.is_empty());
+            dut.self_check();
         }
 
         #[test]
