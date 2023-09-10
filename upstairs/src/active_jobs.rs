@@ -630,10 +630,22 @@ impl DependencySet {
     ///
     /// If this is a non-blocking job, then it only depends on our blocking job
     fn iter_jobs(&self, blocking: bool) -> impl Iterator<Item = u64> + '_ {
-        self.blocking
-            .iter()
-            .filter(move |_| self.nonblocking.is_empty() | !blocking)
-            .chain(self.nonblocking.iter().filter(move |_| blocking))
+        // Forgive the iterator magic; we have to return a concrete type, and
+        // using Option<Iterator>::into_iter().flatten().chain() is a convenient
+        // way to write conditionals into the iterator chain.
+        let a = if self.nonblocking.is_empty() | !blocking {
+            Some(self.blocking.iter())
+        } else {
+            None
+        };
+        let b = if blocking {
+            Some(self.nonblocking.iter())
+        } else {
+            None
+        };
+        a.into_iter()
+            .flatten()
+            .chain(b.into_iter().flatten())
             .cloned()
     }
 }
