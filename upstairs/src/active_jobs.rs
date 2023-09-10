@@ -392,29 +392,14 @@ impl BlockMap {
         // new range:          |============|
         // result:               |--------|
 
-        let split_start = if let Some((start, (end, _))) =
-            self.addr_to_jobs.range(..r.start).rev().next()
+        let find_split_for = |v| match self.addr_to_jobs.range(..v).rev().next()
         {
-            if r.start < *end {
-                Some(*start)
-            } else {
-                None
-            }
-        } else {
-            None
+            Some((start, (end, _))) if v < *end => Some(*start),
+            _ => None,
         };
 
-        let mut split_end = if let Some((start, (end, _))) =
-            self.addr_to_jobs.range(..r.end).rev().next()
-        {
-            if r.end < *end {
-                Some(*start)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let split_start = find_split_for(r.start);
+        let mut split_end = find_split_for(r.end);
 
         // Now, we apply those splits
         if let Some(s) = split_start {
