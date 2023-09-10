@@ -392,18 +392,29 @@ impl BlockMap {
         // new range:          |============|
         // result:               |--------|
 
-        let mut split_start = None;
-        let mut split_end = None;
-        for (start, (end, _set)) in self.iter_overlapping(r.clone()) {
-            if r.start >= *start && r.start < *end {
-                assert!(split_start.is_none());
-                split_start = Some(*start);
+        let split_start = if let Some((start, (end, _))) =
+            self.addr_to_jobs.range(..r.start).rev().next()
+        {
+            if r.start < *end {
+                Some(*start)
+            } else {
+                None
             }
-            if r.end >= *start && r.end < *end {
-                assert!(split_end.is_none());
-                split_end = Some(*start);
+        } else {
+            None
+        };
+
+        let mut split_end = if let Some((start, (end, _))) =
+            self.addr_to_jobs.range(..r.end).rev().next()
+        {
+            if r.end < *end {
+                Some(*start)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // Now, we apply those splits
         if let Some(s) = split_start {
