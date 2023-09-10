@@ -5829,19 +5829,20 @@ pub mod repair_test {
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1007);
         assert_eq!(new_deps, empty);
 
-        // This second write after starting a repair should require job 4 on
-        // both the Active and LiveRepair downstairs, since it masks job 0
+        // This second write after starting a repair should require job 6 (i.e.
+        // the final job of the repair) on both the Active and LiveRepair
+        // downstairs, since it masks job 0
         let job = ds.ds_active.get(&1008).unwrap();
         assert_eq!(job.state[&0], IOState::New);
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
         let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1004]);
+        assert_eq!(&current_deps, &[1006]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1008);
         // LiveRepair downstairs won't see past the repair.
-        assert_eq!(new_deps, &[1004]);
+        assert_eq!(new_deps, &[1006]);
 
         // This final job depends on everything on Active downstairs, but
         // a smaller subset for the LiveRepair downstairs
@@ -5850,16 +5851,15 @@ pub mod repair_test {
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
-        // All the current operations, plus the Reopen operation that doesn't
-        // exist yet
+        // The last write depends on
+        // 1) the final operation on the repair of extent 0
+        // 2) the write operation (8) on extent 0
+        // 3) a new repair operation on extent 1
         let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1001, 1004, 1007, 1008, 1012]);
+        assert_eq!(&current_deps, &[1006, 1008, 1012]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1013);
-        // LiveRepair downstairs won't see past the repair, and it won't
-        // include the skipped IO at 1007, but will have the future repair
-        // close operation that doesn't yet exist.
-        assert_eq!(new_deps, &[1004, 1008, 1012]);
+        assert_eq!(new_deps, &[1006, 1008, 1012]);
     }
 
     #[tokio::test]
