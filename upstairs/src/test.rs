@@ -29,15 +29,6 @@ pub(crate) mod up_test {
         (eid, Block::new_512(offset))
     }
 
-    fn extent_repair_ids() -> ExtentRepairIDs {
-        ExtentRepairIDs {
-            close_id: 1,
-            repair_id: 2,
-            noop_id: 3,
-            reopen_id: 4,
-        }
-    }
-
     fn generic_read_request() -> (ReadRequest, ImpactedBlocks) {
         let request = ReadRequest {
             eid: 0,
@@ -6035,8 +6026,7 @@ pub(crate) mod up_test {
             dependencies: Vec::new(),
             requests: vec![request],
         };
-        let mut assigned_job_ids = HashMap::new();
-        assert!(op.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(op.send_io_live_repair(Some(2)));
 
         // At limit
         let request = ReadRequest {
@@ -6047,7 +6037,7 @@ pub(crate) mod up_test {
             dependencies: Vec::new(),
             requests: vec![request],
         };
-        assert!(op.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(op.send_io_live_repair(Some(2)));
 
         let request = ReadRequest {
             eid: 3,
@@ -6058,12 +6048,10 @@ pub(crate) mod up_test {
             requests: vec![request],
         };
         // We are past the extent limit, so this should return false
-        assert!(!op.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(!op.send_io_live_repair(Some(2)));
 
-        // Now, assign a job ID for this live repair, meaning it's in the
-        // dependency tree
-        assigned_job_ids.insert(3, extent_repair_ids());
-        assert!(op.send_io_live_repair(Some(2), &assigned_job_ids));
+        // If we change the extent limit, it should become true
+        assert!(op.send_io_live_repair(Some(2)));
     }
 
     // Construct an IOop::Write or IOop::WriteUnwritten at the given extent
@@ -6096,49 +6084,43 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn send_io_live_repair_write() {
         // Check the send_io_live_repair for a write below extent limit,
-        // at extent limit, and above extent limit (with and without an assigned
-        // job ID)
-        let mut assigned_job_ids = HashMap::new();
+        // at extent limit, and above extent limit.
 
         // Below limit
         let wr = write_at_extent(0, false);
-        assert!(wr.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(wr.send_io_live_repair(Some(2)));
 
         // At the limit
         let wr = write_at_extent(2, false);
-        assert!(wr.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(wr.send_io_live_repair(Some(2)));
 
         // Above the limit
         let wr = write_at_extent(3, false);
-        assert!(!wr.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(!wr.send_io_live_repair(Some(2)));
 
-        // Above the limit with an assigned job ID
-        assigned_job_ids.insert(3, extent_repair_ids());
-        assert!(wr.send_io_live_repair(Some(3), &assigned_job_ids));
+        // Back to being below the limit
+        assert!(wr.send_io_live_repair(Some(3)));
     }
 
     #[tokio::test]
     async fn send_io_live_repair_unwritten_write() {
         // Check the send_io_live_repair for a write unwritten below extent
-        // at extent limit, and above extent limit (with and without an assigned
-        // job ID)
-        let mut assigned_job_ids = HashMap::new();
+        // at extent limit, and above extent limit.
 
         // Below limit
         let wr = write_at_extent(0, true);
-        assert!(wr.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(wr.send_io_live_repair(Some(2)));
 
         // At the limit
         let wr = write_at_extent(2, true);
-        assert!(wr.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(wr.send_io_live_repair(Some(2)));
 
         // Above the limit
         let wr = write_at_extent(3, true);
-        assert!(!wr.send_io_live_repair(Some(2), &assigned_job_ids));
+        assert!(!wr.send_io_live_repair(Some(2)));
 
-        // Above the limit with an assigned job ID
-        assigned_job_ids.insert(3, extent_repair_ids());
-        assert!(wr.send_io_live_repair(Some(3), &assigned_job_ids));
+        // Back to being below the limit
+        assert!(wr.send_io_live_repair(Some(3)));
     }
 
     #[tokio::test]

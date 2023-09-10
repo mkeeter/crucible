@@ -1,6 +1,9 @@
 // Copyright 2023 Oxide Computer Company
 
-use crate::{AckStatus, DownstairsIO, IOop, ImpactedAddr, ImpactedBlocks};
+use crate::{
+    AckStatus, DownstairsIO, ExtentRepairIDs, IOop, ImpactedAddr,
+    ImpactedBlocks,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `ActiveJobs` tracks active jobs by ID
@@ -67,12 +70,13 @@ impl ActiveJobs {
         let blocking = match &io.work {
             IOop::Write { .. }
             | IOop::WriteUnwritten { .. }
-            | IOop::Flush { .. }
+            | IOop::Flush { .. } => Some(true),
+            IOop::Read { .. } => Some(false),
+            // Repair deps were already added in in `insert_repair`
+            IOop::ExtentFlushClose { .. }
             | IOop::ExtentLiveNoOp { .. }
-            | IOop::ExtentFlushClose { .. }
             | IOop::ExtentLiveReopen { .. }
-            | IOop::ExtentLiveRepair { .. } => true,
-            IOop::Read { .. } => false,
+            | IOop::ExtentLiveRepair { .. } => None,
             _ => panic!("unexpected io work {:?}", io.work),
         };
         let r = match (&io.work, &io.impacted_blocks) {
@@ -90,8 +94,36 @@ impl ActiveJobs {
             }
             (_, b) => *b,
         };
-        self.block_to_active.insert_range(r, job_id, blocking);
         self.jobs.insert(job_id, io);
+        if let Some(blocking) = blocking {
+            self.block_to_active.insert_range(r, job_id, blocking);
+        }
+    }
+
+    /// Inserts a set of repair IDs into the dependency tracker.
+    ///
+    /// Note that jobs are only added to the dependency tracker; they are not
+    /// added to the list of active jobs (because this may be a future
+    /// reservation, without an allocated `DownstairsIO`).
+    pub fn insert_repair(
+        &mut self,
+        repair_ids: ExtentRepairIDs,
+        extent: u64,
+    ) -> Vec<u64> {
+        let blocks = ImpactedBlocks::InclusiveRange(
+            ImpactedAddr {
+                extent_id: extent,
+                block: 0,
+            },
+            ImpactedAddr {
+                extent_id: extent,
+                block: u64::MAX,
+            },
+        );
+        let dep = self.block_to_active.check_range(blocks, true);
+        self.block_to_active
+            .insert_range(blocks, repair_ids.reopen_id, true);
+        dep
     }
 
     /// Removes a job by ID, returning its IO work
@@ -140,21 +172,6 @@ impl ActiveJobs {
 
     pub fn deps_for_read(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
         self.block_to_active.check_range(impacted_blocks, false)
-    }
-
-    // Build the list of dependencies for a live repair job.  These are jobs that
-    // must finish before this repair job can move begin.  Because we need all
-    // three repair jobs to happen lock step, we have to prevent any IO from
-    // hitting the same extent, which means any IO going to our ImpactedBlocks
-    // (the whole extent) must finish first (or come after) our job.
-    pub fn deps_for_live_repair(
-        &self,
-        impacted_blocks: ImpactedBlocks,
-        close_id: u64,
-    ) -> Vec<u64> {
-        let mut out = self.deps_for_write(impacted_blocks);
-        out.retain(|v| *v <= close_id);
-        out
     }
 
     pub fn ackable_work(&self) -> Vec<u64> {
@@ -251,6 +268,17 @@ struct BlockMap {
     /// overlap.
     addr_to_jobs: BTreeMap<ImpactedAddr, (ImpactedAddr, DependencySet)>,
     job_to_range: BTreeMap<u64, std::ops::Range<ImpactedAddr>>,
+
+    /// If we know the number of blocks in an extent, it's stored here
+    ///
+    /// This is used for optimization: for example, if there are 8 blocks per
+    /// extent, then `{ extent: 0, block: 8 }` represents the same block as
+    /// `{ extent: 1, block: 0 }`.
+    ///
+    /// If we _don't_ know blocks per extent, this still works: the former is
+    /// lexicographically ordered below the latter.  However, there could be
+    /// unknown zero-length ranges in the range map.
+    blocks_per_extent: Option<u64>,
 }
 
 impl BlockMap {
@@ -409,30 +437,37 @@ impl BlockMap {
             .map(|(start, _)| *start)
             .or_else(|| self.addr_to_jobs.first_key_value().map(|(k, _)| *k))
             else { return; };
-        while pos < r.end {
+        while pos <= r.end {
             let (end, value) = self.addr_to_jobs.get(&pos).unwrap();
             let end = *end;
-            // Check if the next range is adjacent
-            if let Some((new_end, next)) = self.addr_to_jobs.get(&end) {
-                // Check if the adjacent range is the same :O
-                let new_end = *new_end;
-                if value == next {
+            match self.addr_to_jobs.get(&end) {
+                // If the next range is adjacent and equal, merge into it
+                Some((new_end, next)) if value == next => {
+                    let new_end = *new_end;
                     self.addr_to_jobs.get_mut(&pos).unwrap().0 = new_end;
                     self.addr_to_jobs.remove(&end).unwrap();
                     // Leave pos at the existing position, so that we can
                     // continue merging later blocks
-                } else {
-                    pos = end;
                 }
-            } else {
-                pos = end;
+                _ => {
+                    // Remove blocks which are pathologically empty
+                    if (pos.block == u64::MAX
+                        || Some(pos.block) == self.blocks_per_extent)
+                        && end.block == 0
+                        && end.extent_id == pos.extent_id + 1
+                    {
+                        self.addr_to_jobs.remove(&pos).unwrap();
+                    }
+                    // Shuffle along
+                    let Some(next_pos) = self
+                        .addr_to_jobs
+                        .range(end..)
+                        .next()
+                        .map(|(start, _)| *start)
+                        else { break; };
+                    pos = next_pos;
+                }
             }
-            pos = self
-                .addr_to_jobs
-                .range(pos..)
-                .next()
-                .map(|(start, _)| *start)
-                .unwrap_or(r.end);
         }
     }
 
@@ -456,6 +491,7 @@ impl BlockMap {
 
     /// Removes the given job from its range
     fn remove_job(&mut self, job: u64) {
+        let mut to_remove = vec![];
         if let Some(r) = self.job_to_range.remove(&job) {
             self.insert_splits(r.clone());
 
@@ -478,6 +514,9 @@ impl BlockMap {
                         self.addr_to_jobs.get_mut(&next_start).unwrap();
                     v.remove(job);
                     pos = *next_end;
+                    if v.is_empty() {
+                        to_remove.push(next_start);
+                    }
                 } else {
                     // This range is already gone; it was probably overwritten
                     // and then the overwritten range was removed.
@@ -487,9 +526,11 @@ impl BlockMap {
                     pos = next_start;
                 }
             }
+            for f in to_remove {
+                self.addr_to_jobs.remove(&f);
+            }
             self.merge_adjacent_sections(r);
         }
-        self.addr_to_jobs.retain(|_start, (_end, v)| !v.is_empty());
     }
 
     /// Self-check routine for invariants
@@ -520,6 +561,9 @@ impl BlockMap {
 }
 
 /// A set of dependencies, associated with a range in a [`BlockMap`]
+///
+/// A dependency set stores some number of jobs, and can be either blocking or
+/// non-blocking.
 ///
 /// Each dependency set has 0-1 blocking dependencies (e.g. writes), and any
 /// number of non-blocking dependencies.
@@ -707,7 +751,10 @@ mod test {
             c in block_strat(), c_type in any::<bool>(),
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockMap::default();
+            let mut dut = BlockMap {
+                blocks_per_extent:Some(BLOCKS_PER_EXTENT),
+                ..BlockMap::default()
+            };
             dut.self_check();
             dut.insert_range(a, 1000, a_type);
             dut.self_check();
@@ -734,7 +781,10 @@ mod test {
             remove in 1000u64..1003,
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockMap::default();
+            let mut dut = BlockMap {
+                blocks_per_extent:Some(BLOCKS_PER_EXTENT),
+                ..BlockMap::default()
+            };
             dut.insert_range(a, 1000, a_type);
             dut.insert_range(b, 1001, b_type);
             dut.insert_range(c, 1002, c_type);
@@ -759,7 +809,10 @@ mod test {
             a in block_strat(), a_type in any::<bool>(),
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockMap::default();
+            let mut dut = BlockMap {
+                blocks_per_extent:Some(BLOCKS_PER_EXTENT),
+                ..BlockMap::default()
+            };
             dut.insert_range(a, 1000, a_type);
             dut.self_check();
             dut.remove_job(1000);
@@ -784,7 +837,11 @@ mod test {
             order in Just([1000, 1001, 1002]).prop_shuffle(),
             read in block_strat(), read_type in any::<bool>(),
         ) {
-            let mut dut = BlockMap::default();
+            let mut dut = BlockMap {
+                blocks_per_extent:Some(BLOCKS_PER_EXTENT),
+                ..BlockMap::default()
+            };
+            dut.blocks_per_extent = Some(BLOCKS_PER_EXTENT);
             dut.insert_range(a, 1000, a_type);
             dut.insert_range(b, 1001, b_type);
             dut.insert_range(c, 1002, c_type);

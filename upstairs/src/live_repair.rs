@@ -290,7 +290,7 @@ async fn live_repair_main(
     // process the next few extents as it's possible for IOs to have reserved
     // future job IDs for repair work and be depending on those IDs.  The
     // failed_repair case below should handle these if they exist.
-    for eid in 0..extent_count {
+    for eid in 0..extent_count as u64 {
         info!(log, "Start extent {} repair", eid);
         cdt::extent__or__start!(|| (eid));
 
@@ -615,7 +615,7 @@ fn repair_or_noop(
 async fn create_and_enqueue_reopen_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
-    eid: u32,
+    eid: u64,
     deps: Vec<u64>,
     reopen_id: u64,
     gw_reopen_id: u64,
@@ -651,7 +651,7 @@ async fn create_and_enqueue_reopen_io(
 async fn create_and_enqueue_close_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
-    eid: u32,
+    eid: u64,
     next_flush: u64,
     gen: u64,
     deps: Vec<u64>,
@@ -694,7 +694,7 @@ async fn create_and_enqueue_close_io(
 async fn create_and_enqueue_repair_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
-    eid: u32,
+    eid: u64,
     deps: Vec<u64>,
     repair_id: u64,
     gw_repair_id: u64,
@@ -820,7 +820,7 @@ impl Upstairs {
         &self,
         gw: &mut MutexGuard<'_, GuestWork>,
         ds: &mut MutexGuard<'_, Downstairs>,
-        eid: u32,
+        eid: u64,
     ) {
         warn!(self.log, "Extent {} Aborting repair", eid);
 
@@ -853,17 +853,10 @@ impl Upstairs {
             // Get the work IDs for the downstairs jobs we need to create.
             // We get the first one, then send three more based on it
             // as a starting value
-            let extent_repair_ids = ds.get_repair_ids(eid);
+            let (extent_repair_ids, deps) = ds.get_repair_ids(eid);
             let ds_id = extent_repair_ids.close_id;
-
-            // Get the list of deps all repair operations will start from.
-            // We don't care about these jobs with respect to each other as
-            // none are doing any work.
             let ddef = self.ddef.lock().await.get_def().unwrap();
             let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
-
-            let deps =
-                ds.ds_active.deps_for_live_repair(impacted_blocks, ds_id);
 
             warn!(
                 self.log,
@@ -901,7 +894,7 @@ impl Upstairs {
         &self,
         brw: block_req::BlockReqWaiter,
         ds_id: u64,
-        eid: u32,
+        eid: u64,
         mut abort_repair: bool,
         ds_done_tx: &mpsc::Sender<u64>,
     ) -> bool {
@@ -992,7 +985,7 @@ impl Upstairs {
     async fn repair_extent(
         &self,
         ds_work_vec: &[mpsc::Sender<u64>],
-        eid: u32,
+        eid: u64,
         source: u8,
         repair: Vec<u8>,
         ds_done_tx: &mpsc::Sender<u64>,
@@ -1063,22 +1056,18 @@ impl Upstairs {
         let gw_reopen_id: u64 = gw.next_gw_id();
 
         // The work IDs for the downstairs side of things.
-        let extent_repair_ids = ds.get_repair_ids(eid);
+        let (extent_repair_ids, mut deps) = ds.get_repair_ids(eid);
         let close_id = extent_repair_ids.close_id;
         let repair_id = extent_repair_ids.repair_id;
         let noop_id = extent_repair_ids.noop_id;
         let reopen_id = extent_repair_ids.reopen_id;
 
-        // Get the list of dependencies all repair operations will start
-        // from.  Note that this list of dependencies will potentially
-        // include skipped jobs for some downstairs.  The list of
-        // dependencies can be further altered when we are about to send
-        // IO to an individual downstairs that is under repair. At that
-        // time, we go through the list of dependencies and remove jobs
-        // that we skipped or finished for that specific downstairs before
-        // we send the repair IO over the wire.
-        let mut deps =
-            ds.ds_active.deps_for_live_repair(impacted_blocks, close_id);
+        //  Note that `deps` (the list of dependencies) will potentially include
+        //  skipped jobs for some downstairs.  The list of dependencies can be
+        //  further altered when we are about to send IO to an individual
+        //  downstairs that is under repair. At that time, we go through the
+        //  list of dependencies and remove jobs that we skipped or finished for
+        //  that specific downstairs before we send the repair IO over the wire.
 
         info!(
             self.log,
@@ -2701,7 +2690,7 @@ pub mod repair_test {
         assert_eq!(reserved_ids.reopen_id, 1003);
 
         // Get the IDs again this time.
-        let reserved_ids = ds.get_repair_ids(0);
+        let (reserved_ids, _deps) = ds.get_repair_ids(0);
         assert_eq!(reserved_ids.close_id, 1000);
         assert_eq!(reserved_ids.repair_id, 1001);
         assert_eq!(reserved_ids.noop_id, 1002);
@@ -2964,8 +2953,8 @@ pub mod repair_test {
         //   2 |       |       | RpRpRp|
         //   3 |       |       | RpRpRp|
         //   4 | W W W | W W W | W W W | 3
-        //   5 | R R R | R R R | R R R | 3,4
-        //   6 | WuWuWu| WuWuWu| WuWuWu| 3,5
+        //   5 | R R R | R R R | R R R | 4
+        //   6 | WuWuWu| WuWuWu| WuWuWu| 5
         //
         // TODO: this has superfluous dependencies
         let up = create_test_upstairs(1).await;
@@ -3020,8 +3009,8 @@ pub mod repair_test {
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
         assert_eq!(jobs[0].work.deps(), &[1003]);
-        assert_eq!(jobs[1].work.deps(), &[1004, 1003]);
-        assert_eq!(jobs[2].work.deps(), &[1005, 1003]);
+        assert_eq!(jobs[1].work.deps(), &[1004]);
+        assert_eq!(jobs[2].work.deps(), &[1005]);
     }
 
     #[tokio::test]
@@ -4053,7 +4042,7 @@ pub mod repair_test {
     // Note that this test function will call get_repair_ids()
     // which will allocate four job IDs (and take the first one for
     // itself).
-    async fn create_and_enqueue_close_op(up: &Arc<Upstairs>, eid: u32) {
+    async fn create_and_enqueue_close_op(up: &Arc<Upstairs>, eid: u64) {
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
         let ddef = up.ddef.lock().await.get_def().unwrap();
@@ -4062,8 +4051,8 @@ pub mod repair_test {
 
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = gw.next_gw_id();
-        let close_id = ds.next_id();
-        let deps = ds.ds_active.deps_for_live_repair(impacted_blocks, close_id);
+        let (repair_ids, deps) = ds.get_repair_ids(eid);
+        let close_id = repair_ids.close_id;
 
         // let repair = vec![0, 2];
         let _reopen_brw = create_and_enqueue_close_io(
@@ -4091,7 +4080,7 @@ pub mod repair_test {
     // Note that the repair operation can be either an actual repair,
     // or a NoOp, and we are just hard coding the NoOp as the
     // choice here.  If you wish to test that decision, look elsewhere.
-    async fn create_and_enqueue_repair_op(up: &Arc<Upstairs>, eid: u32) {
+    async fn create_and_enqueue_repair_op(up: &Arc<Upstairs>, eid: u64) {
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
         let ddef = up.ddef.lock().await.get_def().unwrap();
@@ -4100,11 +4089,8 @@ pub mod repair_test {
         let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         let gw_repair_id: u64 = gw.next_gw_id();
-        let extent_repair_ids = ds.get_repair_ids(eid);
+        let (extent_repair_ids, deps) = ds.get_repair_ids(eid);
         let repair_id = extent_repair_ids.repair_id;
-        let deps = ds
-            .ds_active
-            .deps_for_live_repair(impacted_blocks, repair_id);
 
         let _repair_brw = create_and_enqueue_noop_io(
             &mut ds,
@@ -4301,7 +4287,10 @@ pub mod repair_test {
         // op# | 0 1 2 | deps
         // ----|-------|-----
         //   0 | RpRpRp|
-        //   1 |     W | 0
+        //   1 | RpRpRp|
+        //   2 | RpRpRp|
+        //   3 | RpRpRp|
+        //   4 |     W | 3
 
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -4331,9 +4320,11 @@ pub mod repair_test {
         // 2 Jobs were created
         assert_eq!(jobs.len(), 2);
 
-        // The three writes don't depend on anything
+        assert_eq!(jobs[0].ds_id, 1000);
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
+
+        assert_eq!(jobs[1].ds_id, 1004);
+        assert_eq!(jobs[1].work.deps(), &[1003]);
     }
 
     #[tokio::test]
@@ -4343,7 +4334,10 @@ pub mod repair_test {
         // op# | 0 1 2 | deps
         // ----|-------|-----
         //   0 | RpRpRp|
-        //   1 | R     | 0
+        //   1 | RpRpRp|
+        //   2 | RpRpRp|
+        //   3 | RpRpRp|
+        //   4 | R     | 3
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
@@ -4370,9 +4364,11 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 2);
 
+        assert_eq!(jobs[0].ds_id, 1000);
         assert!(jobs[0].work.deps().is_empty());
-        // The read depends on the repair
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
+        // The read depends on the last item of the repair
+        assert_eq!(jobs[1].ds_id, 1004);
+        assert_eq!(jobs[1].work.deps(), &[1003]);
     }
 
     #[tokio::test]
@@ -4382,7 +4378,10 @@ pub mod repair_test {
         // op# | 0 1 2 | deps
         // ----|-------|-----
         //   0 | RpRpRp|
-        //   1 | F F F | 0
+        //   1 | RpRpRp|
+        //   2 | RpRpRp|
+        //   3 | RpRpRp|
+        //   4 | F F F | 3
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
@@ -4404,9 +4403,11 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 2);
 
+        assert_eq!(jobs[0].ds_id, 1000);
         assert!(jobs[0].work.deps().is_empty());
-        // The flush depends on the repair
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
+        // The flush depends on the repair close operation
+        assert_eq!(jobs[1].ds_id, 1004);
+        assert_eq!(jobs[1].work.deps(), &[1003]);
     }
 
     #[tokio::test]
@@ -4504,8 +4505,11 @@ pub mod repair_test {
         // op# | 0 1 2 | 3 4 5 | deps
         // ----|-------|-------|-----
         //   0 | F F F | F F F |
-        //   1 |       | RpRpRp| 0
-        //   2 | F F F | F F F | 0,1
+        //   1 |       | RpRpRp|
+        //   2 |       | RpRpRp| 0
+        //   3 |       | RpRpRp|
+        //   4 |       | RpRpRp|
+        //   5 | F F F | F F F | 0,4
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
@@ -4524,9 +4528,14 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 3);
 
+        assert_eq!(jobs[0].ds_id, 1000);
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
-        assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
+
+        assert_eq!(jobs[1].ds_id, 1002);
+        assert_eq!(jobs[1].work.deps(), &[1000]);
+
+        assert_eq!(jobs[2].ds_id, 1005);
+        assert_eq!(jobs[2].work.deps(), &[1000, 1004]);
     }
 
     #[tokio::test]
@@ -4536,8 +4545,14 @@ pub mod repair_test {
         // op# | 0 1 2 | 3 4 5 | deps
         // ----|-------|-------|-----
         //   0 | RpRpRp|       |
-        //   1 | F F F | F F F | 0
-        //   2 |       | RpRpRp| 1
+        //  *1 | RpRpRp|       |
+        //   2 | RpRpRp|       |
+        //   3 | RpRpRp|       |
+        //  *4 | F F F | F F F | 3
+        //   5 |       | RpRpRp|
+        //  *6 |       | RpRpRp| 4
+        //   7 |       | RpRpRp|
+        //   8 |       | RpRpRp|
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
@@ -4554,9 +4569,12 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 3);
 
+        assert_eq!(jobs[0].ds_id, 1001);
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
-        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id]);
+        assert_eq!(jobs[1].ds_id, 1004);
+        assert_eq!(jobs[1].work.deps(), &[1003]);
+        assert_eq!(jobs[2].ds_id, 1006);
+        assert_eq!(jobs[2].work.deps(), &[1004]);
     }
 
     #[tokio::test]
@@ -4569,8 +4587,26 @@ pub mod repair_test {
         // op# | 0 1 2 | deps
         // ----|-------|-----
         //   0 | RpRpRp|
-        //   1 | RpRpRp| 0
-        //   2 | RpRpRp| 1
+        //  *1 | RpRpRp|
+        //   2 | RpRpRp|
+        //   3 | RpRpRp|
+        //   --|-------|-----
+        //   4 | RpRpRp|
+        //  *5 | RpRpRp| 3
+        //   6 | RpRpRp|
+        //   7 | RpRpRp|
+        //   --|-------|-----
+        //   8 | RpRpRp|
+        //  *9 | RpRpRp| 7
+        //  10 | RpRpRp|
+        //  10 | RpRpRp|
+        //
+        //  This graph is a little funky, because in actuality, it would be the
+        //  *close* operation that would get the dependency on the most recent
+        //  repair; however, `create_and_enqueue_repair_op` enqueues the repair
+        //  op (the second out of four) instead.
+        //
+        // (Dependencies are handled more correctly in `repair_extent`)
 
         let up = create_test_upstairs(1).await;
         create_and_enqueue_repair_op(&up, 0).await;
@@ -4583,9 +4619,12 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 3);
 
+        assert_eq!(jobs[0].ds_id, 1001);
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
-        assert_eq!(jobs[2].work.deps(), &[jobs[1].ds_id]);
+        assert_eq!(jobs[1].ds_id, 1005);
+        assert_eq!(jobs[1].work.deps(), &[1003]);
+        assert_eq!(jobs[2].ds_id, 1009);
+        assert_eq!(jobs[2].work.deps(), &[1007]);
     }
 
     #[tokio::test]
@@ -4834,7 +4873,7 @@ pub mod repair_test {
         //   5 |       | Rrep  |
         //   6 |       | Rnoop |
         //   7 |       | Ropen |
-        //   5 |     W | W W   | 0,1,2,3 XXX This is wrong?
+        //   8 |     W | W W   | 3,7
         //
         // We also verify that the job IDs make sense for our repair id
         // reservation that happens when we need to insert a job like this.
@@ -4871,7 +4910,7 @@ pub mod repair_test {
 
         assert!(jobs[0].work.deps().is_empty());
         assert_eq!(jobs[1].ds_id, 1008);
-        assert_eq!(jobs[1].work.deps(), &[1001, 1007]);
+        assert_eq!(jobs[1].work.deps(), &[1003, 1007]);
     }
 
     #[tokio::test]
@@ -4881,7 +4920,10 @@ pub mod repair_test {
         // op# | 0 1 2 | 3 4 5 | deps
         // ----|-------|-------|-----
         //   0 |       | RpRpRp|
-        //   1 |   R R | R     | 0
+        //  *1 |       | RpRpRp|
+        //   2 |       | RpRpRp|
+        //   3 |       | RpRpRp|
+        //   4 |   R R | R     | 3
 
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -4902,8 +4944,10 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 2);
 
+        assert_eq!(jobs[0].ds_id, 1001);
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]);
+        assert_eq!(jobs[1].ds_id, 1004);
+        assert_eq!(jobs[1].work.deps(), &[1003]);
     }
 
     #[tokio::test]
@@ -4961,13 +5005,22 @@ pub mod repair_test {
         //       block   block   block
         // op# | 0 1 2 | 3 4 5 | 6 7 8 | deps
         // ----|-------|-------|-------|-----
-        //   0 |       |       |   W   |
+        //  *0 |       |       |   W   |
         //   1 | RpRpRp|       |       |
-        //   2 |       |   W   |       |
-        //   3 |     R |       |       | 1
-        //   4 |       | RpRpRp|       | 2
-        //   5 |       |     W |       | 4
-        //   6 |       |       | RpRpRp| 0
+        //  *2 | RpRpRp|       |       |
+        //   3 | RpRpRp|       |       |
+        //   4 | RpRpRp|       |       |
+        //  *5 |       |   W   |       |
+        //  *6 |     R |       |       | 4
+        //   7 |       | RpRpRp|       | 5
+        //  *8 |       | RpRpRp|       |
+        //   9 |       | RpRpRp|       |
+        //  10 |       | RpRpRp|       |
+        // *11 |       |     W |       | 10
+        //  12 |       |       | RpRpRp| 0
+        // *13 |       |       | RpRpRp|
+        //  14 |       |       | RpRpRp|
+        //  15 |       |       | RpRpRp|
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
@@ -5024,13 +5077,26 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 7);
 
+        assert_eq!(jobs[0].ds_id, 1000);
         assert!(jobs[0].work.deps().is_empty());
+
+        assert_eq!(jobs[1].ds_id, 1002);
         assert!(jobs[1].work.deps().is_empty());
+
+        assert_eq!(jobs[2].ds_id, 1005);
         assert!(jobs[2].work.deps().is_empty());
-        assert_eq!(jobs[3].work.deps(), &[jobs[1].ds_id]);
-        assert_eq!(jobs[4].work.deps(), &[jobs[2].ds_id]);
-        assert_eq!(jobs[5].work.deps(), &[jobs[4].ds_id]);
-        assert_eq!(jobs[6].work.deps(), &[jobs[0].ds_id]);
+
+        assert_eq!(jobs[3].ds_id, 1006);
+        assert_eq!(jobs[3].work.deps(), &[1004]);
+
+        assert_eq!(jobs[4].ds_id, 1008);
+        assert_eq!(jobs[4].work.deps(), &[1005]);
+
+        assert_eq!(jobs[5].ds_id, 1011);
+        assert_eq!(jobs[5].work.deps(), &[1010]);
+
+        assert_eq!(jobs[6].ds_id, 1013);
+        assert_eq!(jobs[6].work.deps(), &[1000]);
     }
 
     #[tokio::test]
@@ -5324,9 +5390,9 @@ pub mod repair_test {
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
-        let eid = 0;
+        let eid = 0u64;
         let mut ds = up.downstairs.lock().await;
-        ds.extent_limit[1] = Some(eid);
+        ds.extent_limit[1] = Some(eid as usize);
         drop(ds);
 
         submit_three_ios(&up, &ds_done_tx).await;
@@ -5336,7 +5402,7 @@ pub mod repair_test {
 
         up.abort_repair_ds(&mut ds, UpState::Active, &ds_done_tx)
             .await;
-        up.abort_repair_extent(&mut gw, &mut ds, eid as u32).await;
+        up.abort_repair_extent(&mut gw, &mut ds, eid).await;
 
         assert_eq!(ds.ds_state[0], DsState::Active);
         assert_eq!(ds.ds_state[1], DsState::Faulted);
@@ -5362,9 +5428,9 @@ pub mod repair_test {
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
-        let eid = 0;
+        let eid = 0u64;
         let mut ds = up.downstairs.lock().await;
-        ds.extent_limit[1] = Some(eid);
+        ds.extent_limit[1] = Some(eid as usize);
         drop(ds);
 
         submit_three_ios(&up, &ds_done_tx).await;
@@ -5373,11 +5439,11 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
 
         // Reserve some repair IDs
-        let reserved_ids = ds.reserve_repair_ids(eid as u32);
+        let reserved_ids = ds.reserve_repair_ids(eid);
 
         up.abort_repair_ds(&mut ds, UpState::Active, &ds_done_tx)
             .await;
-        up.abort_repair_extent(&mut gw, &mut ds, eid as u32).await;
+        up.abort_repair_extent(&mut gw, &mut ds, eid).await;
 
         // Check all three IOs again, downstairs 1 will be skipped..
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
@@ -5409,11 +5475,11 @@ pub mod repair_test {
         up.ds_transition(2, DsState::Faulted).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
-        let eid = 0;
+        let eid = 0u64;
         let mut ds = up.downstairs.lock().await;
-        ds.extent_limit[0] = Some(eid);
-        ds.extent_limit[1] = Some(eid);
-        ds.extent_limit[2] = Some(eid);
+        ds.extent_limit[0] = Some(eid as usize);
+        ds.extent_limit[1] = Some(eid as usize);
+        ds.extent_limit[2] = Some(eid as usize);
         drop(ds);
 
         submit_three_ios(&up, &ds_done_tx).await;
@@ -5422,11 +5488,11 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
 
         // Reserve some repair IDs
-        let _reserved_ids = ds.reserve_repair_ids(eid as u32);
+        let _reserved_ids = ds.reserve_repair_ids(eid);
 
         up.abort_repair_ds(&mut ds, UpState::Active, &ds_done_tx)
             .await;
-        up.abort_repair_extent(&mut gw, &mut ds, eid as u32).await;
+        up.abort_repair_extent(&mut gw, &mut ds, eid).await;
 
         // Check all three IOs again, all downstairs will be skipped..
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
@@ -5439,7 +5505,7 @@ pub mod repair_test {
 
         // No repair jobs should be submitted
         assert_eq!(jobs.len(), 3);
-        assert!(!ds.query_repair_ids(eid as u32));
+        assert!(!ds.query_repair_ids(eid));
     }
 
     async fn test_upstairs_okay() -> Arc<Upstairs> {
@@ -5865,14 +5931,11 @@ pub mod repair_test {
         let gw_reopen_id: u64 = gw.next_gw_id();
 
         // The work IDs for the downstairs side of things.
-        let extent_repair_ids = ds.get_repair_ids(eid);
+        let (extent_repair_ids, mut deps) = ds.get_repair_ids(eid);
         let close_id = extent_repair_ids.close_id;
         let repair_id = extent_repair_ids.repair_id;
         let noop_id = extent_repair_ids.noop_id;
         let reopen_id = extent_repair_ids.reopen_id;
-
-        let mut deps =
-            ds.ds_active.deps_for_live_repair(impacted_blocks, close_id);
 
         // The initial close IO has the base set of dependencies.
         // Each additional job will depend on the previous.
@@ -6087,12 +6150,12 @@ pub mod repair_test {
         //   2 |       | RpRpRp|       |
         //   3 |       | RpRpRp|       |
         //   4 |       | RpRpRp|       |
-        //   5 |     W | W     |       | 0,4
+        //   5 |     W | W     |       | 4
         //   6 |       |       | RpRpRp|
         //   7 |       |       | RpRpRp|
         //   8 |       |       | RpRpRp|
         //   9 |       |       | RpRpRp|
-        //   10|       |     R | R     | 0,4,9
+        //   10|       |     R | R     | 4,9
         //
         // More broadly: if a job is _not_ going to be skipped, then it needs
         // reserved repair job IDs for every extent that it touches.
@@ -6160,13 +6223,13 @@ pub mod repair_test {
         assert_eq!(jobs[0].state[&2], IOState::New);
 
         assert_eq!(jobs[1].ds_id, 1005);
-        assert_eq!(jobs[1].work.deps(), &[1000, 1004]);
+        assert_eq!(jobs[1].work.deps(), &[1004]);
         assert_eq!(jobs[1].state[&0], IOState::New);
         assert_eq!(jobs[1].state[&1], IOState::New);
         assert_eq!(jobs[1].state[&2], IOState::New);
 
         assert_eq!(jobs[2].ds_id, 1010);
-        assert_eq!(jobs[2].work.deps(), &[1000, 1004, 1009]);
+        assert_eq!(jobs[2].work.deps(), &[1004, 1009]);
         assert_eq!(jobs[2].state[&0], IOState::New);
         assert_eq!(jobs[2].state[&1], IOState::New);
         assert_eq!(jobs[2].state[&2], IOState::New);
