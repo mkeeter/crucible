@@ -6051,7 +6051,7 @@ pub(crate) mod up_test {
         assert!(!op.send_io_live_repair(Some(2)));
 
         // If we change the extent limit, it should become true
-        assert!(op.send_io_live_repair(Some(2)));
+        assert!(op.send_io_live_repair(Some(3)));
     }
 
     // Construct an IOop::Write or IOop::WriteUnwritten at the given extent

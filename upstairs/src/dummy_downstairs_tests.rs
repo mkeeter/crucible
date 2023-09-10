@@ -1167,10 +1167,12 @@ pub(crate) mod protocol_test {
             // IO. Issue some single extent reads and writes to make sure that
             // extent limit is honoured. Do this only after receiving the two
             // above messages as that guarantees we are in the repair task and
-            // that extent_limit is set. Make sure the first read and write to
-            // the extent under repair has the ExtentLiveReopen job as a
-            // dependency. Batch up responses to send after the live repair is
-            // done, otherwise flow control will kick in.
+            // that extent_limit is set. Make sure that the first read to the
+            // extent under repair has the the ExtentLiveReopen job as a
+            // dependency, and that later writes have that read as their
+            // dependency (which works because the read already depended on the
+            // ExtentLiveReopen job). Batch up responses to send after the live
+            // repair is done, otherwise flow control will kick in.
 
             let mut responses = vec![Vec::new(); 3];
 
