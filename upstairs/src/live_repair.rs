@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 // dependency with all IOs on the same extent.  Any existing IOs on that extent
 // will need to finish, and any new IOs for that extent will depend on all the
 // repair work for that extent before they can proceed.
-// Vec<u64> will treat IOs to different extents as independent of each
+// Dependencies will treat IOs to different extents as independent of each
 // other, and repair on one extent should not effect IOs on other extents.
 // IOs that span an extent under repair are considered as being on that extent
 // and are discussed in detail later.
@@ -55,7 +55,7 @@ use tokio::sync::mpsc;
 // it covers have completed repair.  This may involve allocating and reserving
 // repair job IDs, and making those job IDs dependencies for this spanning IO.
 //
-// * Skipped IOs and Vec<u64> “above” a repair command.
+// * Skipped IOs and Dependencies “above” a repair command.
 // For Repair operations (and operations that follow after them), a downstairs
 // under repair will most likely have a bunch of skipped IOs.  Repair
 // operations will often have dependencies that will need to finish on the
