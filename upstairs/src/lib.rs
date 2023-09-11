@@ -4761,7 +4761,7 @@ impl Downstairs {
             noop_id,
             reopen_id,
         };
-        let deps = self.ds_active.insert_repair(repair_ids, eid);
+        let deps = self.ds_active.deps_for_repair(repair_ids, eid);
         info!(
             self.log,
             "inserting repair IDs {repair_ids:?}; got dep {deps:?}"
@@ -4791,7 +4791,7 @@ impl Downstairs {
                 reopen_id,
             };
 
-            let deps = self.ds_active.insert_repair(repair_ids, eid);
+            let deps = self.ds_active.deps_for_repair(repair_ids, eid);
             (repair_ids, deps)
         }
     }
@@ -5745,7 +5745,7 @@ impl Upstairs {
             info!(self.log, "flush with snap requested");
         }
 
-        let dep = downstairs.ds_active.deps_for_flush();
+        let dep = downstairs.ds_active.deps_for_flush(next_id);
         debug!(self.log, "IO Flush {} has deps {:?}", next_id, dep);
 
         /*
@@ -5876,7 +5876,13 @@ impl Upstairs {
             "reserving repair jobs for {impacted_blocks:?}"
         );
         downstairs.reserve_repair_jobs_for(impacted_blocks);
-        let dep = downstairs.ds_active.deps_for_write(impacted_blocks);
+
+        // After reserving any LiveRepair IDs, go get one for this job.
+        // This is required to avoid circular dependencies.
+        let next_id = downstairs.next_id();
+        let dep = downstairs
+            .ds_active
+            .deps_for_write(next_id, impacted_blocks);
         info!(downstairs.log, "got dep {dep:?}");
         cdt::gw__write__deps!(|| (
             downstairs.ds_active.len() as u64,
@@ -5941,9 +5947,6 @@ impl Upstairs {
             cur_offset += byte_len;
         }
 
-        // After reserving any LiveRepair IDs, go get one for this job.
-        // This is required to avoid circular dependencies.
-        let next_id = downstairs.next_id();
         debug!(self.log, "IO Write {} has deps {:?}", next_id, dep);
 
         let wr = create_write_eob(
@@ -6040,7 +6043,13 @@ impl Upstairs {
         cdt::gw__read__start!(|| (gw_id));
 
         downstairs.reserve_repair_jobs_for(impacted_blocks);
-        let dep = downstairs.ds_active.deps_for_read(impacted_blocks);
+
+        /*
+         * Create the tracking info for downstairs request numbers (ds_id) we
+         * will create on behalf of this guest job.
+         */
+        let next_id = downstairs.next_id();
+        let dep = downstairs.ds_active.deps_for_read(next_id, impacted_blocks);
 
         /*
          * Now create a downstairs work job for each (eid, bo) returned
@@ -6053,12 +6062,7 @@ impl Upstairs {
             requests.push(ReadRequest { eid, offset });
         }
 
-        /*
-         * Create the tracking info for downstairs request numbers (ds_id) we
-         * will create on behalf of this guest job.
-         */
         let mut sub = HashMap::new();
-        let next_id = downstairs.next_id();
 
         debug!(self.log, "IO Read  {} has deps {:?}", next_id, dep);
 

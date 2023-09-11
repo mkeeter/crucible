@@ -67,63 +67,24 @@ impl ActiveJobs {
     /// Inserts a new job ID and its associated IO work
     #[inline]
     pub fn insert(&mut self, job_id: u64, io: DownstairsIO) {
-        let blocking = match &io.work {
-            IOop::Write { .. }
-            | IOop::WriteUnwritten { .. }
-            | IOop::Flush { .. } => Some(true),
-            IOop::Read { .. } => Some(false),
-            // Repair deps were already added in in `insert_repair`
-            IOop::ExtentFlushClose { .. }
-            | IOop::ExtentLiveNoOp { .. }
-            | IOop::ExtentLiveReopen { .. }
-            | IOop::ExtentLiveRepair { .. } => None,
-            _ => panic!("unexpected io work {:?}", io.work),
-        };
-        let r = match (&io.work, &io.impacted_blocks) {
-            (IOop::Flush { .. }, ImpactedBlocks::Empty) => {
-                ImpactedBlocks::InclusiveRange(
-                    ImpactedAddr {
-                        extent_id: 0,
-                        block: 0,
-                    },
-                    ImpactedAddr {
-                        extent_id: u64::MAX,
-                        block: u64::MAX,
-                    },
-                )
-            }
-            (_, b) => *b,
-        };
-        self.jobs.insert(job_id, io);
-        if let Some(blocking) = blocking {
-            self.block_to_active.insert_range(r, job_id, blocking);
+        // Check that all jobs types which should be tracked by our dependency
+        // tracker have been recorded.
+        if matches!(
+            &io.work,
+            IOop::Flush { .. }
+                | IOop::Write { .. }
+                | IOop::WriteUnwritten { .. }
+                | IOop::Read { .. }
+                | IOop::ExtentLiveReopen { .. }
+        ) {
+            assert!(self.block_to_active.job_to_range.contains_key(&job_id))
+        } else {
+            // Other live repair jobs aren't recorded, because they're
+            // immediately masked by the ExtentLiveReopen (which is the final
+            // operation in the repair job).
+            assert!(!self.block_to_active.job_to_range.contains_key(&job_id))
         }
-    }
-
-    /// Inserts a set of repair IDs into the dependency tracker.
-    ///
-    /// Note that jobs are only added to the dependency tracker; they are not
-    /// added to the list of active jobs (because this may be a future
-    /// reservation, without an allocated `DownstairsIO`).
-    pub fn insert_repair(
-        &mut self,
-        repair_ids: ExtentRepairIDs,
-        extent: u64,
-    ) -> Vec<u64> {
-        let blocks = ImpactedBlocks::InclusiveRange(
-            ImpactedAddr {
-                extent_id: extent,
-                block: 0,
-            },
-            ImpactedAddr {
-                extent_id: extent,
-                block: u64::MAX,
-            },
-        );
-        let dep = self.block_to_active.check_range(blocks, true);
-        self.block_to_active
-            .insert_range(blocks, repair_ids.reopen_id, true);
-        dep
+        self.jobs.insert(job_id, io);
     }
 
     /// Removes a job by ID, returning its IO work
@@ -152,8 +113,8 @@ impl ActiveJobs {
         self.jobs.values()
     }
 
-    pub fn deps_for_flush(&self) -> Vec<u64> {
-        let r = ImpactedBlocks::InclusiveRange(
+    pub fn deps_for_flush(&mut self, flush_id: u64) -> Vec<u64> {
+        let blocks = ImpactedBlocks::InclusiveRange(
             ImpactedAddr {
                 extent_id: 0,
                 block: 0,
@@ -163,15 +124,57 @@ impl ActiveJobs {
                 block: u64::MAX,
             },
         );
-        self.block_to_active.check_range(r, true)
+        let dep = self.block_to_active.check_range(blocks, true);
+        self.block_to_active.insert_range(blocks, flush_id, true);
+        dep
     }
 
-    pub fn deps_for_write(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
-        self.block_to_active.check_range(impacted_blocks, true)
+    pub fn deps_for_write(
+        &mut self,
+        write_id: u64,
+        impacted_blocks: ImpactedBlocks,
+    ) -> Vec<u64> {
+        let dep = self.block_to_active.check_range(impacted_blocks, true);
+        self.block_to_active
+            .insert_range(impacted_blocks, write_id, true);
+        dep
     }
 
-    pub fn deps_for_read(&self, impacted_blocks: ImpactedBlocks) -> Vec<u64> {
-        self.block_to_active.check_range(impacted_blocks, false)
+    pub fn deps_for_read(
+        &mut self,
+        read_id: u64,
+        impacted_blocks: ImpactedBlocks,
+    ) -> Vec<u64> {
+        let dep = self.block_to_active.check_range(impacted_blocks, false);
+        self.block_to_active
+            .insert_range(impacted_blocks, read_id, false);
+        dep
+    }
+
+    /// Inserts a set of repair IDs into the dependency tracker.
+    ///
+    /// Note that jobs are only added to the dependency tracker; they are not
+    /// added to the list of active jobs (because this may be a future
+    /// reservation, without an allocated `DownstairsIO`).
+    pub fn deps_for_repair(
+        &mut self,
+        repair_ids: ExtentRepairIDs,
+        extent: u64,
+    ) -> Vec<u64> {
+        let blocks = ImpactedBlocks::InclusiveRange(
+            ImpactedAddr {
+                extent_id: extent,
+                block: 0,
+            },
+            ImpactedAddr {
+                extent_id: extent,
+                block: u64::MAX,
+            },
+        );
+        let dep = self.block_to_active.check_range(blocks, true);
+        self.block_to_active
+            .insert_range(blocks, repair_ids.reopen_id, true);
+        dep
     }
 
     pub fn ackable_work(&self) -> Vec<u64> {
