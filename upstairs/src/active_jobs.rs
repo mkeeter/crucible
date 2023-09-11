@@ -277,7 +277,7 @@ struct BlockMap {
     ///
     /// If we _don't_ know blocks per extent, this still works: the former is
     /// lexicographically ordered below the latter.  However, there could be
-    /// unknown zero-length ranges in the range map.
+    /// zero-length ranges in the range map.
     blocks_per_extent: Option<u64>,
 }
 
@@ -391,33 +391,24 @@ impl BlockMap {
         // existing range:       |--------|
         // new range:          |============|
         // result:               |--------|
-
-        let find_split_for = |v| match self.addr_to_jobs.range(..v).rev().next()
-        {
-            Some((start, (end, _))) if v < *end => Some(*start),
-            _ => None,
-        };
-
-        let split_start = find_split_for(r.start);
-        let mut split_end = find_split_for(r.end);
-
-        // Now, we apply those splits
-        if let Some(s) = split_start {
-            let prev = self.addr_to_jobs.get_mut(&s).unwrap();
-            let v = prev.clone();
-            prev.0 = r.start;
-            self.addr_to_jobs.insert(r.start, v);
-            // Correct for the case where split_start and split_end point into
-            // the same existing range (see the diagram above!)
-            if split_start == split_end {
-                split_end = Some(r.start);
+        for i in [r.start, r.end] {
+            if let Some(split) = self.find_range_containing(i) {
+                let prev = self.addr_to_jobs.get_mut(&split).unwrap();
+                let v = prev.clone();
+                prev.0 = i;
+                self.addr_to_jobs.insert(i, v);
             }
         }
-        if let Some(s) = split_end {
-            let prev = self.addr_to_jobs.get_mut(&s).unwrap();
-            let v = prev.clone();
-            prev.0 = r.end;
-            self.addr_to_jobs.insert(r.end, v);
+    }
+
+    /// Looks for a range that contains the given address
+    ///
+    /// If such a range exists, returns its starting address (i.e. the key to
+    /// look it up in [`self.addr_to_jobs`].
+    fn find_range_containing(&self, i: ImpactedAddr) -> Option<ImpactedAddr> {
+        match self.addr_to_jobs.range(..i).rev().next() {
+            Some((start, (end, _))) if i < *end => Some(*start),
+            _ => None,
         }
     }
 
@@ -663,7 +654,6 @@ mod test {
     impl Oracle {
         fn new() -> Self {
             let mut ddef = RegionDefinition::default();
-            // TODO these must be kept in sync manually, which seems bad
             ddef.set_extent_size(Block {
                 value: BLOCKS_PER_EXTENT,
                 shift: crucible_common::MIN_SHIFT, // unused
