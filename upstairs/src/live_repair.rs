@@ -411,7 +411,7 @@ async fn live_repair_main(
 fn create_reopen_io(
     eid: usize,
     ds_id: u64,
-    dependencies: Vec<u64>,
+    dependencies: Dependencies,
     gw_id: u64,
 ) -> DownstairsIO {
     let reopen_ioop = IOop::ExtentLiveReopen {
@@ -439,7 +439,7 @@ fn create_reopen_io(
 fn create_close_io(
     eid: usize,
     ds_id: u64,
-    dependencies: Vec<u64>,
+    dependencies: Dependencies,
     gw_id: u64,
     flush: u64,
     gen: u64,
@@ -475,7 +475,7 @@ fn create_close_io(
 #[allow(clippy::too_many_arguments)]
 fn create_repair_io(
     ds_id: u64,
-    dependencies: Vec<u64>,
+    dependencies: Dependencies,
     gw_id: u64,
     extent: usize,
     repair_address: SocketAddr,
@@ -508,7 +508,7 @@ fn create_repair_io(
 
 fn create_noop_io(
     ds_id: u64,
-    dependencies: Vec<u64>,
+    dependencies: Dependencies,
     gw_id: u64,
 ) -> DownstairsIO {
     let noop_ioop = IOop::ExtentLiveNoOp { dependencies };
@@ -543,7 +543,7 @@ fn repair_or_noop(
     ds: &mut Downstairs,
     extent: usize,
     repair_id: u64,
-    repair_deps: Vec<u64>,
+    repair_deps: Dependencies,
     gw_repair_id: u64,
     source: u8,
     repair: &Vec<u8>,
@@ -606,7 +606,7 @@ async fn create_and_enqueue_reopen_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
     eid: u64,
-    deps: Vec<u64>,
+    deps: Dependencies,
     reopen_id: u64,
     gw_reopen_id: u64,
 ) -> block_req::BlockReqWaiter {
@@ -638,7 +638,7 @@ async fn create_and_enqueue_close_io(
     eid: u64,
     next_flush: u64,
     gen: u64,
-    deps: Vec<u64>,
+    deps: Dependencies,
     close_id: u64,
     gw_close_id: u64,
     source: u8,
@@ -677,7 +677,7 @@ async fn create_and_enqueue_repair_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
     eid: u64,
-    deps: Vec<u64>,
+    deps: Dependencies,
     repair_id: u64,
     gw_repair_id: u64,
     source: u8,
@@ -713,7 +713,7 @@ async fn create_and_enqueue_repair_io(
 async fn create_and_enqueue_noop_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
-    deps: Vec<u64>,
+    deps: Dependencies,
     noop_id: u64,
     gw_noop_id: u64,
 ) -> block_req::BlockReqWaiter {
@@ -834,7 +834,6 @@ impl Upstairs {
             // as a starting value
             let (extent_repair_ids, deps) = ds.get_repair_ids(eid);
             let ds_id = extent_repair_ids.close_id;
-            let ddef = self.ddef.lock().await.get_def().unwrap();
 
             warn!(
                 self.log,
@@ -1017,7 +1016,6 @@ impl Upstairs {
             }
             ds.extent_limit[*ds_repair as usize] = Some(eid as usize);
         }
-        let ddef = self.ddef.lock().await.get_def().unwrap();
 
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = gw.next_gw_id();
@@ -3183,17 +3181,16 @@ pub mod repair_test {
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
-        let ddef = up.ddef.lock().await.get_def().unwrap();
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
 
-        let close_id = 1000;
         let gw_close_id = 1;
+        let (repair_ids, deps) = ds.get_repair_ids(eid);
         // Create and insert the close job on the work queue.
         let close_io = create_close_io(
             eid as usize,
-            close_id,
-            Vec::new(), // deps
+            repair_ids.close_id,
+            deps,
             gw_close_id,
             3,       // flush
             2,       // gen
@@ -3202,7 +3199,7 @@ pub mod repair_test {
         );
 
         let mut sub = HashMap::new();
-        sub.insert(close_id, 0);
+        sub.insert(repair_ids.close_id, 0);
 
         let (send, recv) = mpsc::channel(1);
         let op = BlockOp::RepairOp;
@@ -3216,9 +3213,9 @@ pub mod repair_test {
 
         ds.enqueue_repair(close_io).await;
 
-        ds.in_progress(close_id, 0);
-        ds.in_progress(close_id, 1);
-        ds.in_progress(close_id, 2);
+        ds.in_progress(repair_ids.close_id, 0);
+        ds.in_progress(repair_ids.close_id, 1);
+        ds.in_progress(repair_ids.close_id, 2);
 
         let ei = ExtentInfo {
             generation: 5,
@@ -3228,7 +3225,7 @@ pub mod repair_test {
         // First two are false, final job will return true
         assert!(!ds
             .process_ds_completion(
-                close_id,
+                repair_ids.close_id,
                 0,
                 Ok(vec![]),
                 &None,
@@ -3255,7 +3252,7 @@ pub mod repair_test {
         };
         assert!(!ds
             .process_ds_completion(
-                close_id,
+                repair_ids.close_id,
                 1,
                 Ok(vec![]),
                 &None,
@@ -3276,7 +3273,7 @@ pub mod repair_test {
         };
         assert!(ds
             .process_ds_completion(
-                close_id,
+                repair_ids.close_id,
                 2,
                 Ok(vec![]),
                 &None,
@@ -3327,15 +3324,17 @@ pub mod repair_test {
             } else {
                 vec![0, 1]
             };
+            let eid = 0;
+            let (repair_ids, deps) = ds.get_repair_ids(eid);
 
             let repair_op = repair_or_noop(
                 &mut ds,
-                0,              // Extent
-                1000,           // ds_id
-                vec![],         // Dependencies
-                1,              // gw_id
-                source,         // Source extent
-                &repair_extent, // Repair extent
+                eid as usize,         // Extent
+                repair_ids.repair_id, // ds_id
+                deps,                 // Dependencies
+                1,                    // gw_id
+                source,               // Source extent
+                &repair_extent,       // Repair extent
             );
 
             println!("repair op: {:?}", repair_op);
@@ -3345,7 +3344,7 @@ pub mod repair_test {
                     panic!("Incorrect work type returned: {:?}", x);
                 }
             }
-            assert_eq!(repair_op.ds_id, 1000);
+            assert_eq!(repair_op.ds_id, repair_ids.repair_id);
             assert_eq!(repair_op.guest_id, 1);
             println!("Passed for source {}", source);
         }
@@ -3360,12 +3359,13 @@ pub mod repair_test {
     // You are sending in the source and repair(Vec) the client IDs you
     // expect to see in the resulting IOop::ExtentLiveRepair.
     fn what_needs_repair(ds: &mut Downstairs, source: u8, repair: Vec<u8>) {
+        let (repair_ids, deps) = ds.get_repair_ids(0);
         let repair_op = repair_or_noop(
             ds,
-            0,      // Extent
-            1000,   // ds_id
-            vec![], // Dependencies
-            1,      // gw_id
+            0,                   // Extent
+            repair_ids.close_id, // ds_id
+            deps,                // Dependencies
+            1,                   // gw_id
             source,
             &repair,
         );
@@ -3388,7 +3388,7 @@ pub mod repair_test {
                 panic!("Incorrect work type returned: {:?}", x);
             }
         }
-        assert_eq!(repair_op.ds_id, 1000);
+        assert_eq!(repair_op.ds_id, repair_ids.close_id);
         assert_eq!(repair_op.guest_id, 1);
     }
 
@@ -3702,12 +3702,13 @@ pub mod repair_test {
 
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let ddef = up.ddef.lock().await.get_def().unwrap();
 
         // Upstairs "guest" work IDs.
         let gw_r_id: u64 = 1;
-        let r_id = 1002;
-        let deps = vec![1000, 1001];
+        let (repair_ids, mut deps) = ds.get_repair_ids(eid);
+        assert!(deps.is_empty());
+        deps.push(1000); // TODO(matt) this isn't testing useful stuff?
+        deps.push(1001);
 
         // create close/fclose jobs first.
         // create the reopen job second (but use final ID)j
@@ -3715,11 +3716,16 @@ pub mod repair_test {
         // actually enqueue'ing the middle repair job.
 
         let _reopen_brw = create_and_enqueue_reopen_io(
-            &mut ds, &mut gw, eid, deps, r_id, gw_r_id,
+            &mut ds,
+            &mut gw,
+            eid,
+            deps,
+            repair_ids.reopen_id,
+            gw_r_id,
         )
         .await;
 
-        let job = ds.ds_active.get(&r_id).unwrap();
+        let job = ds.ds_active.get(&repair_ids.reopen_id).unwrap();
 
         println!("Job is {:?}", job);
         match &job.work {
@@ -3727,7 +3733,7 @@ pub mod repair_test {
                 dependencies: d,
                 extent: e,
             } => {
-                assert_eq!(*d, vec![1000, 1001]);
+                assert_eq!(*d, &[1000, 1001]);
                 assert_eq!(*e, eid as usize);
             }
             x => {
@@ -3754,12 +3760,13 @@ pub mod repair_test {
 
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let ddef = up.ddef.lock().await.get_def().unwrap();
 
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = 1;
-        let close_id = 1002;
-        let deps = vec![1000, 1001];
+        let (repair_ids, mut deps) = ds.get_repair_ids(eid);
+        assert!(deps.is_empty());
+        deps.push(1000);
+        deps.push(1001);
 
         // create close/fclose jobs first.
         // create the reopen job second (but use final ID)j
@@ -3777,14 +3784,14 @@ pub mod repair_test {
             next_flush,
             gen,
             deps,
-            close_id,
+            repair_ids.close_id,
             gw_close_id,
             source,
             repair.clone(),
         )
         .await;
 
-        let job = ds.ds_active.get(&close_id).unwrap();
+        let job = ds.ds_active.get(&repair_ids.close_id).unwrap();
 
         println!("Job is {:?}", job);
         match &job.work {
@@ -3796,7 +3803,7 @@ pub mod repair_test {
                 source_downstairs,
                 repair_downstairs,
             } => {
-                assert_eq!(*dependencies, vec![1000, 1001]);
+                assert_eq!(*dependencies, &[1000, 1001]);
                 assert_eq!(*extent, eid as usize);
                 assert_eq!(*flush_number, next_flush);
                 assert_eq!(*gen_number, gen);
@@ -3831,12 +3838,13 @@ pub mod repair_test {
 
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let ddef = up.ddef.lock().await.get_def().unwrap();
 
         // Upstairs "guest" work IDs.
         let gw_repair_id: u64 = gw.next_gw_id();
-        let repair_id = 1003;
-        let deps = vec![1001, 1002];
+        let (repair_ids, mut deps) = ds.get_repair_ids(eid);
+        assert!(deps.is_empty());
+        deps.push(1001);
+        deps.push(1002); // TODO: this is no longer testing something useful
 
         let source = 0;
         let repair = vec![1, 2];
@@ -3857,19 +3865,19 @@ pub mod repair_test {
             &mut gw,
             eid,
             deps,
-            repair_id,
+            repair_ids.repair_id,
             gw_repair_id,
             source,
             &repair,
         )
         .await;
 
-        let job = ds.ds_active.get(&repair_id).unwrap();
+        let job = ds.ds_active.get(&repair_ids.repair_id).unwrap();
 
         println!("Job is {:?}", job);
         match &job.work {
             IOop::ExtentLiveNoOp { dependencies } => {
-                assert_eq!(*dependencies, vec![1001, 1002]);
+                assert_eq!(*dependencies, [1001, 1002]);
             }
             x => {
                 panic!(
@@ -3895,15 +3903,16 @@ pub mod repair_test {
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
-        let ddef = up.ddef.lock().await.get_def().unwrap();
 
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
 
         // Upstairs "guest" work IDs.
         let gw_repair_id: u64 = gw.next_gw_id();
-        let repair_id = 1003;
-        let deps = vec![1001, 1002];
+        let (repair_ids, mut deps) = ds.get_repair_ids(eid);
+        assert!(deps.is_empty());
+        deps.push(1001);
+        deps.push(1002); // TODO: this is no longer testing something useful
         let source = 0;
         let repair = vec![1, 2];
 
@@ -3932,14 +3941,14 @@ pub mod repair_test {
             &mut gw,
             eid,
             deps,
-            repair_id,
+            repair_ids.repair_id,
             gw_repair_id,
             source,
             &repair,
         )
         .await;
 
-        let job = ds.ds_active.get(&repair_id).unwrap();
+        let job = ds.ds_active.get(&repair_ids.repair_id).unwrap();
 
         println!("Job is {:?}", job);
         match &job.work {
@@ -3950,7 +3959,7 @@ pub mod repair_test {
                 source_repair_address,
                 repair_downstairs,
             } => {
-                assert_eq!(*dependencies, vec![1001, 1002]);
+                assert_eq!(*dependencies, &[1001, 1002]);
                 assert_eq!(*extent, eid as usize);
                 assert_eq!(*source_downstairs, source);
                 assert_eq!(
@@ -3987,7 +3996,6 @@ pub mod repair_test {
     async fn create_and_enqueue_close_op(up: &Arc<Upstairs>, eid: u64) {
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
-        let ddef = up.ddef.lock().await.get_def().unwrap();
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
 
         // Upstairs "guest" work IDs.
@@ -4023,7 +4031,6 @@ pub mod repair_test {
     async fn create_and_enqueue_repair_op(up: &Arc<Upstairs>, eid: u64) {
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
-        let ddef = up.ddef.lock().await.get_def().unwrap();
 
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
 
@@ -5525,30 +5532,28 @@ pub mod repair_test {
         // Walk the three new jobs, verify that the dependencies will be
         // updated for our downstairs under repair.
         // Make the empty dep list for comparison
-        let cv: Vec<u64> = vec![];
-
         let job = ds.ds_active.get(&1003).unwrap();
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
 
-        assert_eq!(&current_deps, &[1002]);
+        assert_eq!(current_deps, &[1002]);
         // No dependencies are valid for live repair
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
-        assert_eq!(new_deps, cv);
+        assert!(new_deps.is_empty());
 
         let job = ds.ds_active.get(&1004).unwrap();
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
 
         // Job 1001 is not a dep for 1004
-        assert_eq!(&current_deps, &[1003]);
+        assert_eq!(current_deps, &[1003]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
-        assert_eq!(new_deps, cv);
+        assert!(new_deps.is_empty());
 
         let job = ds.ds_active.get(&1005).unwrap();
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
 
-        assert_eq!(&current_deps, &[1004]);
+        assert_eq!(current_deps, &[1004]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
-        assert_eq!(new_deps, cv);
+        assert!(new_deps.is_empty());
     }
 
     #[tokio::test]
@@ -5617,26 +5622,25 @@ pub mod repair_test {
         // Walk the three final jobs, verify that the dependencies will be
         // updated for our downstairs under repair, but will still include
         // the jobs that came after the repair.
-        let cv: Vec<u64> = vec![];
 
         let job = ds.ds_active.get(&1006).unwrap();
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
 
-        assert_eq!(&current_deps, &[1005]);
+        assert_eq!(current_deps, &[1005]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
-        assert_eq!(new_deps, cv);
+        assert!(new_deps.is_empty());
 
         let job = ds.ds_active.get(&1007).unwrap();
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
 
-        assert_eq!(&current_deps, &[1006]);
+        assert_eq!(current_deps, &[1006]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, &[1006]);
 
         let job = ds.ds_active.get(&1008).unwrap();
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
 
-        assert_eq!(&current_deps, &[1007]);
+        assert_eq!(current_deps, &[1007]);
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 0);
         assert_eq!(new_deps, &[1007]);
     }
@@ -5748,24 +5752,21 @@ pub mod repair_test {
         // it will not depend on anything. This is okay, because the job
         // itself is Skipped there, so we won't actually send it.
 
-        // Empty vec to compare with and keep the compiler happy.
-        let empty: Vec<u64> = vec![];
-
         let mut ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&1007).unwrap();
         assert_eq!(job.state[&0], IOState::New);
         assert_eq!(job.state[&1], IOState::Skipped);
         assert_eq!(job.state[&2], IOState::New);
 
-        let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1002]);
+        let current_deps = job.work.deps().clone();
+        assert_eq!(current_deps, &[1002]);
 
         // Verify that the Skipped job on the LiveRepair downstairs do not
         // have any dependencies, as, technically, this IO is the first IO to
         // happen after we started repair, and we should not look for any
         // dependencies before starting repair.
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1007);
-        assert_eq!(new_deps, empty);
+        assert!(new_deps.is_empty());
 
         // This second write after starting a repair should require job 6 (i.e.
         // the final job of the repair) on both the Active and LiveRepair
@@ -5775,8 +5776,8 @@ pub mod repair_test {
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
-        let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1006]);
+        let current_deps = job.work.deps().clone();
+        assert_eq!(current_deps, &[1006]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1008);
         // LiveRepair downstairs won't see past the repair.
@@ -5793,8 +5794,8 @@ pub mod repair_test {
         // 1) the final operation on the repair of extent 0
         // 2) the write operation (8) on extent 0
         // 3) a new repair operation on extent 1
-        let current_deps = job.work.deps().to_vec();
-        assert_eq!(&current_deps, &[1006, 1008, 1012]);
+        let current_deps = job.work.deps().clone();
+        assert_eq!(current_deps, &[1006, 1008, 1012]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1013);
         assert_eq!(new_deps, &[1006, 1008, 1012]);
@@ -5846,7 +5847,6 @@ pub mod repair_test {
         drop(ds);
 
         let eid = 0;
-        let ddef = up.ddef.lock().await.get_def().unwrap();
 
         // Fault the downstairs
         up.ds_transition(1, DsState::Faulted).await;
@@ -5924,7 +5924,7 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&1004).unwrap();
 
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
         // We start with repair jobs, plus the original jobs.
         assert_eq!(&current_deps, &[1000, 1001, 1002, 1003]);
 
@@ -5941,7 +5941,7 @@ pub mod repair_test {
         assert_eq!(job.state[&1], IOState::New);
         assert_eq!(job.state[&2], IOState::New);
 
-        let current_deps = job.work.deps().to_vec();
+        let current_deps = job.work.deps().clone();
         assert_eq!(&current_deps, &[1004]);
 
         let new_deps = ds.remove_dep_if_live_repair(1, current_deps, 1005);
