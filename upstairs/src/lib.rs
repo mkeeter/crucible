@@ -70,7 +70,6 @@ pub use live_repair::{check_for_repair, ExtentInfo, RepairCheck};
 
 mod active_jobs;
 use active_jobs::ActiveJobs;
-pub use active_jobs::Dependencies;
 
 use async_trait::async_trait;
 
@@ -718,7 +717,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps.take(),
+                    dependencies: deps,
                     writes,
                 })
                 .await?
@@ -738,7 +737,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps.take(),
+                    dependencies: deps,
                     writes,
                 })
                 .await?
@@ -768,7 +767,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps.take(),
+                    dependencies: deps,
                     flush_number,
                     gen_number,
                     snapshot_details,
@@ -788,7 +787,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps.take(),
+                    dependencies: deps,
                     requests,
                 })
                 .await?
@@ -820,7 +819,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps.take(),
+                        dependencies: deps,
                         extent_id: extent,
                     })
                     .await?
@@ -829,7 +828,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps.take(),
+                        dependencies: deps,
                         extent_id: extent,
                         flush_number,
                         gen_number,
@@ -853,7 +852,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps.take(),
+                        dependencies: deps,
                         extent_id: extent,
                         source_client_id: source_downstairs,
                         source_repair_address,
@@ -864,7 +863,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps.take(),
+                        dependencies: deps,
                     })
                     .await?
                 }
@@ -881,7 +880,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps.take(),
+                    dependencies: deps,
                     extent_id: extent,
                 })
                 .await?
@@ -895,7 +894,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps.take(),
+                    dependencies: deps,
                 })
                 .await?
             }
@@ -2905,7 +2904,7 @@ struct Downstairs {
      * The key is the extent being repaired; the value is a tuple of reserved
      * IDs and existing dependencies for the first job in the repair.
      */
-    repair_job_ids: BTreeMap<u64, (ExtentRepairIDs, Dependencies)>,
+    repair_job_ids: BTreeMap<u64, (ExtentRepairIDs, Vec<u64>)>,
 
     /**
      * When repairing, this will be the  minimum job ID the downstairs under
@@ -3043,9 +3042,9 @@ impl Downstairs {
     fn remove_dep_if_live_repair(
         &mut self,
         client_id: u8,
-        mut deps: Dependencies,
+        mut deps: Vec<u64>,
         ds_id: u64,
-    ) -> Dependencies {
+    ) -> Vec<u64> {
         debug!(
             self.log,
             "[{}] {} Remove check skipped:{:?} from deps:{:?}",
@@ -4775,7 +4774,7 @@ impl Downstairs {
     // Get the repair IDs for this extent.
     // If they were already reserved, then us those values, otherwise,
     // go get the next set of job IDs.
-    fn get_repair_ids(&mut self, eid: u64) -> (ExtentRepairIDs, Dependencies) {
+    fn get_repair_ids(&mut self, eid: u64) -> (ExtentRepairIDs, Vec<u64>) {
         if let Some((eri, deps)) = self.repair_job_ids.remove(&eid) {
             debug!(self.log, "Return existing job ids for {} GG", eid);
             (eri, deps)
@@ -5515,9 +5514,9 @@ impl Upstairs {
     async fn live_repair_dep_check(
         &self,
         client_id: u8,
-        deps: Dependencies,
+        deps: Vec<u64>,
         ds_id: u64,
-    ) -> Dependencies {
+    ) -> Vec<u64> {
         let mut ds = self.downstairs.lock().await;
 
         if ds.dependencies_need_cleanup(client_id) {
@@ -7826,7 +7825,7 @@ impl DownstairsIO {
             replay: self.replay,
             job_type,
             num_blocks,
-            deps: deps.take(), // TODO(matt) could we store Dependencies here?
+            deps,
             ack_status: self.ack_status,
             state,
         }
@@ -7870,19 +7869,19 @@ impl ReconcileIO {
 #[derive(Debug, Clone, PartialEq)]
 pub enum IOop {
     Write {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         writes: Vec<crucible_protocol::Write>,
     },
     WriteUnwritten {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         writes: Vec<crucible_protocol::Write>,
     },
     Read {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         requests: Vec<ReadRequest>,
     },
     Flush {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         flush_number: u64,
         gen_number: u64,
         snapshot_details: Option<SnapshotDetails>,
@@ -7892,11 +7891,11 @@ pub enum IOop {
      * These operations are for repairing a bad downstairs
      */
     ExtentClose {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         extent: usize,
     },
     ExtentFlushClose {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         extent: usize,
         flush_number: u64,
         gen_number: u64,
@@ -7904,23 +7903,23 @@ pub enum IOop {
         repair_downstairs: Vec<u8>,
     },
     ExtentLiveRepair {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         extent: usize,
         source_downstairs: u8,
         source_repair_address: SocketAddr,
         repair_downstairs: Vec<u8>,
     },
     ExtentLiveReopen {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
         extent: usize,
     },
     ExtentLiveNoOp {
-        dependencies: Dependencies, // Jobs that must finish before this
+        dependencies: Vec<u64>, // Jobs that must finish before this
     },
 }
 
 impl IOop {
-    pub fn deps(&self) -> &Dependencies {
+    pub fn deps(&self) -> &Vec<u64> {
         match &self {
             IOop::Write {
                 dependencies,
@@ -8000,7 +7999,7 @@ impl IOop {
      * The size of the IO, or extent number if a repair operation.
      * A Vec of the dependencies.
      */
-    pub fn ioop_summary(&self) -> (String, usize, Dependencies) {
+    pub fn ioop_summary(&self) -> (String, usize, Vec<u64>) {
         let (job_type, num_blocks, deps) = match self {
             IOop::Read {
                 dependencies,
@@ -10260,7 +10259,7 @@ fn create_read_eob(
 #[allow(clippy::too_many_arguments)]
 fn create_flush(
     ds_id: u64,
-    dependencies: Dependencies,
+    dependencies: Vec<u64>,
     flush_number: u64,
     guest_id: u64,
     gen_number: u64,

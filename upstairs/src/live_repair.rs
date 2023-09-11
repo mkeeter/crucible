@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 // dependency with all IOs on the same extent.  Any existing IOs on that extent
 // will need to finish, and any new IOs for that extent will depend on all the
 // repair work for that extent before they can proceed.
-// Dependencies will treat IOs to different extents as independent of each
+// Vec<u64> will treat IOs to different extents as independent of each
 // other, and repair on one extent should not effect IOs on other extents.
 // IOs that span an extent under repair are considered as being on that extent
 // and are discussed in detail later.
@@ -55,7 +55,7 @@ use tokio::sync::mpsc;
 // it covers have completed repair.  This may involve allocating and reserving
 // repair job IDs, and making those job IDs dependencies for this spanning IO.
 //
-// * Skipped IOs and Dependencies “above” a repair command.
+// * Skipped IOs and Vec<u64> “above” a repair command.
 // For Repair operations (and operations that follow after them), a downstairs
 // under repair will most likely have a bunch of skipped IOs.  Repair
 // operations will often have dependencies that will need to finish on the
@@ -411,7 +411,7 @@ async fn live_repair_main(
 fn create_reopen_io(
     eid: usize,
     ds_id: u64,
-    dependencies: Dependencies,
+    dependencies: Vec<u64>,
     gw_id: u64,
 ) -> DownstairsIO {
     let reopen_ioop = IOop::ExtentLiveReopen {
@@ -439,7 +439,7 @@ fn create_reopen_io(
 fn create_close_io(
     eid: usize,
     ds_id: u64,
-    dependencies: Dependencies,
+    dependencies: Vec<u64>,
     gw_id: u64,
     flush: u64,
     gen: u64,
@@ -475,7 +475,7 @@ fn create_close_io(
 #[allow(clippy::too_many_arguments)]
 fn create_repair_io(
     ds_id: u64,
-    dependencies: Dependencies,
+    dependencies: Vec<u64>,
     gw_id: u64,
     extent: usize,
     repair_address: SocketAddr,
@@ -508,7 +508,7 @@ fn create_repair_io(
 
 fn create_noop_io(
     ds_id: u64,
-    dependencies: Dependencies,
+    dependencies: Vec<u64>,
     gw_id: u64,
 ) -> DownstairsIO {
     let noop_ioop = IOop::ExtentLiveNoOp { dependencies };
@@ -543,7 +543,7 @@ fn repair_or_noop(
     ds: &mut Downstairs,
     extent: usize,
     repair_id: u64,
-    repair_deps: Dependencies,
+    repair_deps: Vec<u64>,
     gw_repair_id: u64,
     source: u8,
     repair: &Vec<u8>,
@@ -606,7 +606,7 @@ async fn create_and_enqueue_reopen_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
     eid: u64,
-    deps: Dependencies,
+    deps: Vec<u64>,
     reopen_id: u64,
     gw_reopen_id: u64,
 ) -> block_req::BlockReqWaiter {
@@ -638,7 +638,7 @@ async fn create_and_enqueue_close_io(
     eid: u64,
     next_flush: u64,
     gen: u64,
-    deps: Dependencies,
+    deps: Vec<u64>,
     close_id: u64,
     gw_close_id: u64,
     source: u8,
@@ -677,7 +677,7 @@ async fn create_and_enqueue_repair_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
     eid: u64,
-    deps: Dependencies,
+    deps: Vec<u64>,
     repair_id: u64,
     gw_repair_id: u64,
     source: u8,
@@ -713,7 +713,7 @@ async fn create_and_enqueue_repair_io(
 async fn create_and_enqueue_noop_io(
     ds: &mut Downstairs,
     gw: &mut GuestWork,
-    deps: Dependencies,
+    deps: Vec<u64>,
     noop_id: u64,
     gw_noop_id: u64,
 ) -> block_req::BlockReqWaiter {
@@ -3331,7 +3331,7 @@ pub mod repair_test {
                 &mut ds,
                 eid as usize,         // Extent
                 repair_ids.repair_id, // ds_id
-                deps,                 // Dependencies
+                deps,                 // Vec<u64>
                 1,                    // gw_id
                 source,               // Source extent
                 &repair_extent,       // Repair extent
@@ -3364,7 +3364,7 @@ pub mod repair_test {
             ds,
             0,                   // Extent
             repair_ids.close_id, // ds_id
-            deps,                // Dependencies
+            deps,                // Vec<u64>
             1,                   // gw_id
             source,
             &repair,
@@ -4551,7 +4551,7 @@ pub mod repair_test {
         //  repair; however, `create_and_enqueue_repair_op` enqueues the repair
         //  op (the second out of four) instead.
         //
-        // (Dependencies are handled more correctly in `repair_extent`)
+        // (Vec<u64> are handled more correctly in `repair_extent`)
 
         let up = create_test_upstairs(1).await;
         create_and_enqueue_repair_op(&up, 0).await;

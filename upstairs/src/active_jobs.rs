@@ -119,7 +119,7 @@ impl ActiveJobs {
         self.jobs.values()
     }
 
-    pub fn deps_for_flush(&mut self, flush_id: u64) -> Dependencies {
+    pub fn deps_for_flush(&mut self, flush_id: u64) -> Vec<u64> {
         let blocks = ImpactedBlocks::InclusiveRange(
             ImpactedAddr {
                 extent_id: 0,
@@ -139,7 +139,7 @@ impl ActiveJobs {
         &mut self,
         write_id: u64,
         impacted_blocks: ImpactedBlocks,
-    ) -> Dependencies {
+    ) -> Vec<u64> {
         let dep = self.block_to_active.check_range(impacted_blocks, true);
         self.block_to_active
             .insert_range(impacted_blocks, write_id, true);
@@ -150,7 +150,7 @@ impl ActiveJobs {
         &mut self,
         read_id: u64,
         impacted_blocks: ImpactedBlocks,
-    ) -> Dependencies {
+    ) -> Vec<u64> {
         let dep = self.block_to_active.check_range(impacted_blocks, false);
         self.block_to_active
             .insert_range(impacted_blocks, read_id, false);
@@ -166,7 +166,7 @@ impl ActiveJobs {
         &mut self,
         repair_ids: ExtentRepairIDs,
         extent: u64,
-    ) -> Dependencies {
+    ) -> Vec<u64> {
         let blocks = ImpactedBlocks::InclusiveRange(
             ImpactedAddr {
                 extent_id: extent,
@@ -273,79 +273,6 @@ impl<'a> std::ops::Drop for DownstairsIOHandle<'a> {
     }
 }
 
-/// Job dependencies
-///
-/// This is identical to a `Vec<u64>`, except that it can't be constructed by
-/// user code; instead, it must be returned by `ActiveJobs::deps_for_*` (which
-/// is also responsible for adding it to the map).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Dependencies(Vec<u64>);
-
-impl Dependencies {
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-    pub fn push(&mut self, v: u64) {
-        self.0.push(v);
-    }
-    pub fn retain<F: FnMut(&u64) -> bool>(&mut self, f: F) {
-        self.0.retain(f)
-    }
-    pub fn take(self) -> Vec<u64> {
-        self.0
-    }
-    /// Creates a new, empty set of dependencies
-    ///
-    /// Using this outside of unit tests is forbidden, since that would let you
-    /// violate the rule that dependencies must be tracked; however, we can't
-    /// make it private because `Dependencies::empty` is called by unit tests
-    /// outside of this crate.
-    //TODO(matt) do some feature magic to hide this
-    pub fn empty() -> Self {
-        Self(vec![])
-    }
-    /// Converts from a `Vec` to a dependency list
-    ///
-    /// This must only be called at API boundaries, and should not be used to
-    /// build new sets of dependencies willy-nilly.
-    pub fn from_vec(v: Vec<u64>) -> Self {
-        Self(v)
-    }
-    pub fn iter(&self) -> impl Iterator<Item = &u64> {
-        self.0.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a Dependencies {
-    type Item = &'a u64;
-    type IntoIter = std::slice::Iter<'a, u64>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl<const N: usize> PartialEq<[u64; N]> for Dependencies {
-    fn eq(&self, other: &[u64; N]) -> bool {
-        self.0.eq(other)
-    }
-}
-
-impl<const N: usize> PartialEq<&[u64; N]> for Dependencies {
-    fn eq(&self, other: &&[u64; N]) -> bool {
-        self.0.eq(other)
-    }
-}
-
-impl AsRef<[u64]> for Dependencies {
-    fn as_ref(&self) -> &[u64] {
-        self.0.as_ref()
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
 /// Acceleration data structure to quickly look up dependencies
@@ -375,14 +302,14 @@ struct BlockMap {
 
 impl BlockMap {
     /// Returns all dependencies that are active across the given range
-    fn check_range(&self, r: ImpactedBlocks, blocking: bool) -> Dependencies {
+    fn check_range(&self, r: ImpactedBlocks, blocking: bool) -> Vec<u64> {
         let mut out = BTreeSet::new();
         if let Some(r) = Self::blocks_to_range(r) {
             for (_start, (_end, set)) in self.iter_overlapping(r) {
                 out.extend(set.iter_jobs(blocking));
             }
         }
-        Dependencies(out.into_iter().collect())
+        out.into_iter().collect()
     }
 
     fn blocks_to_range(
@@ -777,11 +704,7 @@ mod test {
             }
             self.job_to_range.insert(job, r);
         }
-        fn check_range(
-            &self,
-            r: ImpactedBlocks,
-            blocking: bool,
-        ) -> Dependencies {
+        fn check_range(&self, r: ImpactedBlocks, blocking: bool) -> Vec<u64> {
             let mut out = BTreeSet::new();
             for (i, b) in r.blocks(&self.ddef) {
                 let addr = ImpactedAddr {
@@ -792,7 +715,7 @@ mod test {
                     out.extend(s.iter_jobs(blocking));
                 }
             }
-            Dependencies(out.into_iter().collect())
+            out.into_iter().collect()
         }
         fn remove_job(&mut self, job: u64) {
             let r = self.job_to_range.remove(&job).unwrap();

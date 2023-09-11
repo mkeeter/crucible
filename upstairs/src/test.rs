@@ -5921,7 +5921,7 @@ pub(crate) mod up_test {
             offset: Block::new_512(7),
         };
         let op = IOop::Read {
-            dependencies: Dependencies::empty(),
+            dependencies: vec![],
             requests: vec![request],
         };
         assert!(op.send_io_live_repair(Some(2)));
@@ -5932,7 +5932,7 @@ pub(crate) mod up_test {
             offset: Block::new_512(7),
         };
         let op = IOop::Read {
-            dependencies: Dependencies::empty(),
+            dependencies: vec![],
             requests: vec![request],
         };
         assert!(op.send_io_live_repair(Some(2)));
@@ -5942,7 +5942,7 @@ pub(crate) mod up_test {
             offset: Block::new_512(7),
         };
         let op = IOop::Read {
-            dependencies: Dependencies::empty(),
+            dependencies: vec![],
             requests: vec![request],
         };
         // We are past the extent limit, so this should return false
@@ -5968,12 +5968,12 @@ pub(crate) mod up_test {
 
         if wu {
             IOop::WriteUnwritten {
-                dependencies: Dependencies::empty(),
+                dependencies: vec![],
                 writes,
             }
         } else {
             IOop::Write {
-                dependencies: Dependencies::empty(),
+                dependencies: vec![],
                 writes,
             }
         }
