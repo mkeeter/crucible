@@ -5883,10 +5883,6 @@ impl Upstairs {
          * Create the list of downstairs request numbers (ds_id) we created
          * on behalf of this guest job.
          */
-        info!(
-            downstairs.log,
-            "reserving repair jobs for {impacted_blocks:?}"
-        );
         downstairs.reserve_repair_jobs_for(impacted_blocks);
 
         // After reserving any LiveRepair IDs, go get one for this job.
