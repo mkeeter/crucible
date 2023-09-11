@@ -10190,7 +10190,7 @@ fn create_write_eob(
         ds.ds_active.len() as u64,
         dependencies.len() as u64
     ));
-    info!(ds.log, "IO Write {} has deps {:?}", ds_id, dependencies);
+    debug!(ds.log, "IO Write {} has deps {:?}", ds_id, dependencies);
 
     let awrite = if is_write_unwritten {
         IOop::WriteUnwritten {
