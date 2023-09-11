@@ -6038,6 +6038,27 @@ impl Upstairs {
          * want to create a gap in the IDs.
          */
         let gw_id: u64 = gw.next_gw_id();
+
+        // HA HA HA
+        if let Some(r) =
+            downstairs.ds_active.read_from_cache(impacted_blocks, ddef)
+        {
+            let mut downstairs_buffer = HashMap::new();
+            downstairs_buffer.insert(u64::MAX, r);
+            let mut new_gtos = GtoS::new(
+                HashMap::new(),
+                vec![u64::MAX], // fake downstairs job ID
+                Some(data),     // guest buffer
+                downstairs_buffer,
+                req,
+            );
+            // TODO: check against read_response_hashes
+            new_gtos.transfer().await;
+            new_gtos.notify(Ok(())).await;
+            gw.completed.push(gw_id);
+            return Ok(());
+        }
+
         cdt::gw__read__start!(|| (gw_id));
 
         downstairs.reserve_repair_jobs_for(impacted_blocks);

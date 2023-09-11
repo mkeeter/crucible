@@ -196,6 +196,94 @@ impl ActiveJobs {
             r.end.extent_id
         })
     }
+
+    pub fn read_from_cache(
+        &self,
+        b: ImpactedBlocks,
+        ddef: crucible_common::RegionDefinition,
+    ) -> Option<Vec<crucible_protocol::ReadResponse>> {
+        let Some(r) = BlockMap::blocks_to_range(b) else { return None; };
+
+        // Check that the interval is fully covered with `Write` operations that
+        // are contiguous, meaning we'll be able to build every single block.
+        let mut prev = None;
+        let mut overlapping_writes = vec![];
+        for (start, (end, set)) in
+            self.block_to_active.iter_overlapping(r.clone())
+        {
+            if let Some(prev) = prev {
+                if prev != start {
+                    return None;
+                }
+            } else if start > &r.start {
+                // Started after the target range, so we can't read it
+                return None;
+            }
+            if let Some(write) = set.blocking {
+                if matches!(
+                    &self.jobs.get(&write).unwrap().work,
+                    IOop::Write { .. }
+                ) {
+                    // Skip empty blocks
+                    if !(start.block == ddef.extent_size().value
+                        && end.block == 0)
+                    {
+                        overlapping_writes.push((write, start, end));
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            prev = Some(end);
+        }
+        // We didn't cover the entire range :(
+        if prev.is_none() || prev.unwrap() < &r.end {
+            return None;
+        }
+
+        // At this point, we know that the entire read region is covered with
+        // IOop::Write operations.  Neat.
+        let out: Vec<_> = overlapping_writes
+            .into_iter()
+            .flat_map(|(w, start, end)| {
+                if let IOop::Write { writes, .. } =
+                    &self.jobs.get(&w).unwrap().work
+                {
+                    writes
+                        .iter()
+                        .skip_while(|w| {
+                            w.eid < start.extent_id
+                                || (w.eid == start.extent_id
+                                    && w.offset.value < start.block)
+                        })
+                        .take_while(|w| {
+                            w.eid < end.extent_id
+                                || w.eid == end.extent_id
+                                    && w.offset.value < end.block
+                        })
+                } else {
+                    panic!("write disappeared");
+                }
+            })
+            .skip_while(|w| {
+                w.eid < r.start.extent_id
+                    || (w.eid == r.start.extent_id
+                        && w.offset.value < r.start.block)
+            })
+            .map(|w| crucible_protocol::ReadResponse {
+                eid: w.eid,
+                offset: w.offset,
+                data: w.data.as_ref().into(),
+                block_contexts: vec![w.block_context.clone()],
+            })
+            .take(b.blocks(&ddef).len())
+            .collect();
+        assert_eq!(out.len(), b.blocks(&ddef).len());
+
+        Some(out)
+    }
 }
 
 impl<'a> IntoIterator for &'a ActiveJobs {
