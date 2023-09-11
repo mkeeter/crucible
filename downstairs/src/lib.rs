@@ -5712,7 +5712,7 @@ mod test {
 
         // Add one job, id 1000
         let rio = IOop::Read {
-            dependencies: vec![],
+            dependencies: Vec::new(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
@@ -5807,7 +5807,7 @@ mod test {
 
         // Add one job, id 1000
         let rio = IOop::Read {
-            dependencies: vec![],
+            dependencies: Vec::new(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
@@ -5902,7 +5902,7 @@ mod test {
 
         // Add one job, id 1000
         let rio = IOop::Read {
-            dependencies: vec![],
+            dependencies: Vec::new(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
