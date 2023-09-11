@@ -29,26 +29,15 @@ pub(crate) mod up_test {
         (eid, Block::new_512(offset))
     }
 
-    fn generic_read_request() -> (ReadRequest, ImpactedBlocks) {
-        let request = ReadRequest {
+    fn generic_read_request() -> ReadRequest {
+        ReadRequest {
             eid: 0,
             offset: Block::new_512(7),
-        };
-        let iblocks = ImpactedBlocks::new(
-            ImpactedAddr {
-                extent_id: 0,
-                block: 7,
-            },
-            ImpactedAddr {
-                extent_id: 0,
-                block: 7,
-            },
-        );
-        (request, iblocks)
+        }
     }
 
-    fn generic_write_request() -> (crucible_protocol::Write, ImpactedBlocks) {
-        let request = crucible_protocol::Write {
+    fn generic_write_request() -> crucible_protocol::Write {
+        crucible_protocol::Write {
             eid: 0,
             offset: Block::new_512(7),
             data: Bytes::from(vec![1]),
@@ -56,25 +45,12 @@ pub(crate) mod up_test {
                 encryption_context: None,
                 hash: 0,
             },
-        };
-        let iblocks = ImpactedBlocks::new(
-            ImpactedAddr {
-                extent_id: 0,
-                block: 7,
-            },
-            ImpactedAddr {
-                extent_id: 0,
-                block: 7,
-            },
-        );
-        (request, iblocks)
+        }
     }
 
     fn create_generic_read_eob(ds_id: u64) -> (ReadRequest, DownstairsIO) {
-        let (request, iblocks) = generic_read_request();
-
-        let op =
-            create_read_eob(ds_id, vec![], 10, vec![request.clone()], iblocks);
+        let request = generic_read_request();
+        let op = create_read_eob(ds_id, vec![], 10, vec![request.clone()]);
 
         (request, op)
     }
@@ -755,16 +731,7 @@ pub(crate) mod up_test {
 
         let next_id = ds.next_id();
 
-        let op = create_flush(
-            next_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
 
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -825,16 +792,7 @@ pub(crate) mod up_test {
 
         let next_id = ds.next_id();
 
-        let op = create_flush(
-            next_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
 
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -899,16 +857,7 @@ pub(crate) mod up_test {
 
         let next_id = ds.next_id();
 
-        let op = create_flush(
-            next_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
 
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -1234,19 +1183,14 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
 
-        let (request, iblocks) = generic_read_request();
+        let request = generic_read_request();
         let next_id = {
             let mut ds = upstairs.downstairs.lock().await;
 
             let next_id = ds.next_id();
 
-            let op = create_read_eob(
-                next_id,
-                vec![],
-                10,
-                vec![request.clone()],
-                iblocks,
-            );
+            let op =
+                create_read_eob(next_id, vec![], 10, vec![request.clone()]);
 
             ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -1640,14 +1584,13 @@ pub(crate) mod up_test {
 
         // send a write, and clients 0 and 1 will return errors
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             next_id,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
 
         ds.enqueue(op, ds_done_tx.clone()).await;
@@ -1738,14 +1681,13 @@ pub(crate) mod up_test {
 
         // Create a write, enqueue it on both the downstairs
         // and the guest work queues.
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             next_id,
             vec![],
             gw_id,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
 
         let mut sub = HashMap::new();
@@ -1833,14 +1775,13 @@ pub(crate) mod up_test {
 
         // Create a write, enqueue it on both the downstairs
         // and the guest work queues.
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             next_id,
             vec![],
             gw_id,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
 
         let mut sub = HashMap::new();
@@ -1915,14 +1856,13 @@ pub(crate) mod up_test {
 
         // Create a write, enqueue it on both the downstairs
         // and the guest work queues.
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             next_id,
             vec![],
             gw_id,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
 
         let mut sub = HashMap::new();
@@ -2012,7 +1952,6 @@ pub(crate) mod up_test {
             gw_id,
             11, // Gen number
             None,
-            ImpactedBlocks::Empty,
             None,
         );
 
@@ -2097,7 +2036,6 @@ pub(crate) mod up_test {
             gw_id,
             11, // Gen number
             None,
-            ImpactedBlocks::Empty,
             None,
         );
 
@@ -2169,7 +2107,6 @@ pub(crate) mod up_test {
             gw_id,
             11, // Gen number
             None,
-            ImpactedBlocks::Empty,
             None,
         );
 
@@ -2447,16 +2384,7 @@ pub(crate) mod up_test {
         // A flush is required to move work to completed
         // Create the flush then send it to all downstairs.
         let next_id = ds.next_id();
-        let op = create_flush(
-            next_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
 
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -2556,16 +2484,7 @@ pub(crate) mod up_test {
         // A flush is required to move work to completed
         // Create the flush then send it to all downstairs.
         let next_id = ds.next_id();
-        let op = create_flush(
-            next_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
 
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -2623,25 +2542,23 @@ pub(crate) mod up_test {
         let id1 = ds.next_id();
         let id2 = ds.next_id();
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id1,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id2,
             vec![],
             20,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -2703,16 +2620,7 @@ pub(crate) mod up_test {
 
         // Create the flush, put on the work queue
         let flush_id = ds.next_id();
-        let op = create_flush(
-            flush_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(flush_id, vec![], 10, 0, 0, None, None);
         ds.enqueue(op, ds_done_tx.clone()).await;
 
         // Simulate sending the flush to downstairs 0 and 1
@@ -2825,14 +2733,13 @@ pub(crate) mod up_test {
         // Build our write IO.
         let next_id = ds.next_id();
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             next_id,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         // Put the write on the queue.
         ds.enqueue(op, ds_done_tx.clone()).await;
@@ -2883,16 +2790,7 @@ pub(crate) mod up_test {
 
         // Create the flush IO
         let next_id = ds.next_id();
-        let op = create_flush(
-            next_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
         ds.enqueue(op, ds_done_tx.clone()).await;
 
         // Submit the flush to all three downstairs.
@@ -2967,26 +2865,19 @@ pub(crate) mod up_test {
         let id1 = ds.next_id();
         let id2 = ds.next_id();
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id1,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
-        let (request, iblocks) = generic_write_request();
-        let op = create_write_eob(
-            id2,
-            vec![],
-            1,
-            vec![request],
-            is_write_unwritten,
-            iblocks,
-        );
+        let request = generic_write_request();
+        let op =
+            create_write_eob(id2, vec![], 1, vec![request], is_write_unwritten);
         ds.enqueue(op, ds_done_tx.clone()).await;
 
         // Submit the two writes, to 2/3 of the downstairs.
@@ -3047,16 +2938,7 @@ pub(crate) mod up_test {
 
         // Create and enqueue the flush.
         let flush_id = ds.next_id();
-        let op = create_flush(
-            flush_id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(flush_id, vec![], 10, 0, 0, None, None);
         ds.enqueue(op, ds_done_tx.clone()).await;
 
         // Send the flush to two downstairs.
@@ -3583,14 +3465,13 @@ pub(crate) mod up_test {
 
         // Create the write and put it on the work queue.
         let id1 = ds.next_id();
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id1,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -3678,14 +3559,13 @@ pub(crate) mod up_test {
 
         // Create the write and put it on the work queue.
         let id1 = ds.next_id();
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id1,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -3878,14 +3758,13 @@ pub(crate) mod up_test {
         // Build a write, put it on the work queue.
         let id1 = ds.next_id();
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id1,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -4081,14 +3960,13 @@ pub(crate) mod up_test {
         // Build a write, put it on the work queue.
         let id1 = ds.next_id();
 
-        let (request, iblocks) = generic_write_request();
+        let request = generic_write_request();
         let op = create_write_eob(
             id1,
             vec![],
             10,
             vec![request],
             is_write_unwritten,
-            iblocks,
         );
         ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -5573,15 +5451,9 @@ pub(crate) mod up_test {
 
             let next_id = ds.next_id();
 
-            let (request, iblocks) = generic_write_request();
-            let op = create_write_eob(
-                next_id,
-                vec![],
-                10,
-                vec![request],
-                false,
-                iblocks,
-            );
+            let request = generic_write_request();
+            let op =
+                create_write_eob(next_id, vec![], 10, vec![request], false);
 
             ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -5652,15 +5524,9 @@ pub(crate) mod up_test {
 
             let next_id = ds.next_id();
 
-            let (request, iblocks) = generic_write_request();
-            let op = create_write_eob(
-                next_id,
-                vec![],
-                10,
-                vec![request],
-                false,
-                iblocks,
-            );
+            let request = generic_write_request();
+            let op =
+                create_write_eob(next_id, vec![], 10, vec![request], false);
 
             ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -5703,19 +5569,14 @@ pub(crate) mod up_test {
         up.downstairs.lock().await.ack(next_id);
 
         // Now, do a read.
-        let (request, iblocks) = generic_read_request();
+        let request = generic_read_request();
 
         let next_id = {
             let mut ds = up.downstairs.lock().await;
 
             let next_id = ds.next_id();
-            let op = create_read_eob(
-                next_id,
-                vec![],
-                10,
-                vec![request.clone()],
-                iblocks,
-            );
+            let op =
+                create_read_eob(next_id, vec![], 10, vec![request.clone()]);
 
             ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -5757,16 +5618,7 @@ pub(crate) mod up_test {
             let mut ds = up.downstairs.lock().await;
 
             let next_id = ds.next_id();
-            let op = create_flush(
-                next_id,
-                vec![],
-                10,
-                0,
-                0,
-                None,
-                ImpactedBlocks::Empty,
-                None,
-            );
+            let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
             ds.enqueue(op, ds_done_tx.clone()).await;
 
             // As this DS is failed, it should return none
@@ -5826,15 +5678,9 @@ pub(crate) mod up_test {
 
             let next_id = ds.next_id();
 
-            let (request, iblocks) = generic_write_request();
-            let op = create_write_eob(
-                next_id,
-                vec![],
-                10,
-                vec![request],
-                false,
-                iblocks,
-            );
+            let request = generic_write_request();
+            let op =
+                create_write_eob(next_id, vec![], 10, vec![request], false);
 
             ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -5882,19 +5728,14 @@ pub(crate) mod up_test {
 
         // Now, do a read.
 
-        let (request, iblocks) = generic_read_request();
+        let request = generic_read_request();
         let next_id = {
             let mut ds = up.downstairs.lock().await;
 
             let next_id = ds.next_id();
 
-            let op = create_read_eob(
-                next_id,
-                vec![],
-                10,
-                vec![request.clone()],
-                iblocks,
-            );
+            let op =
+                create_read_eob(next_id, vec![], 10, vec![request.clone()]);
 
             ds.enqueue(op, ds_done_tx.clone()).await;
 
@@ -5933,9 +5774,8 @@ pub(crate) mod up_test {
 
         let id = ds.next_id();
 
-        let (request, iblocks) = generic_write_request();
-        let op =
-            create_write_eob(id, vec![], 10, vec![request], false, iblocks);
+        let request = generic_write_request();
+        let op = create_write_eob(id, vec![], 10, vec![request], false);
         ds.enqueue(op, ds_done_tx.clone()).await;
 
         if make_in_progress {
@@ -5959,16 +5799,7 @@ pub(crate) mod up_test {
 
         let id = ds.next_id();
 
-        let op = create_flush(
-            id,
-            vec![],
-            10,
-            0,
-            0,
-            None,
-            ImpactedBlocks::Empty,
-            None,
-        );
+        let op = create_flush(id, vec![], 10, 0, 0, None, None);
         ds.enqueue(op, ds_done_tx.clone()).await;
 
         if make_in_progress {
@@ -5992,13 +5823,7 @@ pub(crate) mod up_test {
 
         let read_id = ds.next_id();
 
-        let op = create_read_eob(
-            read_id,
-            vec![],
-            10,
-            vec![request],
-            ImpactedBlocks::Empty,
-        );
+        let op = create_read_eob(read_id, vec![], 10, vec![request]);
 
         // Add the reads
         ds.enqueue(op, ds_done_tx.clone()).await;
@@ -6217,16 +6042,7 @@ pub(crate) mod up_test {
             let mut ds = up.downstairs.lock().await;
 
             let next_id = ds.next_id();
-            let op = create_flush(
-                next_id,
-                vec![],
-                10,
-                0,
-                0,
-                None,
-                ImpactedBlocks::Empty,
-                None,
-            );
+            let op = create_flush(next_id, vec![], 10, 0, 0, None, None);
             ds.enqueue(op, ds_done_tx.clone()).await;
 
             assert!(ds.in_progress(next_id, 0).is_some());
@@ -8502,13 +8318,10 @@ pub(crate) mod up_test {
         assert_eq!(jobs.len(), 3);
 
         // confirm which extents are impacted (in case make_upstairs changes)
-        assert_eq!(jobs[0].impacted_blocks.extents().unwrap().count(), 1);
-        assert_eq!(jobs[1].impacted_blocks.extents().unwrap().count(), 2);
-        assert_eq!(jobs[2].impacted_blocks.extents().unwrap().count(), 1);
-        assert_ne!(
-            jobs[0].impacted_blocks.extents(),
-            jobs[2].impacted_blocks.extents()
-        );
+        assert_eq!(ds.get_extents_for(jobs[0]).count(), 1);
+        assert_eq!(ds.get_extents_for(jobs[1]).count(), 2);
+        assert_eq!(ds.get_extents_for(jobs[2]).count(), 1);
+        assert_ne!(ds.get_extents_for(jobs[0]), ds.get_extents_for(jobs[2]));
 
         // confirm deps
         assert!(jobs[0].work.deps().is_empty()); // op 0
@@ -8599,20 +8412,14 @@ pub(crate) mod up_test {
         assert_eq!(jobs.len(), 5);
 
         // confirm which extents are impacted (in case make_upstairs changes)
-        assert_eq!(jobs[0].impacted_blocks.extents().unwrap().count(), 1);
-        assert_eq!(jobs[1].impacted_blocks.extents().unwrap().count(), 2);
-        assert_eq!(jobs[2].impacted_blocks.extents().unwrap().count(), 1);
-        assert_eq!(jobs[3].impacted_blocks.extents().unwrap().count(), 2);
-        assert_eq!(jobs[4].impacted_blocks.extents().unwrap().count(), 1);
+        assert_eq!(ds.get_extents_for(jobs[0]).count(), 1);
+        assert_eq!(ds.get_extents_for(jobs[1]).count(), 2);
+        assert_eq!(ds.get_extents_for(jobs[2]).count(), 1);
+        assert_eq!(ds.get_extents_for(jobs[3]).count(), 2);
+        assert_eq!(ds.get_extents_for(jobs[4]).count(), 1);
 
-        assert_ne!(
-            jobs[0].impacted_blocks.extents(),
-            jobs[2].impacted_blocks.extents()
-        );
-        assert_ne!(
-            jobs[4].impacted_blocks.extents(),
-            jobs[2].impacted_blocks.extents()
-        );
+        assert_ne!(ds.get_extents_for(jobs[0]), ds.get_extents_for(jobs[2]));
+        assert_ne!(ds.get_extents_for(jobs[4]), ds.get_extents_for(jobs[2]));
 
         assert!(jobs[0].work.deps().is_empty()); // op 0
         assert_eq!(jobs[1].work.deps(), &[jobs[0].ds_id]); // op 1
@@ -8682,14 +8489,11 @@ pub(crate) mod up_test {
         assert_eq!(jobs.len(), 3);
 
         // confirm which extents are impacted (in case make_upstairs changes)
-        assert_eq!(jobs[0].impacted_blocks.extents().unwrap().count(), 1);
-        assert_eq!(jobs[1].impacted_blocks.extents().unwrap().count(), 1);
-        assert_eq!(jobs[2].impacted_blocks.extents().unwrap().count(), 2);
+        assert_eq!(ds.get_extents_for(jobs[0]).count(), 1);
+        assert_eq!(ds.get_extents_for(jobs[1]).count(), 1);
+        assert_eq!(ds.get_extents_for(jobs[2]).count(), 2);
 
-        assert_ne!(
-            jobs[0].impacted_blocks.extents(),
-            jobs[1].impacted_blocks.extents()
-        );
+        assert_ne!(ds.get_extents_for(jobs[0]), ds.get_extents_for(jobs[1]));
 
         assert!(jobs[0].work.deps().is_empty()); // op 0
         assert!(jobs[1].work.deps().is_empty()); // op 1

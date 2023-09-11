@@ -413,7 +413,6 @@ fn create_reopen_io(
     ds_id: u64,
     dependencies: Vec<u64>,
     gw_id: u64,
-    impacted_blocks: ImpactedBlocks,
 ) -> DownstairsIO {
     let reopen_ioop = IOop::ExtentLiveReopen {
         dependencies,
@@ -433,7 +432,6 @@ fn create_reopen_io(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 
@@ -443,7 +441,6 @@ fn create_close_io(
     ds_id: u64,
     dependencies: Vec<u64>,
     gw_id: u64,
-    impacted_blocks: ImpactedBlocks,
     flush: u64,
     gen: u64,
     source: u8,
@@ -472,7 +469,6 @@ fn create_close_io(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 
@@ -482,7 +478,6 @@ fn create_repair_io(
     dependencies: Vec<u64>,
     gw_id: u64,
     extent: usize,
-    impacted_blocks: ImpactedBlocks,
     repair_address: SocketAddr,
     source_downstairs: u8,
     repair_downstairs: Vec<u8>,
@@ -508,7 +503,6 @@ fn create_repair_io(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 
@@ -516,7 +510,6 @@ fn create_noop_io(
     ds_id: u64,
     dependencies: Vec<u64>,
     gw_id: u64,
-    impacted_blocks: ImpactedBlocks,
 ) -> DownstairsIO {
     let noop_ioop = IOop::ExtentLiveNoOp { dependencies };
 
@@ -533,7 +526,6 @@ fn create_noop_io(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 
@@ -553,7 +545,6 @@ fn repair_or_noop(
     repair_id: u64,
     repair_deps: Vec<u64>,
     gw_repair_id: u64,
-    impacted_blocks: ImpactedBlocks,
     source: u8,
     repair: &Vec<u8>,
 ) -> DownstairsIO {
@@ -587,7 +578,7 @@ fn repair_or_noop(
         for cid in repair.iter() {
             ds.extents_confirmed[*cid as usize] += 1;
         }
-        create_noop_io(repair_id, repair_deps, gw_repair_id, impacted_blocks)
+        create_noop_io(repair_id, repair_deps, gw_repair_id)
     } else {
         info!(
             ds.log,
@@ -603,7 +594,6 @@ fn repair_or_noop(
             repair_deps,
             gw_repair_id,
             extent,
-            impacted_blocks,
             repair_address,
             source,
             need_repair,
@@ -619,15 +609,9 @@ async fn create_and_enqueue_reopen_io(
     deps: Vec<u64>,
     reopen_id: u64,
     gw_reopen_id: u64,
-    impacted_blocks: ImpactedBlocks,
 ) -> block_req::BlockReqWaiter {
-    let reopen_io = create_reopen_io(
-        eid as usize,
-        reopen_id,
-        deps,
-        gw_reopen_id,
-        impacted_blocks,
-    );
+    let reopen_io =
+        create_reopen_io(eid as usize, reopen_id, deps, gw_reopen_id);
 
     let mut sub = HashMap::new();
     sub.insert(reopen_id, 0);
@@ -657,7 +641,6 @@ async fn create_and_enqueue_close_io(
     deps: Vec<u64>,
     close_id: u64,
     gw_close_id: u64,
-    impacted_blocks: ImpactedBlocks,
     source: u8,
     repair: Vec<u8>,
 ) -> block_req::BlockReqWaiter {
@@ -666,7 +649,6 @@ async fn create_and_enqueue_close_io(
         close_id,
         deps,
         gw_close_id,
-        impacted_blocks,
         next_flush,
         gen,
         source,
@@ -698,7 +680,6 @@ async fn create_and_enqueue_repair_io(
     deps: Vec<u64>,
     repair_id: u64,
     gw_repair_id: u64,
-    impacted_blocks: ImpactedBlocks,
     source: u8,
     repair: &Vec<u8>,
 ) -> block_req::BlockReqWaiter {
@@ -708,7 +689,6 @@ async fn create_and_enqueue_repair_io(
         repair_id,
         deps,
         gw_repair_id,
-        impacted_blocks,
         source,
         repair,
     );
@@ -736,9 +716,8 @@ async fn create_and_enqueue_noop_io(
     deps: Vec<u64>,
     noop_id: u64,
     gw_noop_id: u64,
-    impacted_blocks: ImpactedBlocks,
 ) -> block_req::BlockReqWaiter {
-    let nio = create_noop_io(noop_id, deps, gw_noop_id, impacted_blocks);
+    let nio = create_noop_io(noop_id, deps, gw_noop_id);
 
     let mut sub = HashMap::new();
     sub.insert(noop_id, 0);
@@ -856,7 +835,6 @@ impl Upstairs {
             let (extent_repair_ids, deps) = ds.get_repair_ids(eid);
             let ds_id = extent_repair_ids.close_id;
             let ddef = self.ddef.lock().await.get_def().unwrap();
-            let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
             warn!(
                 self.log,
@@ -870,15 +848,9 @@ impl Upstairs {
             let mut noops = Vec::new();
             for id in ds_id..ds_id + 4 {
                 let gw_id = gw.next_gw_id();
-                let noop_brw = create_and_enqueue_noop_io(
-                    ds,
-                    gw,
-                    deps.clone(),
-                    id,
-                    gw_id,
-                    impacted_blocks,
-                )
-                .await;
+                let noop_brw =
+                    create_and_enqueue_noop_io(ds, gw, deps.clone(), id, gw_id)
+                        .await;
                 noops.push(noop_brw);
             }
         }
@@ -1047,8 +1019,6 @@ impl Upstairs {
         }
         let ddef = self.ddef.lock().await.get_def().unwrap();
 
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
-
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = gw.next_gw_id();
         let gw_repair_id: u64 = gw.next_gw_id();
@@ -1100,7 +1070,6 @@ impl Upstairs {
             reopen_deps,
             reopen_id,
             gw_reopen_id,
-            impacted_blocks,
         )
         .await;
 
@@ -1117,7 +1086,6 @@ impl Upstairs {
             close_deps,
             close_id,
             gw_close_id,
-            impacted_blocks,
             source,
             repair.clone(),
         )
@@ -1183,7 +1151,6 @@ impl Upstairs {
                 repair_deps,
                 repair_id,
                 gw_repair_id,
-                impacted_blocks,
             )
             .await
         } else {
@@ -1194,7 +1161,6 @@ impl Upstairs {
                 repair_deps,
                 repair_id,
                 gw_repair_id,
-                impacted_blocks,
                 source,
                 &repair,
             )
@@ -1245,12 +1211,7 @@ impl Upstairs {
 
         // This is the same if we are in error or not.
         let noop_brw = create_and_enqueue_noop_io(
-            &mut ds,
-            &mut gw,
-            noop_deps,
-            noop_id,
-            gw_noop_id,
-            impacted_blocks,
+            &mut ds, &mut gw, noop_deps, noop_id, gw_noop_id,
         )
         .await;
 
@@ -3225,7 +3186,6 @@ pub mod repair_test {
         let ddef = up.ddef.lock().await.get_def().unwrap();
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         let close_id = 1000;
         let gw_close_id = 1;
@@ -3235,7 +3195,6 @@ pub mod repair_test {
             close_id,
             Vec::new(), // deps
             gw_close_id,
-            impacted_blocks,
             3,       // flush
             2,       // gen
             0,       // source
@@ -3371,11 +3330,10 @@ pub mod repair_test {
 
             let repair_op = repair_or_noop(
                 &mut ds,
-                0,      // Extent
-                1000,   // ds_id
-                vec![], // Dependencies
-                1,      // gw_id
-                ImpactedBlocks::Empty,
+                0,              // Extent
+                1000,           // ds_id
+                vec![],         // Dependencies
+                1,              // gw_id
                 source,         // Source extent
                 &repair_extent, // Repair extent
             );
@@ -3408,7 +3366,6 @@ pub mod repair_test {
             1000,   // ds_id
             vec![], // Dependencies
             1,      // gw_id
-            ImpactedBlocks::Empty,
             source,
             &repair,
         );
@@ -3746,7 +3703,6 @@ pub mod repair_test {
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
         let ddef = up.ddef.lock().await.get_def().unwrap();
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         // Upstairs "guest" work IDs.
         let gw_r_id: u64 = 1;
@@ -3759,13 +3715,7 @@ pub mod repair_test {
         // actually enqueue'ing the middle repair job.
 
         let _reopen_brw = create_and_enqueue_reopen_io(
-            &mut ds,
-            &mut gw,
-            eid,
-            deps,
-            r_id,
-            gw_r_id,
-            impacted_blocks,
+            &mut ds, &mut gw, eid, deps, r_id, gw_r_id,
         )
         .await;
 
@@ -3805,7 +3755,6 @@ pub mod repair_test {
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
         let ddef = up.ddef.lock().await.get_def().unwrap();
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = 1;
@@ -3830,7 +3779,6 @@ pub mod repair_test {
             deps,
             close_id,
             gw_close_id,
-            impacted_blocks,
             source,
             repair.clone(),
         )
@@ -3884,7 +3832,6 @@ pub mod repair_test {
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
         let ddef = up.ddef.lock().await.get_def().unwrap();
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         // Upstairs "guest" work IDs.
         let gw_repair_id: u64 = gw.next_gw_id();
@@ -3912,7 +3859,6 @@ pub mod repair_test {
             deps,
             repair_id,
             gw_repair_id,
-            impacted_blocks,
             source,
             &repair,
         )
@@ -3953,7 +3899,6 @@ pub mod repair_test {
 
         let eid = 1;
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         // Upstairs "guest" work IDs.
         let gw_repair_id: u64 = gw.next_gw_id();
@@ -3989,7 +3934,6 @@ pub mod repair_test {
             deps,
             repair_id,
             gw_repair_id,
-            impacted_blocks,
             source,
             &repair,
         )
@@ -4045,7 +3989,6 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         let ddef = up.ddef.lock().await.get_def().unwrap();
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         // Upstairs "guest" work IDs.
         let gw_close_id: u64 = gw.next_gw_id();
@@ -4062,7 +4005,6 @@ pub mod repair_test {
             deps,
             close_id,
             gw_close_id,
-            impacted_blocks,
             0,       // source downstairs
             vec![1], // repair downstairs
         )
@@ -4084,7 +4026,6 @@ pub mod repair_test {
         let ddef = up.ddef.lock().await.get_def().unwrap();
 
         ds.extent_limit[1] = Some(eid.try_into().unwrap());
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         let gw_repair_id: u64 = gw.next_gw_id();
         let (extent_repair_ids, deps) = ds.get_repair_ids(eid);
@@ -4096,7 +4037,6 @@ pub mod repair_test {
             deps,
             repair_id,
             gw_repair_id,
-            impacted_blocks,
         )
         .await;
         drop(gw);
@@ -5907,7 +5847,6 @@ pub mod repair_test {
 
         let eid = 0;
         let ddef = up.ddef.lock().await.get_def().unwrap();
-        let impacted_blocks = extent_to_impacted_blocks(&ddef, eid);
 
         // Fault the downstairs
         up.ds_transition(1, DsState::Faulted).await;
@@ -5950,7 +5889,6 @@ pub mod repair_test {
             reopen_deps,
             reopen_id,
             gw_reopen_id,
-            impacted_blocks,
         )
         .await;
 
@@ -5965,7 +5903,6 @@ pub mod repair_test {
             close_deps,
             close_id,
             gw_close_id,
-            impacted_blocks,
             0,
             vec![1],
         )

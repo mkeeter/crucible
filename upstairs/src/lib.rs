@@ -4842,6 +4842,18 @@ impl Downstairs {
             }
         }
     }
+
+    /// Return the extent range covered by the given job
+    ///
+    /// # Panics
+    /// If the job is not stored in our `Downstairs`
+    #[cfg(test)]
+    fn get_extents_for(
+        &self,
+        io: &DownstairsIO,
+    ) -> std::ops::RangeInclusive<u64> {
+        self.ds_active.get_extents_for(io.ds_id)
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -5768,7 +5780,6 @@ impl Upstairs {
             gw_id,
             self.get_generation().await,
             snapshot_details,
-            ImpactedBlocks::Empty,
             extent_under_repair,
         );
 
@@ -5955,7 +5966,6 @@ impl Upstairs {
             gw_id,
             writes,
             is_write_unwritten,
-            impacted_blocks,
         );
 
         let mut sub = HashMap::new();
@@ -6068,13 +6078,7 @@ impl Upstairs {
 
         sub.insert(next_id, 0); // XXX does this value matter?
 
-        let wr = create_read_eob(
-            next_id,
-            dep.clone(),
-            gw_id,
-            requests,
-            impacted_blocks,
-        );
+        let wr = create_read_eob(next_id, dep.clone(), gw_id, requests);
 
         /*
          * New work created, add to the guest_work HM. New work must be put
@@ -7724,8 +7728,6 @@ struct DownstairsIO {
      */
     data: Option<Vec<ReadResponse>>,
     read_response_hashes: Vec<Option<u64>>,
-
-    impacted_blocks: ImpactedBlocks,
 }
 
 impl DownstairsIO {
@@ -10186,7 +10188,6 @@ fn create_write_eob(
     gw_id: u64,
     writes: Vec<crucible_protocol::Write>,
     is_write_unwritten: bool,
-    impacted_blocks: ImpactedBlocks,
 ) -> DownstairsIO {
     /*
      * Note to self:  Should the dependency list cover everything since
@@ -10218,7 +10219,6 @@ fn create_write_eob(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 
@@ -10232,7 +10232,6 @@ fn create_read_eob(
     dependencies: Vec<u64>,
     gw_id: u64,
     requests: Vec<ReadRequest>,
-    impacted_blocks: ImpactedBlocks,
 ) -> DownstairsIO {
     let aread = IOop::Read {
         dependencies,
@@ -10253,7 +10252,6 @@ fn create_read_eob(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 
@@ -10268,7 +10266,6 @@ fn create_flush(
     guest_id: u64,
     gen_number: u64,
     snapshot_details: Option<SnapshotDetails>,
-    impacted_blocks: ImpactedBlocks,
     extent_limit: Option<usize>,
 ) -> DownstairsIO {
     let flush = IOop::Flush {
@@ -10292,7 +10289,6 @@ fn create_flush(
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
-        impacted_blocks,
     }
 }
 

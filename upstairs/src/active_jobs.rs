@@ -180,6 +180,16 @@ impl ActiveJobs {
     pub fn ackable_work(&self) -> Vec<u64> {
         self.ackable.iter().cloned().collect()
     }
+
+    #[cfg(test)]
+    pub fn get_extents_for(&self, job: u64) -> std::ops::RangeInclusive<u64> {
+        let r = self.block_to_active.job_to_range.get(&job).unwrap();
+        r.start.extent_id..=(if r.end.block == 0 {
+            r.end.extent_id - 1
+        } else {
+            r.end.extent_id
+        })
+    }
 }
 
 impl<'a> IntoIterator for &'a ActiveJobs {
