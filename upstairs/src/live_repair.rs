@@ -1,7 +1,7 @@
 // Copyright 2023 Oxide Computer Company
 
 use super::*;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 // Live Repair
 // This handles the situation where one (or two) downstairs are no longer
@@ -344,7 +344,7 @@ async fn live_repair_main(
     // Send a final flush, wait for it to finish so we know the downstairs
     // has cleared all the repair jobs and our "last flush" is set.
 
-    let (send, recv) = mpsc::channel(1);
+    let (send, recv) = oneshot::channel();
     let op = BlockOp::Flush {
         snapshot_details: None,
     };
@@ -595,7 +595,7 @@ async fn create_and_enqueue_reopen_io(
     sub.insert(reopen_id, 0);
 
     cdt::gw__reopen__start!(|| (gw_reopen_id, eid));
-    let (send, recv) = mpsc::channel(1);
+    let (send, recv) = oneshot::channel();
     let op = BlockOp::RepairOp;
     let reopen_br = BlockReq::new(op, send);
     let reopen_brw = BlockReqWaiter::new(recv);
@@ -637,7 +637,7 @@ async fn create_and_enqueue_close_io(
     sub.insert(close_id, 0);
 
     cdt::gw__close__start!(|| (gw_close_id, eid));
-    let (send, recv) = mpsc::channel(1);
+    let (send, recv) = oneshot::channel();
     let op = BlockOp::RepairOp;
     let close_br = BlockReq::new(op, send);
     let close_brw = BlockReqWaiter::new(recv);
@@ -675,7 +675,7 @@ async fn create_and_enqueue_repair_io(
     sub.insert(repair_id, 0);
 
     cdt::gw__repair__start!(|| (gw_repair_id, eid));
-    let (send, recv) = mpsc::channel(1);
+    let (send, recv) = oneshot::channel();
     let op = BlockOp::RepairOp;
     let repair_br = BlockReq::new(op, send);
     let repair_brw = BlockReqWaiter::new(recv);
@@ -701,7 +701,7 @@ async fn create_and_enqueue_noop_io(
     sub.insert(noop_id, 0);
 
     cdt::gw__noop__start!(|| (gw_noop_id));
-    let (send, recv) = mpsc::channel(1);
+    let (send, recv) = oneshot::channel();
     let op = BlockOp::RepairOp;
     let noop_br = BlockReq::new(op, send);
     let noop_brw = BlockReqWaiter::new(recv);
@@ -3190,7 +3190,7 @@ pub mod repair_test {
         let mut sub = HashMap::new();
         sub.insert(repair_ids.close_id, 0);
 
-        let (send, recv) = mpsc::channel(1);
+        let (send, recv) = oneshot::channel();
         let op = BlockOp::RepairOp;
         let close_br = BlockReq::new(op, send);
         let _close_brw = BlockReqWaiter::new(recv);
