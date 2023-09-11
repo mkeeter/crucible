@@ -69,7 +69,8 @@ mod live_repair;
 pub use live_repair::{check_for_repair, ExtentInfo, RepairCheck};
 
 mod active_jobs;
-use active_jobs::{ActiveJobs, Dependencies};
+use active_jobs::ActiveJobs;
+pub use active_jobs::Dependencies;
 
 use async_trait::async_trait;
 

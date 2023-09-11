@@ -297,9 +297,34 @@ impl Dependencies {
     pub fn take(self) -> Vec<u64> {
         self.0
     }
-    #[cfg(test)]
+    /// Creates a new, empty set of dependencies
+    ///
+    /// Using this outside of unit tests is forbidden, since that would let you
+    /// violate the rule that dependencies must be tracked; however, we can't
+    /// make it private because `Dependencies::empty` is called by unit tests
+    /// outside of this crate.
+    //TODO(matt) do some feature magic to hide this
     pub fn empty() -> Self {
         Self(vec![])
+    }
+    /// Converts from a `Vec` to a dependency list
+    ///
+    /// This must only be called at API boundaries, and should not be used to
+    /// build new sets of dependencies willy-nilly.
+    pub fn from_vec(v: Vec<u64>) -> Self {
+        Self(v)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &u64> {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Dependencies {
+    type Item = &'a u64;
+    type IntoIter = std::slice::Iter<'a, u64>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
     }
 }
 

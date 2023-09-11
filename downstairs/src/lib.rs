@@ -536,7 +536,7 @@ where
             cdt::submit__write__start!(|| job_id);
 
             let new_write = IOop::Write {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 writes,
             };
 
@@ -567,7 +567,7 @@ where
             cdt::submit__flush__start!(|| job_id);
 
             let new_flush = IOop::Flush {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 flush_number,
                 gen_number,
                 snapshot_details,
@@ -598,7 +598,7 @@ where
             cdt::submit__writeunwritten__start!(|| job_id);
 
             let new_write = IOop::WriteUnwritten {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 writes,
             };
 
@@ -626,7 +626,7 @@ where
             cdt::submit__read__start!(|| job_id);
 
             let new_read = IOop::Read {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 requests,
             };
 
@@ -656,7 +656,7 @@ where
             cdt::submit__el__close__start!(|| job_id);
             // TODO: Add dtrace probes
             let ext_close = IOop::ExtentClose {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 extent: extent_id,
             };
 
@@ -687,7 +687,7 @@ where
             cdt::submit__el__flush__close__start!(|| job_id);
             // Do both the flush, and then the close
             let new_flush = IOop::ExtentFlushClose {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 extent: extent_id,
                 flush_number,
                 gen_number,
@@ -722,7 +722,7 @@ where
             cdt::submit__el__repair__start!(|| job_id);
             // Do both the flush, and then the close
             let new_repair = IOop::ExtentLiveRepair {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 extent: extent_id,
                 source_downstairs: source_client_id,
                 source_repair_address,
@@ -754,7 +754,7 @@ where
 
             cdt::submit__el__reopen__start!(|| job_id);
             let new_open = IOop::ExtentLiveReopen {
-                dependencies,
+                dependencies: Dependencies::from_vec(dependencies),
                 extent: extent_id,
             };
 
@@ -779,7 +779,9 @@ where
                 return Ok(());
             }
             cdt::submit__el__noop__start!(|| job_id);
-            let new_open = IOop::ExtentLiveNoOp { dependencies };
+            let new_open = IOop::ExtentLiveNoOp {
+                dependencies: Dependencies::from_vec(dependencies),
+            };
 
             let d = ad.lock().await;
             debug!(d.log, "Received NoOP {}", job_id);
@@ -3250,7 +3252,7 @@ mod test {
                 ds_id,
                 work: if is_flush {
                     IOop::Flush {
-                        dependencies: deps,
+                        dependencies: Dependencies::from_vec(deps),
                         flush_number: 10,
                         gen_number: 0,
                         snapshot_details: None,
@@ -3258,7 +3260,7 @@ mod test {
                     }
                 } else {
                     IOop::Read {
-                        dependencies: deps,
+                        dependencies: Dependencies::from_vec(deps),
                         requests: vec![ReadRequest {
                             eid: 1,
                             offset: Block::new_512(1),
@@ -3282,7 +3284,7 @@ mod test {
                 upstairs_connection,
                 ds_id,
                 work: IOop::WriteUnwritten {
-                    dependencies: deps,
+                    dependencies: Dependencies::from_vec(deps),
                     writes: Vec::with_capacity(1),
                 },
                 state: WorkState::New,
@@ -3435,7 +3437,7 @@ mod test {
             .await?;
 
         let rio = IOop::Read {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
@@ -3445,7 +3447,7 @@ mod test {
 
         let deps = vec![1000];
         let rio = IOop::Read {
-            dependencies: deps,
+            dependencies: Dependencies::from_vec(deps),
             requests: vec![ReadRequest {
                 eid: 1,
                 offset: Block::new_512(1),
@@ -3543,13 +3545,13 @@ mod test {
             .await?;
 
         let rio = IOop::ExtentClose {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             extent: 0,
         };
         ds.add_work(upstairs_connection, 1000, rio).await?;
 
         let rio = IOop::ExtentFlushClose {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             extent: 1,
             flush_number: 1,
             gen_number: 2,
@@ -3560,7 +3562,7 @@ mod test {
 
         let deps = vec![1000, 1001];
         let rio = IOop::Read {
-            dependencies: deps,
+            dependencies: Dependencies::from_vec(deps),
             requests: vec![ReadRequest {
                 eid: 2,
                 offset: Block::new_512(1),
@@ -3569,12 +3571,14 @@ mod test {
         ds.add_work(upstairs_connection, 1002, rio).await?;
 
         let deps = vec![1000, 1001, 1002];
-        let rio = IOop::ExtentLiveNoOp { dependencies: deps };
+        let rio = IOop::ExtentLiveNoOp {
+            dependencies: Dependencies::from_vec(deps),
+        };
         ds.add_work(upstairs_connection, 1003, rio).await?;
 
         let deps = vec![1000, 1001, 1002, 1003];
         let rio = IOop::ExtentLiveReopen {
-            dependencies: deps,
+            dependencies: Dependencies::from_vec(deps),
             extent: 0,
         };
         ds.add_work(upstairs_connection, 1004, rio).await?;
@@ -3633,13 +3637,13 @@ mod test {
             .await?;
 
         let rio = IOop::ExtentClose {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             extent: 0,
         };
         ds.add_work(upstairs_connection, 1000, rio).await?;
 
         let rio = IOop::ExtentFlushClose {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             extent: 1,
             flush_number: 1,
             gen_number: gen,
@@ -3650,12 +3654,12 @@ mod test {
 
         // Add the two reopen commands for the two extents we closed.
         let rio = IOop::ExtentLiveReopen {
-            dependencies: vec![1000],
+            dependencies: Dependencies::from_vec(vec![1000]),
             extent: 0,
         };
         ds.add_work(upstairs_connection, 1002, rio).await?;
         let rio = IOop::ExtentLiveReopen {
-            dependencies: vec![1001],
+            dependencies: Dependencies::from_vec(vec![1001]),
             extent: 1,
         };
         ds.add_work(upstairs_connection, 1003, rio).await?;
@@ -3807,14 +3811,14 @@ mod test {
         // Create and add the first write
         let writes = create_generic_test_write(eid);
         let rio = IOop::Write {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             writes,
         };
         ds.add_work(upstairs_connection, 1000, rio).await?;
 
         // add work for flush 1001
         let rio = IOop::Flush {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             flush_number: 3,
             gen_number: gen,
             snapshot_details: None,
@@ -3826,14 +3830,14 @@ mod test {
         let writes = create_generic_test_write(eid);
 
         let rio = IOop::Write {
-            dependencies: vec![1000, 1001],
+            dependencies: Dependencies::from_vec(vec![1000, 1001]),
             writes,
         };
         ds.add_work(upstairs_connection, 1002, rio).await?;
 
         // Now close the extent
         let rio = IOop::ExtentClose {
-            dependencies: vec![1000, 1001, 1002],
+            dependencies: Dependencies::from_vec(vec![1000, 1001, 1002]),
             extent: eid as usize,
         };
         ds.add_work(upstairs_connection, 1003, rio).await?;
@@ -3929,13 +3933,13 @@ mod test {
         // Create the write
         let writes = create_generic_test_write(eid);
         let rio = IOop::Write {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             writes,
         };
         ds.add_work(upstairs_connection, 1000, rio).await?;
 
         let rio = IOop::ExtentClose {
-            dependencies: vec![1000],
+            dependencies: Dependencies::from_vec(vec![1000]),
             extent: eid as usize,
         };
         ds.add_work(upstairs_connection, 1001, rio).await?;
@@ -4041,13 +4045,13 @@ mod test {
         // Create the write
         let writes = create_generic_test_write(eid);
         let rio = IOop::Write {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             writes,
         };
         ds.add_work(upstairs_connection, 1000, rio).await?;
 
         let rio = IOop::ExtentFlushClose {
-            dependencies: vec![1000],
+            dependencies: Dependencies::from_vec(vec![1000]),
             extent: eid as usize,
             flush_number: 3,
             gen_number: gen,
@@ -4156,7 +4160,7 @@ mod test {
         // Create the write for extent 1
         let writes = create_generic_test_write(eid_one);
         let rio = IOop::Write {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             writes,
         };
         ds.add_work(upstairs_connection, 1000, rio).await?;
@@ -4164,14 +4168,14 @@ mod test {
         // Create the write for extent 2
         let writes = create_generic_test_write(eid_two);
         let rio = IOop::Write {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             writes,
         };
         ds.add_work(upstairs_connection, 1001, rio).await?;
 
         // Flush and close extent 1
         let rio = IOop::ExtentFlushClose {
-            dependencies: vec![1000],
+            dependencies: Dependencies::from_vec(vec![1000]),
             extent: eid_one as usize,
             flush_number: 6,
             gen_number: gen,
@@ -4182,7 +4186,7 @@ mod test {
 
         // Just close extent 2
         let rio = IOop::ExtentClose {
-            dependencies: vec![1001],
+            dependencies: Dependencies::from_vec(vec![1001]),
             extent: eid_two as usize,
         };
         ds.add_work(upstairs_connection, 1003, rio).await?;
@@ -4323,7 +4327,7 @@ mod test {
         // Verify ExtentClose jobs move through the work queue
         let eid = 1;
         let ioop = IOop::ExtentClose {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             extent: eid,
         };
         test_misc_work_through_work_queue(1000, ioop);
@@ -4335,7 +4339,7 @@ mod test {
 
         let eid = 1;
         let ioop = IOop::ExtentFlushClose {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             extent: eid,
             flush_number: 1,
             gen_number: 2,
@@ -4354,7 +4358,7 @@ mod test {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
         let ioop = IOop::ExtentLiveRepair {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             extent: eid,
             source_downstairs: 0,
             source_repair_address,
@@ -4369,7 +4373,7 @@ mod test {
         let eid = 1;
 
         let ioop = IOop::ExtentLiveReopen {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
             extent: eid,
         };
         test_misc_work_through_work_queue(1000, ioop);
@@ -4380,7 +4384,7 @@ mod test {
         // Verify ExtentLiveNoOp jobs move through the work queue
 
         let ioop = IOop::ExtentLiveNoOp {
-            dependencies: vec![],
+            dependencies: Dependencies::empty(),
         };
         test_misc_work_through_work_queue(1000, ioop);
     }
@@ -5619,7 +5623,7 @@ mod test {
         assert_eq!(ds.active_upstairs().len(), 2);
 
         let read_1 = IOop::Read {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
@@ -5629,7 +5633,7 @@ mod test {
             .await?;
 
         let read_2 = IOop::Read {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             requests: vec![ReadRequest {
                 eid: 1,
                 offset: Block::new_512(2),
@@ -5712,7 +5716,7 @@ mod test {
 
         // Add one job, id 1000
         let rio = IOop::Read {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
@@ -5807,7 +5811,7 @@ mod test {
 
         // Add one job, id 1000
         let rio = IOop::Read {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
@@ -5902,7 +5906,7 @@ mod test {
 
         // Add one job, id 1000
         let rio = IOop::Read {
-            dependencies: Vec::new(),
+            dependencies: Dependencies::empty(),
             requests: vec![ReadRequest {
                 eid: 0,
                 offset: Block::new_512(1),
