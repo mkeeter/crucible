@@ -3563,10 +3563,10 @@ impl Downstairs {
                         self.extent_limit[cid as usize].map(|first| {
                             self.repair_job_ids
                                 .last_key_value()
-                                .map(|(k, _)| *k as u64)
+                                .map(|(k, _)| *k)
                                 .unwrap_or(first as u64)
                         });
-                    // TODO is my_limit ever `None` here?
+                    // TODO(matt) is my_limit ever `None` here?
                     assert!(self.repair_min_id.is_some());
                     if io.work.send_io_live_repair(my_limit) {
                         // Leave this IO as New, the downstairs will receive it.

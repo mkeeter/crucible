@@ -2955,8 +2955,6 @@ pub mod repair_test {
         //   4 | W W W | W W W | W W W | 3
         //   5 | R R R | R R R | R R R | 4
         //   6 | WuWuWu| WuWuWu| WuWuWu| 5
-        //
-        // TODO: this has superfluous dependencies
         let up = create_test_upstairs(1).await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 

@@ -585,15 +585,10 @@ impl DependencySet {
 
     fn insert_blocking(&mut self, job: u64) {
         if let Some(prev) = self.blocking {
-            // Skip backfilling older jobs
-            if job < prev {
-                return;
-            }
+            assert!(job > prev);
         }
         if let Some(prev) = self.nonblocking.last() {
-            if job < *prev {
-                return;
-            }
+            assert!(job > *prev);
         }
         self.blocking = Some(job);
         self.nonblocking.clear();
@@ -610,10 +605,8 @@ impl DependencySet {
     }
 
     fn remove(&mut self, job: u64) {
-        if let Some(v) = self.blocking {
-            if v == job {
-                self.blocking = None;
-            }
+        if self.blocking == Some(job) {
+            self.blocking = None;
         }
         self.nonblocking.retain(|&v| v != job);
     }
