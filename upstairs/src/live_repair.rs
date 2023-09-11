@@ -1024,7 +1024,7 @@ impl Upstairs {
         let gw_reopen_id: u64 = gw.next_gw_id();
 
         // The work IDs for the downstairs side of things.
-        let (extent_repair_ids, mut deps) = ds.get_repair_ids(eid);
+        let (extent_repair_ids, close_deps) = ds.get_repair_ids(eid);
         let close_id = extent_repair_ids.close_id;
         let repair_id = extent_repair_ids.repair_id;
         let noop_id = extent_repair_ids.noop_id;
@@ -1045,27 +1045,17 @@ impl Upstairs {
             repair_id,
             noop_id,
             reopen_id,
-            deps,
+            close_deps,
         );
 
         // The initial close IO has the base set of dependencies.
         // Each additional job will depend on the previous.
-        let close_deps = deps.clone();
-
-        deps.push(close_id);
-        let repair_deps = deps.clone();
-
-        deps.push(repair_id);
-        let noop_deps = deps.clone();
-
-        deps.push(noop_id);
-        let reopen_deps = deps.clone();
 
         let reopen_brw = create_and_enqueue_reopen_io(
             &mut ds,
             &mut gw,
             eid,
-            reopen_deps,
+            vec![noop_id],
             reopen_id,
             gw_reopen_id,
         )
@@ -1146,7 +1136,7 @@ impl Upstairs {
             create_and_enqueue_noop_io(
                 &mut ds,
                 &mut gw,
-                repair_deps,
+                vec![close_id],
                 repair_id,
                 gw_repair_id,
             )
@@ -1156,7 +1146,7 @@ impl Upstairs {
                 &mut ds,
                 &mut gw,
                 eid,
-                repair_deps,
+                vec![close_id],
                 repair_id,
                 gw_repair_id,
                 source,
@@ -1209,7 +1199,11 @@ impl Upstairs {
 
         // This is the same if we are in error or not.
         let noop_brw = create_and_enqueue_noop_io(
-            &mut ds, &mut gw, noop_deps, noop_id, gw_noop_id,
+            &mut ds,
+            &mut gw,
+            vec![repair_id],
+            noop_id,
+            gw_noop_id,
         )
         .await;
 
