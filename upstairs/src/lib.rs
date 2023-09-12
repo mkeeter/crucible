@@ -5821,7 +5821,7 @@ impl Upstairs {
         req: Option<BlockReq>,
         is_write_unwritten: bool,
         ds_done_tx: mpsc::Sender<()>,
-    ) -> Result<(), ()> {
+    ) -> Result<(u64, Option<Duration>), ()> {
         if !self.guest_io_ready().await {
             if let Some(req) = req {
                 req.send_err(CrucibleError::UpstairsInactive).await;
@@ -5977,7 +5977,7 @@ impl Upstairs {
         }
         downstairs.enqueue(wr, ds_done_tx).await;
 
-        Ok(())
+        Ok((next_id, None))
     }
 
     /*
@@ -9641,14 +9641,33 @@ async fn process_new_io(
             *lastcast += 1;
         }
         BlockOp::Write { offset, data } => {
-            if up
-                .submit_write(offset, data, Some(req), false, ds_done_tx)
+            let Ok((ds_id, ack_delay)) = up
+                .submit_write(
+                    offset,
+                    data,
+                    Some(req),
+                    false,
+                    ds_done_tx.clone(),
+                )
                 .await
-                .is_err()
-            {
-                return;
-            }
+                else { return; };
             send_work(dst, *lastcast, &up.log).await;
+
+            if let Some(ack_delay) = ack_delay {
+                let up = up.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(ack_delay).await;
+                    let mut ds = up.downstairs.lock().await;
+                    let Some(mut h) = ds.ds_active.get_mut(&ds_id)
+                        else { return; };
+                    let job = h.job();
+                    if job.ack_status != AckStatus::AckReady {
+                        job.ack_status = AckStatus::AckReady;
+                        ds_done_tx.send(ds_id).await.unwrap();
+                    }
+                });
+            }
+
             *lastcast += 1;
         }
         BlockOp::WriteUnwritten { offset, data } => {
