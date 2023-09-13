@@ -4,7 +4,7 @@
 #![allow(clippy::mutex_atomic)]
 
 use std::clone::Clone;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
@@ -653,34 +653,19 @@ where
      * This XXX is for coming back here and making a better job of
      * flow control.
      */
-    let mut new_work = u.downstairs.lock().await.new_work(client_id);
-
-    /*
-     * Now we have a list of all the job IDs that are new for our client id.
-     * Walk this list and process each job, marking it InProgress as we
-     * do the work. We do this in two loops because we can't hold the
-     * lock for the hashmap while we do work, and if we release the lock
-     * to do work, we would have to start over and look at all jobs in the
-     * map to see if they are new.
-     *
-     * This also allows us to sort the job ids and do them in order they
-     * were put into the hashmap, though I don't think that is required.
-     */
-    new_work.sort_unstable();
+    let new_work = u.downstairs.lock().await.new_work(client_id);
 
     let mut active_count = u.downstairs.lock().await.submitted_work(client_id);
-    for ndx in 0..new_work.len() {
+    for &new_id in &new_work {
         if active_count >= MAX_ACTIVE_COUNT {
             // Flow control enacted, stop sending work -- and requeue all of
             // our remaining work to assure it isn't dropped
             let mut ds = u.downstairs.lock().await;
-            ds.requeue_work(client_id, &new_work[ndx..]);
+            ds.requeue_work_bulk(client_id, new_work);
             ds.flow_control[client_id as usize] += 1;
             drop(ds);
             return Ok(true);
         }
-
-        let new_id = new_work[ndx];
 
         /*
          * Walk the list of work to do, update its status as in progress
@@ -690,7 +675,7 @@ where
             /*
              * Requeue this work so it isn't completely lost.
              */
-            u.downstairs.lock().await.requeue_work(client_id, &[new_id]);
+            u.downstairs.lock().await.requeue_work(client_id, new_id);
             continue;
         }
 
@@ -2782,7 +2767,7 @@ struct Downstairs {
     /**
      * Cache of new jobs, indexed by client ID.
      */
-    ds_new: Vec<Vec<u64>>,
+    ds_new: Vec<BTreeSet<u64>>,
 
     /**
      * Jobs that have been skipped, indexed by client ID.
@@ -2940,7 +2925,7 @@ impl Downstairs {
             ds_last_flush: vec![0; 3],
             downstairs_errors: HashMap::new(),
             ds_active: ActiveJobs::new(),
-            ds_new: vec![Vec::new(); 3],
+            ds_new: vec![BTreeSet::new(); 3],
             ds_skipped_jobs: [HashSet::new(), HashSet::new(), HashSet::new()],
             completed: AllocRingBuffer::new(2048),
             completed_jobs: AllocRingBuffer::new(8),
@@ -3402,7 +3387,7 @@ impl Downstairs {
             if old_state != IOState::New {
                 self.io_state_count.decr(&old_state, client_id);
                 self.io_state_count.incr(&IOState::New, client_id);
-                self.ds_new[client_id as usize].push(*ds_id);
+                self.ds_new[client_id as usize].insert(*ds_id);
             }
         });
     }
@@ -3488,7 +3473,7 @@ impl Downstairs {
      * Return a list of downstairs request IDs that represent unissued
      * requests for this client.
      */
-    fn new_work(&mut self, client_id: u8) -> Vec<u64> {
+    fn new_work(&mut self, client_id: u8) -> BTreeSet<u64> {
         std::mem::take(&mut self.ds_new[client_id as usize])
     }
 
@@ -3496,8 +3481,16 @@ impl Downstairs {
      * Called to requeue work that was previously found by calling
      * [`new_work`], presumably due to flow control.
      */
-    fn requeue_work(&mut self, client_id: u8, work: &[u64]) {
-        self.ds_new[client_id as usize].extend_from_slice(work);
+    fn requeue_work_bulk(&mut self, client_id: u8, work: BTreeSet<u64>) {
+        if self.ds_new[client_id as usize].is_empty() {
+            self.ds_new[client_id as usize] = work;
+        } else {
+            self.ds_new[client_id as usize].extend(work.into_iter());
+        }
+    }
+
+    fn requeue_work(&mut self, client_id: u8, work: u64) {
+        self.ds_new[client_id as usize].insert(work);
     }
 
     /**
@@ -3572,7 +3565,7 @@ impl Downstairs {
                     if io.work.send_io_live_repair(my_limit) {
                         // Leave this IO as New, the downstairs will receive it.
                         self.io_state_count.incr(&IOState::New, cid);
-                        self.ds_new[cid as usize].push(io.ds_id);
+                        self.ds_new[cid as usize].insert(io.ds_id);
                     } else {
                         // Move this IO to skipped, we are not ready for
                         // the downstairs to receive it.
@@ -3584,7 +3577,7 @@ impl Downstairs {
                 }
                 _ => {
                     self.io_state_count.incr(&IOState::New, cid);
-                    self.ds_new[cid as usize].push(io.ds_id);
+                    self.ds_new[cid as usize].insert(io.ds_id);
                 }
             }
         }
@@ -3639,7 +3632,7 @@ impl Downstairs {
                 }
                 _ => {
                     self.io_state_count.incr(&IOState::New, cid);
-                    self.ds_new[cid as usize].push(io.ds_id);
+                    self.ds_new[cid as usize].insert(io.ds_id);
                 }
             }
         }
