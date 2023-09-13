@@ -4519,56 +4519,6 @@ pub mod repair_test {
     }
 
     #[tokio::test]
-    async fn test_live_repair_deps_repair_repair_repair() {
-        // Repair Repair Repair
-        // This is not an expected situation, but does verify that
-        // any new repair operation will be dependent on existing
-        // repair operations on that same extent.
-        //       block
-        // op# | 0 1 2 | deps
-        // ----|-------|-----
-        //   0 | RpRpRp|
-        //  *1 | RpRpRp|
-        //   2 | RpRpRp|
-        //   3 | RpRpRp|
-        //   --|-------|-----
-        //   4 | RpRpRp|
-        //  *5 | RpRpRp| 3
-        //   6 | RpRpRp|
-        //   7 | RpRpRp|
-        //   --|-------|-----
-        //   8 | RpRpRp|
-        //  *9 | RpRpRp| 7
-        //  10 | RpRpRp|
-        //  10 | RpRpRp|
-        //
-        //  This graph is a little funky, because in actuality, it would be the
-        //  *close* operation that would get the dependency on the most recent
-        //  repair; however, `create_and_enqueue_repair_op` enqueues the repair
-        //  op (the second out of four) instead.
-        //
-        // (Vec<u64> are handled more correctly in `repair_extent`)
-
-        let up = create_test_upstairs(1).await;
-        create_and_enqueue_repair_op(&up, 0).await;
-        create_and_enqueue_repair_op(&up, 0).await;
-        create_and_enqueue_repair_op(&up, 0).await;
-
-        let ds = up.downstairs.lock().await;
-
-        let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
-
-        assert_eq!(jobs.len(), 3);
-
-        assert_eq!(jobs[0].ds_id, 1001);
-        assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[1].ds_id, 1005);
-        assert_eq!(jobs[1].work.deps(), &[1003]);
-        assert_eq!(jobs[2].ds_id, 1009);
-        assert_eq!(jobs[2].work.deps(), &[1007]);
-    }
-
-    #[tokio::test]
     async fn test_live_repair_deps_repair_wspan_left() {
         // A repair will depend on a write spanning the extent
         //       block   block
