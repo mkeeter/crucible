@@ -653,15 +653,16 @@ where
      * This XXX is for coming back here and making a better job of
      * flow control.
      */
-    let new_work = u.downstairs.lock().await.new_work(client_id);
+    let mut new_work = u.downstairs.lock().await.new_work(client_id);
 
     let mut active_count = u.downstairs.lock().await.submitted_work(client_id);
-    for &new_id in &new_work {
+    while let Some(new_id) = new_work.pop_first() {
         if active_count >= MAX_ACTIVE_COUNT {
             // Flow control enacted, stop sending work -- and requeue all of
             // our remaining work to assure it isn't dropped
             let mut ds = u.downstairs.lock().await;
             ds.requeue_work_bulk(client_id, new_work);
+            ds.requeue_work(client_id, new_id);
             ds.flow_control[client_id as usize] += 1;
             drop(ds);
             return Ok(true);
