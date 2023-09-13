@@ -4733,20 +4733,16 @@ impl Downstairs {
         }
     }
 
-    // Reserve some job IDs for future repair work.
-    // Return the job IDs we reserved.  If the extent already has
-    // job IDs reserved, then use those instead.
-    fn reserve_repair_ids(&mut self, eid: u64) -> ExtentRepairIDs {
-        if let Some((eri, _deps)) = self.repair_job_ids.get_mut(&eid) {
-            debug!(self.log, "reserve returns existing job ids for {}", eid);
-            let repair_ids = ExtentRepairIDs {
-                close_id: eri.close_id,
-                repair_id: eri.repair_id,
-                noop_id: eri.noop_id,
-                reopen_id: eri.reopen_id,
-            };
-
-            return repair_ids;
+    /// Reserve some job IDs for future repair work on the given extent
+    ///
+    /// This is a no-op if repair IDs were already reserved for this extent
+    fn reserve_repair_ids_for_extent(&mut self, eid: u64) {
+        if self.repair_job_ids.contains_key(&eid) {
+            debug!(
+                self.log,
+                "reserve already has existing job ids for {}", eid
+            );
+            return;
         }
 
         debug!(
@@ -4769,8 +4765,6 @@ impl Downstairs {
             "inserting repair IDs {repair_ids:?}; got dep {deps:?}"
         );
         self.repair_job_ids.insert(eid, (repair_ids, deps));
-
-        repair_ids
     }
 
     /// Get the repair IDs and dependencies for this extent.
@@ -4832,7 +4826,8 @@ impl Downstairs {
         })
     }
 
-    fn reserve_repair_jobs_for(&mut self, impacted_blocks: ImpactedBlocks) {
+    /// Reserves repair IDs if impacted blocks overlap our extent under repair
+    fn check_repair_ids_for_range(&mut self, impacted_blocks: ImpactedBlocks) {
         let Some(eur) = self.get_extent_under_repair() else { return; };
         let mut future_repair = false;
         for eid in impacted_blocks.extents().into_iter().flatten() {
@@ -4840,7 +4835,7 @@ impl Downstairs {
                 future_repair = true;
             } else if eid > *eur.start() && (eid <= *eur.end() || future_repair)
             {
-                self.reserve_repair_ids(eid);
+                self.reserve_repair_ids_for_extent(eid);
                 future_repair = true;
             }
         }
@@ -5881,7 +5876,7 @@ impl Upstairs {
         // The impacted blocks may span our extent under repair.  If that's the
         // case, then reserve repair jobs now (but do not enqueue them); this
         // makes our dependencies correct.
-        downstairs.reserve_repair_jobs_for(impacted_blocks);
+        downstairs.check_repair_ids_for_range(impacted_blocks);
 
         // After reserving any LiveRepair IDs, go get one for this job.
         // This is required to avoid circular dependencies.
@@ -6038,7 +6033,7 @@ impl Upstairs {
         let gw_id: u64 = gw.next_gw_id();
         cdt::gw__read__start!(|| (gw_id));
 
-        downstairs.reserve_repair_jobs_for(impacted_blocks);
+        downstairs.check_repair_ids_for_range(impacted_blocks);
 
         /*
          * Create the tracking info for downstairs request numbers (ds_id) we

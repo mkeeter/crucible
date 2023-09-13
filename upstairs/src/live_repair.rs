@@ -2621,7 +2621,8 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         assert!(!ds.query_repair_ids(0));
 
-        let reserved_ids = ds.reserve_repair_ids(0);
+        ds.reserve_repair_ids_for_extent(0);
+        let (reserved_ids, _deps) = ds.repair_job_ids.get(&0).unwrap();
         assert_eq!(reserved_ids.close_id, 1000);
         assert_eq!(reserved_ids.repair_id, 1001);
         assert_eq!(reserved_ids.noop_id, 1002);
@@ -2636,7 +2637,8 @@ pub mod repair_test {
         assert!(!ds.query_repair_ids(1));
 
         // Reserve the IDs again, make sure they are still the same.
-        let reserved_ids = ds.reserve_repair_ids(0);
+        ds.reserve_repair_ids_for_extent(0);
+        let (reserved_ids, _deps) = ds.repair_job_ids.get(&0).unwrap();
         assert_eq!(reserved_ids.close_id, 1000);
         assert_eq!(reserved_ids.repair_id, 1001);
         assert_eq!(reserved_ids.noop_id, 1002);
@@ -5378,7 +5380,9 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
 
         // Reserve some repair IDs
-        let reserved_ids = ds.reserve_repair_ids(eid);
+        ds.reserve_repair_ids_for_extent(eid);
+        let (reserved_ids, _deps) =
+            ds.repair_job_ids.get(&eid).unwrap().clone();
 
         up.abort_repair_ds(&mut ds, UpState::Active, &ds_done_tx)
             .await;
@@ -5427,7 +5431,7 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
 
         // Reserve some repair IDs
-        let _reserved_ids = ds.reserve_repair_ids(eid);
+        ds.reserve_repair_ids_for_extent(eid);
 
         up.abort_repair_ds(&mut ds, UpState::Active, &ds_done_tx)
             .await;
