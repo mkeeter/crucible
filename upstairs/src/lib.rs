@@ -9764,7 +9764,7 @@ async fn process_new_io(
                     let Some(mut h) = ds.ds_active.get_mut(&ds_id)
                         else { return; };
                     let job = h.job();
-                    if job.ack_status != AckStatus::AckReady {
+                    if job.ack_status == AckStatus::NotAcked {
                         job.ack_status = AckStatus::AckReady;
                         ds_done_tx.send(ds_id).await.unwrap();
                     }
