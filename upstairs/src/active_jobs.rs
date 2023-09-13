@@ -17,6 +17,13 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `DownstairsIOHandle` instead of a raw `&mut DownstairsIO`.  All of this
 /// means that we can keep extra metadata in sync, e.g. a list of all ackable
 /// jobs.
+///
+/// The `ActiveJobs` structure also includes a data structure ([`BlockMap`])
+/// which accelerates dependency tracking: it tracks the most recent blocking
+/// (write / flush / etc) and non-blocking (read) jobs on a per-block basis,
+/// allowing for efficient lookups.  Dependencies are added with the
+/// `deps_for_read/write/flush` functions, which both insert a new job into the
+/// map and return the previous jobs that the new job must depend on.
 #[derive(Debug, Default)]
 pub(crate) struct ActiveJobs {
     jobs: BTreeMap<u64, DownstairsIO>,
