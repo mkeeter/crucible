@@ -84,8 +84,15 @@ impl ActiveJobs {
             | IOop::ExtentLiveReopen { .. } => {
                 assert!(self.block_to_active.job_to_range.contains_key(&job_id))
             }
-            // An ExtentLiveNoOp may be recorded or not, because in some cases,
-            // we can transform an ExtentLiveReopen into an ExtentLiveNoOp
+            // An ExtentLiveNoOp may be recorded or not, because it can appear
+            // in multiple positions in the four-operation repair sequence:
+            // - Normally, it appears in the third position (out of four). In
+            //   that case, it is *not* recorded in our dependency map, because
+            //   it's masked by the fourth operation (an `ExtentLiveReopen`).
+            // - However, if a reserved repair job is aborted, then we replace
+            //   *all four* operations with `ExtentLiveNoOp`.  In that case, we
+            //   see an `ExtentLiveNoOp` in the fourth position (where we
+            //   normally see `ExtentLiveReopen`) and it *is* recorded
             IOop::ExtentLiveNoOp { .. } => (),
             _ => {
                 // Other live repair jobs aren't recorded, because they're
