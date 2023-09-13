@@ -3558,7 +3558,9 @@ impl Downstairs {
                 }
                 DsState::LiveRepair => {
                     // Pick the latest repair limit that's relevant for this
-                    // extent.
+                    // downstairs.  This is either the extent under repair (if
+                    // there are no reserved repair jobs), or the last extent
+                    // for which we have reserved a repair job ID.
                     let my_limit =
                         self.extent_limit[cid as usize].map(|first| {
                             self.repair_job_ids
