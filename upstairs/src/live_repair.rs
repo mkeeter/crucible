@@ -829,8 +829,8 @@ impl Upstairs {
             }
             warn!(self.log, "Extent {} Create and send noop jobs", eid);
 
-            // Get the work IDs for the downstairs jobs we need to create.
-            // We get the first one, then send three more based on it
+            // Get the work IDs and dependencies for the downstairs jobs we need
+            // to create. We get the first one, then send three more based on it
             // as a starting value
             let (extent_repair_ids, deps) = ds.get_repair_ids(eid);
             let ds_id = extent_repair_ids.close_id;
@@ -1030,9 +1030,9 @@ impl Upstairs {
         let noop_id = extent_repair_ids.noop_id;
         let reopen_id = extent_repair_ids.reopen_id;
 
-        //  Note that `deps` (the list of dependencies) will potentially include
-        //  skipped jobs for some downstairs.  The list of dependencies can be
-        //  further altered when we are about to send IO to an individual
+        //  Note that `close_deps` (the list of dependencies) will potentially
+        //  include skipped jobs for some downstairs.  The list of dependencies
+        //  can be further altered when we are about to send IO to an individual
         //  downstairs that is under repair. At that time, we go through the
         //  list of dependencies and remove jobs that we skipped or finished for
         //  that specific downstairs before we send the repair IO over the wire.

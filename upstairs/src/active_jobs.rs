@@ -135,6 +135,9 @@ impl ActiveJobs {
         dep
     }
 
+    /// Inserts a write operation into the dependency tracker
+    ///
+    /// Returns the dependencies which must block the write operation
     pub fn deps_for_write(
         &mut self,
         write_id: u64,
@@ -146,6 +149,9 @@ impl ActiveJobs {
         dep
     }
 
+    /// Inserts a read operation into the dependency tracker
+    ///
+    /// Returns the dependencies which must block the read operation
     pub fn deps_for_read(
         &mut self,
         read_id: u64,
@@ -157,11 +163,13 @@ impl ActiveJobs {
         dep
     }
 
-    /// Inserts a set of repair IDs into the dependency tracker.
+    /// Inserts a set of repair IDs into the dependency tracker
     ///
-    /// Note that jobs are only added to the dependency tracker; they are not
-    /// added to the list of active jobs (because this may be a future
-    /// reservation, without an allocated `DownstairsIO`).
+    /// In practice, only the final repair ID (`reopen_id`) is recorded, because
+    /// the dependency chain within the repair is handled separately.
+    ///
+    /// Returns the set of previous dependencies that must complete before the
+    /// initial repair ID (`close_id`).
     pub fn deps_for_repair(
         &mut self,
         repair_ids: ExtentRepairIDs,

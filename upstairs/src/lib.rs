@@ -4771,9 +4771,10 @@ impl Downstairs {
         repair_ids
     }
 
-    // Get the repair IDs for this extent.
-    // If they were already reserved, then us those values, otherwise,
-    // go get the next set of job IDs.
+    /// Get the repair IDs and dependencies for this extent.
+    ///
+    /// If they were already reserved, then use those values (removing them from
+    /// the list of reserved IDs), otherwise, go get the next set of job IDs.
     fn get_repair_ids(&mut self, eid: u64) -> (ExtentRepairIDs, Vec<u64>) {
         if let Some((eri, deps)) = self.repair_job_ids.remove(&eid) {
             debug!(self.log, "Return existing job ids for {} GG", eid);
@@ -5875,13 +5876,9 @@ impl Upstairs {
             cdt::gw__write__start!(|| (gw_id));
         }
 
-        /*
-         * Now create a downstairs work job for each (eid, bi, len) returned
-         * from extent_from_offset
-         *
-         * Create the list of downstairs request numbers (ds_id) we created
-         * on behalf of this guest job.
-         */
+        // The impacted blocks may span our extent under repair.  If that's the
+        // case, then reserve repair jobs now (but do not enqueue them); this
+        // makes our dependencies correct.
         downstairs.reserve_repair_jobs_for(impacted_blocks);
 
         // After reserving any LiveRepair IDs, go get one for this job.
