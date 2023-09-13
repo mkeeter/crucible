@@ -516,8 +516,10 @@ impl BlockMap {
         if let Some(r) = self.job_to_range.remove(&job) {
             self.insert_splits(r.clone());
 
-            // Iterate over the range covered by our new job, either modifying
-            // existing ranges or inserting new ranges as needed.
+            // Iterate over the range covered by our to-be-removed job, removing
+            // it from any existing ranges.  The job's original range may have
+            // been split or masked by later jobs, so we can't assume that it
+            // exists as a single range in the map!
             let mut pos = r.start;
             while pos != r.end {
                 let mut next_start = self
