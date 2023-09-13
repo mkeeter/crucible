@@ -332,6 +332,7 @@ mod cdt {
     fn ds__read__io__done(_: u64, _: u64) {}
     fn ds__write__io__done(_: u64, _: u64) {}
     fn ds__write__unwritten__io__done(_: u64, _: u64) {}
+    fn ds__write__backpressure(_: u64) {}
     fn ds__flush__io__done(_: u64, _: u64) {}
     fn ds__close__done(_: u64, _: u64) {}
     fn ds__repair__done(_: u64, _: u64) {}
@@ -3538,14 +3539,17 @@ impl Downstairs {
         self.ds_active.ackable_work()
     }
 
-    /**
-     * Enqueue a new downstairs request.
-     */
+    /// Enqueue a new downstairs request.
+    ///
+    /// If this is a write that is subject to backpressure, returns a sleep
+    /// duration before the write should be acked.  Otherwise, writes are acked
+    /// right away, because they don't need to be persistent (that's handled by
+    /// flushes, which must wait for completion).
     async fn enqueue(
         &mut self,
         mut io: DownstairsIO,
         ds_done_tx: mpsc::Sender<()>,
-    ) {
+    ) -> Option<Duration> {
         let mut skipped = 0;
         let is_write = matches!(io.work, IOop::Write { .. });
         for cid in 0..3 {
@@ -3621,13 +3625,21 @@ impl Downstairs {
 
             ds_done_tx.send(()).await.unwrap();
         } else if is_write {
-            let mut handle = self.ds_active.get_mut(&ds_id).unwrap();
-            let job = handle.job();
-            assert_eq!(job.ack_status, AckStatus::NotAcked);
-            job.ack_status = AckStatus::AckReady;
-
-            ds_done_tx.send(()).await.unwrap();
+            // Exert backpressure on writes if the downstairs active queue length is
+            // getting too long.
+            if let Some(n) = self.ds_active.len().checked_sub(3000) {
+                let d = (n * n) as u64;
+                cdt::ds__write__backpressure!(|| (d));
+                return Some(Duration::from_micros(d));
+            } else {
+                let mut handle = self.ds_active.get_mut(&ds_id).unwrap();
+                let job = handle.job();
+                assert_eq!(job.ack_status, AckStatus::NotAcked);
+                job.ack_status = AckStatus::AckReady;
+                ds_done_tx.send(()).await.unwrap();
+            }
         }
+        None
     }
 
     /**
@@ -5798,7 +5810,8 @@ impl Upstairs {
         gw.active.insert(gw_id, new_gtos);
 
         cdt::up__to__ds__flush__start!(|| (gw_id));
-        downstairs.enqueue(fl, ds_done_tx).await;
+        let r = downstairs.enqueue(fl, ds_done_tx).await;
+        assert!(r.is_none(), "backpressure isn't allowed for flushes");
 
         Ok(())
     }
@@ -5975,9 +5988,8 @@ impl Upstairs {
         } else {
             cdt::up__to__ds__write__start!(|| (gw_id));
         }
-        downstairs.enqueue(wr, ds_done_tx).await;
-
-        Ok((next_id, None))
+        let bp = downstairs.enqueue(wr, ds_done_tx.clone()).await;
+        Ok((next_id, bp))
     }
 
     /*
@@ -6088,7 +6100,8 @@ impl Upstairs {
         }
 
         cdt::up__to__ds__read__start!(|| (gw_id));
-        downstairs.enqueue(wr, ds_done_tx).await;
+        let r = downstairs.enqueue(wr, ds_done_tx).await;
+        assert!(r.is_none(), "backpressure not allowed for reads");
 
         Ok(())
     }
