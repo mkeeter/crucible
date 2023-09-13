@@ -749,6 +749,10 @@ mod test {
         }
     }
 
+    // Pick an extent size that plays nice with `block_strat`
+    //
+    // This should be small enough that `block_strat` generates `ImpactedBlocks`
+    // that span multiple extents, but is otherwise arbitrary
     const BLOCKS_PER_EXTENT: u64 = 8;
 
     fn block_strat() -> impl Strategy<Value = ImpactedBlocks> {
