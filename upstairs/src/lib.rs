@@ -2942,6 +2942,22 @@ struct Downstairs {
      * Count of times a downstairs has had flow control turned on
      */
     flow_control: Vec<usize>,
+
+    /// Normally, write operations return right away.
+    ///
+    /// This is called "fast ack" in some documentation
+    ///
+    /// However, this can lead to many writes being piled up; a single flush
+    /// would then delay for an inordinate amount of time.
+    ///
+    /// We deliberately slow down fast acks if the new work queue is getting too
+    /// long.  This variable contains a map from when a fast-ack should happen
+    /// to the job ID that should be acked.
+    ///
+    /// Note that the downstairs may beat us to it!  In that case, the job may
+    /// be already acked (or even removed), and we should handle that
+    /// gracefully.
+    delayed_acks: BTreeMap<Instant, JobId>,
 }
 
 impl Downstairs {
@@ -2977,6 +2993,7 @@ impl Downstairs {
             connected: vec![0; 3],
             replaced: vec![0; 3],
             flow_control: vec![0; 3],
+            delayed_acks: BTreeMap::new(),
         }
     }
 
@@ -3640,6 +3657,28 @@ impl Downstairs {
             }
         }
         None
+    }
+
+    async fn handle_backpressure_acks(
+        &mut self,
+        ds_done_tx: mpsc::Sender<()>,
+    ) -> Option<Instant> {
+        let now = Instant::now();
+        while let Some((time, job)) = self.delayed_acks.pop_first() {
+            if time < now {
+                let Some(mut h) = self.ds_active.get_mut(&job)
+                        else { continue; };
+                let job = h.job();
+                if job.ack_status == AckStatus::NotAcked {
+                    job.ack_status = AckStatus::AckReady;
+                    ds_done_tx.send(()).await.unwrap();
+                }
+            } else {
+                self.delayed_acks.insert(time, job);
+                break;
+            }
+        }
+        self.delayed_acks.first_key_value().map(|(k, _)| *k)
     }
 
     /**
@@ -5834,7 +5873,7 @@ impl Upstairs {
         req: Option<BlockReq>,
         is_write_unwritten: bool,
         ds_done_tx: mpsc::Sender<()>,
-    ) -> Result<(JobId, Option<Duration>), ()> {
+    ) -> Result<Option<Instant>, ()> {
         if !self.guest_io_ready().await {
             if let Some(req) = req {
                 req.send_err(CrucibleError::UpstairsInactive).await;
@@ -5989,7 +6028,12 @@ impl Upstairs {
             cdt::up__to__ds__write__start!(|| (gw_id));
         }
         let bp = downstairs.enqueue(wr, ds_done_tx.clone()).await;
-        Ok((next_id, bp))
+        let ack_time = bp.map(|bp| {
+            let ack_time = Instant::now().checked_add(bp).unwrap();
+            downstairs.delayed_acks.insert(ack_time, next_id);
+            ack_time
+        });
+        Ok(ack_time)
     }
 
     /*
@@ -9578,7 +9622,7 @@ async fn process_new_io(
     dst: &[Target],
     req: BlockReq,
     lastcast: &mut u64,
-) {
+) -> Option<Instant> {
     /*
      * If any of the submit_* functions fail to send to the downstairs, they
      * return an error.  These are reported to the Guest.
@@ -9595,7 +9639,7 @@ async fn process_new_io(
              * let the deactivate finish.
              */
             if let Err(_e) = up.set_active_request(req).await {
-                return;
+                return None;
             }
             // Put the req waiter into the upstairs so we have a hook on
             // who to notify when the answer comes back.
@@ -9609,7 +9653,7 @@ async fn process_new_io(
              * let the deactivate finish.
              */
             if let Err(_e) = up.set_active_request(req).await {
-                return;
+                return None;
             }
             up.set_generation(gen).await;
             send_active(dst, gen);
@@ -9636,7 +9680,7 @@ async fn process_new_io(
              * they (may) have a flush to do.
              */
             if up.set_deactivate(Some(req), ds_done_tx).await.is_err() {
-                return;
+                return None;
             }
 
             send_work(dst, *lastcast, &up.log).await;
@@ -9648,13 +9692,13 @@ async fn process_new_io(
                 .await
                 .is_err()
             {
-                return;
+                return None;
             }
             send_work(dst, *lastcast, &up.log).await;
             *lastcast += 1;
         }
         BlockOp::Write { offset, data } => {
-            let Ok((ds_id, ack_delay)) = up
+            let Ok(ack_delay) = up
                 .submit_write(
                     offset,
                     data,
@@ -9663,25 +9707,11 @@ async fn process_new_io(
                     ds_done_tx.clone(),
                 )
                 .await
-                else { return; };
+                else { return None; };
             send_work(dst, *lastcast, &up.log).await;
 
-            if let Some(ack_delay) = ack_delay {
-                let up = up.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(ack_delay).await;
-                    let mut ds = up.downstairs.lock().await;
-                    let Some(mut h) = ds.ds_active.get_mut(&ds_id)
-                        else { return; };
-                    let job = h.job();
-                    if job.ack_status == AckStatus::NotAcked {
-                        job.ack_status = AckStatus::AckReady;
-                        ds_done_tx.send(()).await.unwrap();
-                    }
-                });
-            }
-
             *lastcast += 1;
+            return ack_delay;
         }
         BlockOp::WriteUnwritten { offset, data } => {
             if up
@@ -9689,7 +9719,7 @@ async fn process_new_io(
                 .await
                 .is_err()
             {
-                return;
+                return None;
             }
             send_work(dst, *lastcast, &up.log).await;
             *lastcast += 1;
@@ -9704,7 +9734,7 @@ async fn process_new_io(
              */
             if !up.guest_io_ready().await {
                 req.send_err(CrucibleError::UpstairsInactive).await;
-                return;
+                return None;
             }
 
             if up
@@ -9712,7 +9742,7 @@ async fn process_new_io(
                 .await
                 .is_err()
             {
-                return;
+                return None;
             }
 
             send_work(dst, *lastcast, &up.log).await;
@@ -9726,16 +9756,18 @@ async fn process_new_io(
             old,
             new,
             result,
-        } => match up.replace_downstairs(id, old, new, &ds_done_tx).await {
-            Ok(v) => {
-                *result.lock().await = v;
-                req.send_ok().await;
-            }
+        } => {
+            match up.replace_downstairs(id, old, new, &ds_done_tx).await {
+                Ok(v) => {
+                    *result.lock().await = v;
+                    req.send_ok().await;
+                }
 
-            Err(e) => {
-                req.send_err(e).await;
-            }
-        },
+                Err(e) => {
+                    req.send_err(e).await;
+                }
+            };
+        }
         // Query ops
         BlockOp::QueryBlockSize { data } => {
             let size = match up.ddef.lock().await.get_def() {
@@ -9750,7 +9782,7 @@ async fn process_new_io(
                         "block size".to_string(),
                     ))
                     .await;
-                    return;
+                    return None;
                 }
             };
             *data.lock().await = size;
@@ -9769,7 +9801,7 @@ async fn process_new_io(
                         "total size".to_string(),
                     ))
                     .await;
-                    return;
+                    return None;
                 }
             };
             *data.lock().await = size;
@@ -9790,7 +9822,7 @@ async fn process_new_io(
                         "extent size".to_string(),
                     ))
                     .await;
-                    return;
+                    return None;
                 }
             };
             *data.lock().await = size;
@@ -9820,12 +9852,13 @@ async fn process_new_io(
         BlockOp::Commit => {
             if !up.guest_io_ready().await {
                 req.send_err(CrucibleError::UpstairsInactive).await;
-                return;
+                return None;
             }
             send_work(dst, *lastcast, &up.log).await;
             *lastcast += 1;
         }
     }
+    None
 }
 
 /**
@@ -9932,6 +9965,7 @@ async fn up_listen(
     let mut stat_update_interval = deadline_secs(1.0);
     let mut repair_check_interval = deadline_secs(60.0);
     let mut repair_check = false;
+    let mut ack_deadline = None;
     loop {
         /*
          * Wait for all three downstairs to connect (for each region set).
@@ -9987,11 +10021,22 @@ async fn up_listen(
                 }
             }
             req = up.guest.recv() => {
-                process_new_io(up, &dst, req, &mut lastcast).await;
+                if let Some(d) = process_new_io(up, &dst, req, &mut lastcast).await {
+                    if ack_deadline.map(|prev| d > prev).unwrap_or(true) {
+                        ack_deadline = Some(d);
+                    }
+                }
 
                 // Check to see if the number of outstanding IOs (between
                 // the upstairs and downstairs) is too many.
                 gone_too_long(up, dst[0].ds_done_tx.clone()).await;
+            }
+            Some(_) = conditional_sleeper(ack_deadline) => {
+                ack_deadline = up.downstairs
+                    .lock()
+                    .await
+                    .handle_backpressure_acks(dst[0].ds_done_tx.clone())
+                    .await;
             }
             _ = sleep_until(repair_check_interval), if repair_check => {
                 match check_for_repair(up, &dst).await {
@@ -10051,6 +10096,16 @@ async fn up_listen(
                 stat_update_interval = deadline_secs(1.0);
             }
         }
+    }
+}
+
+async fn conditional_sleeper(t: Option<Instant>) -> Option<()> {
+    match t {
+        Some(d) => {
+            tokio::time::sleep_until(d).await;
+            Some(())
+        }
+        None => None,
     }
 }
 
