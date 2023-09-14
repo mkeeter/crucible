@@ -3644,7 +3644,10 @@ impl Downstairs {
         } else if is_write {
             // Exert backpressure on writes if the downstairs active queue length is
             // getting too long.
-            if let Some(n) = self.ds_active.len().checked_sub(3000) {
+            //
+            let active = *self.io_state_count.new.iter().max().unwrap()
+                + *self.io_state_count.in_progress.iter().max().unwrap();
+            if let Some(n) = active.checked_sub(3000) {
                 let d = (n * n) as u64;
                 cdt::ds__write__backpressure!(|| (d));
                 return Some(Duration::from_micros(d));
