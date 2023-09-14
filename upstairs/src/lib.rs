@@ -5834,7 +5834,7 @@ impl Upstairs {
         req: Option<BlockReq>,
         is_write_unwritten: bool,
         ds_done_tx: mpsc::Sender<()>,
-    ) -> Result<(u64, Option<Duration>), ()> {
+    ) -> Result<(JobId, Option<Duration>), ()> {
         if !self.guest_io_ready().await {
             if let Some(req) = req {
                 req.send_err(CrucibleError::UpstairsInactive).await;
@@ -9676,7 +9676,7 @@ async fn process_new_io(
                     let job = h.job();
                     if job.ack_status == AckStatus::NotAcked {
                         job.ack_status = AckStatus::AckReady;
-                        ds_done_tx.send(ds_id).await.unwrap();
+                        ds_done_tx.send(()).await.unwrap();
                     }
                 });
             }
