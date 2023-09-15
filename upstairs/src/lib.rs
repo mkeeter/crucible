@@ -656,8 +656,14 @@ where
      * This XXX is for coming back here and making a better job of
      * flow control.
      */
+
+    // Grab new and requeued work from the downstairs, then merge the small set
+    // into the larger (to minimize BTreeSet work).
     let (mut new_work, mut requeued_work) =
         u.downstairs.lock().await.new_work(client_id);
+    if new_work.len() < requeued_work.len() {
+        std::mem::swap(&mut new_work, &mut requeued_work);
+    }
     new_work.append(&mut requeued_work);
 
     let mut active_count = u.downstairs.lock().await.submitted_work(client_id);
