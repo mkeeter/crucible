@@ -106,9 +106,6 @@ pub struct Inner {
 
     /// Is the `ping` or `pong` context slot active?
     active_context: Vec<Option<bool>>,
-
-    /// Have writes happened since the last flush?
-    pub dirty: bool,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -177,8 +174,6 @@ impl Inner {
         Ok(Self {
             file,
             metadb,
-            // TODO(matt) tracking dirtiness without SQLite is hard!
-            dirty: false,
             active_context,
             block_size,
             extent_size,
@@ -222,7 +217,26 @@ impl Inner {
 
         let _rows_affected = stmt.execute([new_gen])?;
 
+        /*
+         * When we write out the new flush number, the dirty bit should be
+         * set back to false.
+         */
+        let mut stmt = self
+            .metadb
+            .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
+        let _rows_affected = stmt.execute([])?;
+
         Ok(())
+    }
+
+    pub fn dirty(&self) -> Result<bool> {
+        let mut stmt = self
+            .metadb
+            .prepare_cached("SELECT value FROM metadata where name='dirty'")?;
+        let mut dirty_iter = stmt.query_map([], |row| row.get(0))?;
+        let dirty = dirty_iter.next().unwrap()?;
+        assert!(dirty_iter.next().is_none());
+        Ok(dirty)
     }
 
     fn get_block_context(
@@ -246,6 +260,16 @@ impl Inner {
         });
 
         Ok(out)
+    }
+
+    fn set_dirty(&self) -> Result<()> {
+        let _ = self
+            .metadb
+            .prepare_cached(
+                "UPDATE metadata SET value=1 WHERE name='dirty' AND value=0",
+            )?
+            .execute([])?;
+        Ok(())
     }
 
     /// For a given block range, return all (two) context rows
@@ -299,7 +323,7 @@ impl Inner {
         &mut self,
         block_contexts: &[&DownstairsBlockContext],
     ) -> Result<()> {
-        self.dirty = true;
+        self.set_dirty()?;
         for block_context in block_contexts {
             let new_slot = self.tx_set_block_context(block_context)?;
             // TODO(matt) This is not exactly what we want, because the data
@@ -676,7 +700,7 @@ impl Extent {
     }
 
     pub async fn dirty(&self) -> bool {
-        self.inner.lock().await.dirty
+        self.inner.lock().await.dirty().unwrap()
     }
 
     /**
@@ -687,8 +711,9 @@ impl Extent {
 
         let gen = inner.gen_number().unwrap();
         let flush = inner.flush_number().unwrap();
+        let dirty = inner.dirty().unwrap();
 
-        Ok((gen, flush, inner.dirty)) // TODO(matt) how is dirty used?
+        Ok((gen, flush, dirty))
     }
 
     /**
@@ -775,6 +800,10 @@ impl Extent {
                 "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
                 params!["flush_number", meta.flush_number],
             )?;
+            metadb.execute(
+                "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
+                params!["dirty", meta.dirty],
+            )?;
 
             // write out
             metadb.close().map_err(|e| {
@@ -802,7 +831,6 @@ impl Extent {
             inner: Mutex::new(Inner {
                 file,
                 metadb,
-                dirty: false,
                 active_context: vec![None; def.extent_size().value as usize],
                 block_size: def.block_size(),
                 extent_size: def.extent_size().value,
@@ -1138,10 +1166,11 @@ impl Extent {
             }
         }
 
+        inner.set_dirty()?;
+
         // Write all the metadata to the DB
         // TODO right now we're including the integrity_hash() time in the sqlite time. It's small in
         // comparison right now, but worth being aware of when looking at dtrace numbers
-        inner.dirty = true;
         println!("marking {} as dirty!", self.number);
         cdt::extent__write__sqlite__insert__start!(|| {
             (job_id.0, self.number, writes.len() as u64)
@@ -1247,7 +1276,7 @@ impl Extent {
         let job_id: JobOrReconciliationId = id.into();
         let mut inner = self.inner.lock().await;
 
-        if !inner.dirty {
+        if !inner.dirty()? {
             /*
              * If we have made no writes to this extent since the last flush,
              * we do not need to update the extent on disk
@@ -1291,8 +1320,6 @@ impl Extent {
         inner.file.seek(SeekFrom::Start(0))?;
 
         cdt::extent__flush__done!(|| { (job_id.get(), self.number) });
-
-        inner.dirty = false;
 
         Ok(())
     }
@@ -1947,7 +1974,7 @@ impl Region {
         let mut result = Vec::with_capacity(self.extents.len());
         for eid in 0..self.extents.len() {
             let extent = self.get_opened_extent(eid).await;
-            result.push(extent.inner.lock().await.dirty);
+            result.push(extent.inner.lock().await.dirty()?);
         }
         Ok(result)
     }
@@ -2573,7 +2600,6 @@ mod test {
             metadb: Connection::open_in_memory().unwrap(),
             block_size: 512,
             extent_size: 100,
-            dirty: false,
             active_context: vec![None; 100],
         };
 
