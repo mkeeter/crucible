@@ -282,11 +282,9 @@ impl Inner {
         block: u64,
         count: u64,
     ) -> Result<Vec<Vec<DownstairsBlockContext>>> {
-        println!("checking {block} through {count}");
         let mut out = vec![];
         for i in block..block + count {
             let ctx = self.get_block_context(i)?;
-            println!("for block {block}, got {ctx:?}");
             out.push(ctx.into_iter().collect());
         }
         Ok(out)
