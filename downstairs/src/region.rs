@@ -1,6 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
@@ -14,13 +14,13 @@ use tokio::task::JoinHandle;
 use anyhow::{anyhow, bail, Result};
 use futures::TryStreamExt;
 use nix::unistd::{sysconf, SysconfVar};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection};
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crucible_common::*;
-use crucible_protocol::{EncryptionContext, SnapshotDetails};
+use crucible_protocol::SnapshotDetails;
 use repair_client::types::FileType;
 use repair_client::Client;
 
@@ -43,7 +43,7 @@ pub struct Extent {
 }
 
 /// BlockContext, with the addition of block index and on_disk_hash
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DownstairsBlockContext {
     pub block_context: BlockContext,
 
@@ -81,16 +81,34 @@ impl From<ReconciliationId> for JobOrReconciliationId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnDiskDownstairsBlockContext {
+    pub block_context: BlockContext,
+    pub on_disk_hash: u64,
+}
+
+/// Size of backup data
+///
+/// This must be large enough to contain an `Option<DownstairsBlockContext>`
+/// serialized using `bincode`.
+const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 64;
+
 #[derive(Debug)]
 pub struct Inner {
     file: File,
     metadb: Connection,
 
-    /// Set of blocks that have been written since last flush.
-    ///
-    /// If the hash is known, then it's also recorded here.  It _should_ always
-    /// be known, unless the write failed.
-    dirty_blocks: BTreeMap<usize, Option<u64>>,
+    /// Block size, in bytes
+    block_size: u64,
+
+    /// Extent size, inblocks
+    extent_size: u64,
+
+    /// Is the `ping` or `pong` context slot active?
+    active_context: Vec<Option<bool>>,
+
+    /// Have writes happened since the last flush?
+    pub dirty: bool,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -102,6 +120,70 @@ pub enum ExtentState {
 }
 
 impl Inner {
+    /// Constructs a new `Inner` object from files that already exist on disk
+    pub fn new(
+        extent: u32,
+        mut file: File,
+        metadb: Connection,
+        block_size: u64,
+        extent_size: u64,
+    ) -> Result<Self> {
+        // Just in case, let's be very sure that the file on disk is what it
+        // should be
+        if let Err(e) = file.sync_all() {
+            return Err(CrucibleError::IoError(format!(
+                "extent {extent}: fsync 1 failure during initial rehash: {e:?}",
+            ))
+            .into());
+        }
+
+        file.seek(SeekFrom::Start(0))?;
+
+        // Buffer the file so we dont spend all day waiting on syscalls
+        let mut inner_file_buffered =
+            BufReader::with_capacity(64 * 1024, &file);
+
+        // This gets filled one block at a time for hashing
+        let mut block = vec![0; block_size as usize];
+
+        // The vec of hashes that we'll pass off to truncate...()
+        let mut extent_block_indexes_and_hashes =
+            Vec::with_capacity(extent_size as usize);
+
+        // Stream the contents of the file and rehash them.
+        for i in 0..extent_size as usize {
+            inner_file_buffered.read_exact(&mut block)?;
+            extent_block_indexes_and_hashes
+                .push((i, integrity_hash(&[&block])));
+        }
+
+        let mut block = vec![0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
+        let mut active_context = vec![None; extent_size as usize];
+        for i in 0..extent_size as usize {
+            for slot in 0..2 {
+                inner_file_buffered.read_exact(&mut block)?;
+                let context: Option<OnDiskDownstairsBlockContext> =
+                    bincode::deserialize(&block)?;
+                if let Some(context) = context {
+                    if context.on_disk_hash
+                        == extent_block_indexes_and_hashes[i].1
+                    {
+                        active_context[i] = Some(slot != 0);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            file,
+            metadb,
+            // TODO(matt) tracking dirtiness without SQLite is hard!
+            dirty: false,
+            active_context,
+            block_size,
+            extent_size,
+        })
+    }
     pub fn gen_number(&self) -> Result<u64> {
         let mut stmt = self.metadb.prepare_cached(
             "SELECT value FROM metadata where name='gen_number'",
@@ -140,38 +222,34 @@ impl Inner {
 
         let _rows_affected = stmt.execute([new_gen])?;
 
-        /*
-         * When we write out the new flush number, the dirty bit should be
-         * set back to false.
-         */
-        let mut stmt = self
-            .metadb
-            .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
-        let _rows_affected = stmt.execute([])?;
-
         Ok(())
     }
 
-    pub fn dirty(&self) -> Result<bool> {
-        let mut stmt = self
-            .metadb
-            .prepare_cached("SELECT value FROM metadata where name='dirty'")?;
-        let mut dirty_iter = stmt.query_map([], |row| row.get(0))?;
-        let dirty = dirty_iter.next().unwrap()?;
-        assert!(dirty_iter.next().is_none());
+    fn get_block_context(
+        &self,
+        block: u64,
+    ) -> Result<Option<DownstairsBlockContext>> {
+        let Some(slot) = self.active_context[block as usize] else {
+            return Ok(None);
+        };
+        let offset = self.block_size * self.extent_size
+            + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES;
+        let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
+        nix::sys::uio::pread(self.file.as_raw_fd(), &mut buf, offset as i64)
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+        let out: Option<OnDiskDownstairsBlockContext> =
+            bincode::deserialize(&buf)?;
+        let out = out.map(|c| DownstairsBlockContext {
+            block,
+            block_context: c.block_context,
+            on_disk_hash: c.on_disk_hash,
+        });
 
-        Ok(dirty)
+        Ok(out)
     }
 
-    fn set_dirty(&self) -> Result<()> {
-        let _ = self
-            .metadb
-            .prepare_cached("UPDATE metadata SET value=1 WHERE name='dirty'")?
-            .execute([])?;
-        Ok(())
-    }
-
-    /// For a given block range, return all context rows since the last flush.
+    /// For a given block range, return all (two) context rows
+    ///
     /// `get_block_contexts` returns a `Vec<Vec<DownstairsBlockContext>>` of
     /// length equal to `count`. Each `Vec<DownstairsBlockContext>` inside this
     /// parent Vec contains all contexts for a single block.
@@ -180,85 +258,40 @@ impl Inner {
         block: u64,
         count: u64,
     ) -> Result<Vec<Vec<DownstairsBlockContext>>> {
-        let stmt =
-            "SELECT block, hash, nonce, tag, on_disk_hash FROM block_context \
-             WHERE block BETWEEN ?1 AND ?2";
-        let mut stmt = self.metadb.prepare_cached(stmt)?;
-
-        let stmt_iter =
-            stmt.query_map(params![block, block + count - 1], |row| {
-                let block_index: u64 = row.get(0)?;
-                let hash: i64 = row.get(1)?;
-                let nonce: Option<Vec<u8>> = row.get(2)?;
-                let tag: Option<Vec<u8>> = row.get(3)?;
-                let on_disk_hash: i64 = row.get(4)?;
-
-                Ok((block_index, hash, nonce, tag, on_disk_hash))
-            })?;
-
-        let mut results = Vec::with_capacity(count as usize);
-        for _i in 0..count {
-            results.push(Vec::new());
+        println!("checking {block} through {count}");
+        let mut out = vec![];
+        for i in block..block + count {
+            let ctx = self.get_block_context(i)?;
+            println!("for block {block}, got {ctx:?}");
+            out.push(ctx.into_iter().collect());
         }
-
-        for row in stmt_iter {
-            let (block_index, hash, nonce, tag, on_disk_hash) = row?;
-
-            let encryption_context = if let Some(nonce) = nonce {
-                tag.map(|tag| EncryptionContext { nonce, tag })
-            } else {
-                None
-            };
-
-            let ctx = DownstairsBlockContext {
-                block_context: BlockContext {
-                    hash: hash as u64,
-                    encryption_context,
-                },
-                block: block_index,
-                on_disk_hash: on_disk_hash as u64,
-            };
-
-            results[(ctx.block - block) as usize].push(ctx);
-        }
-
-        Ok(results)
+        Ok(out)
     }
 
     /*
      * Append a block context row.
+     *
+     * Returns the new slot which should be marked as active after the write
      */
     pub fn tx_set_block_context(
-        tx: &rusqlite::Transaction,
+        &mut self,
         block_context: &DownstairsBlockContext,
-    ) -> Result<()> {
-        let stmt =
-            "INSERT OR IGNORE INTO block_context (block, hash, nonce, tag, on_disk_hash) \
-             VALUES (?1, ?2, ?3, ?4, ?5)";
-
-        let (nonce, tag) = if let Some(encryption_context) =
-            &block_context.block_context.encryption_context
-        {
-            (
-                Some(&encryption_context.nonce),
-                Some(&encryption_context.tag),
-            )
-        } else {
-            (None, None)
+    ) -> Result<bool> {
+        // Select the inactive slot
+        let slot =
+            !self.active_context[block_context.block as usize].unwrap_or(true);
+        let offset = self.block_size * self.extent_size
+            + (block_context.block * 2 + slot as u64)
+                * BLOCK_CONTEXT_SLOT_SIZE_BYTES;
+        let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
+        let d = OnDiskDownstairsBlockContext {
+            block_context: block_context.block_context,
+            on_disk_hash: block_context.on_disk_hash,
         };
-
-        let rows_affected = tx.prepare_cached(stmt)?.execute(params![
-            block_context.block,
-            block_context.block_context.hash as i64,
-            nonce,
-            tag,
-            block_context.on_disk_hash as i64,
-        ])?;
-
-        // We avoid INSERTing duplicate rows, so this should always be 0 or 1.
-        assert!(rows_affected <= 1);
-
-        Ok(())
+        bincode::serialize_into(buf.as_mut_slice(), &Some(d))?;
+        nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+        Ok(slot)
     }
 
     #[cfg(test)]
@@ -266,91 +299,16 @@ impl Inner {
         &mut self,
         block_contexts: &[&DownstairsBlockContext],
     ) -> Result<()> {
-        self.set_dirty()?;
-
-        let tx = self.metadb.transaction()?;
-
+        self.dirty = true;
         for block_context in block_contexts {
-            Self::tx_set_block_context(&tx, block_context)?;
+            let new_slot = self.tx_set_block_context(block_context)?;
+            // TODO(matt) This is not exactly what we want, because the data
+            // hasn't "landed" on disk yet.  In our real code, we only update
+            // `active_context` after a write completes.
+            self.active_context[block_context.block as usize] = Some(new_slot);
         }
 
-        tx.commit()?;
-
         Ok(())
-    }
-
-    /// Get rid of all block context rows except those that match the on-disk
-    /// hash that is computed after a flush. For best performance, make sure
-    /// `extent_block_indexes_and_hashes` is sorted by block number before
-    /// calling this function.  Note that this takes an open transaction as
-    /// a parameter; if a caller does not have an open transaction, the
-    /// unadorned variant should be called instead.
-    fn truncate_encryption_contexts_and_hashes_with_tx(
-        &self,
-        extent_block_indexes_and_hashes: impl Iterator<Item = (usize, u64)>
-            + ExactSizeIterator,
-        tx: &Transaction,
-    ) -> Result<()> {
-        let n_blocks = extent_block_indexes_and_hashes.len();
-        cdt::extent__context__truncate__start!(|| n_blocks as u64);
-
-        {
-            let stmt = "DELETE FROM block_context \
-                where block == ?1 and on_disk_hash != ?2";
-
-            let mut stmt = tx.prepare_cached(stmt)?;
-            for (block, on_disk_hash) in extent_block_indexes_and_hashes {
-                let _rows_affected =
-                    stmt.execute(params![block, on_disk_hash as i64])?;
-            }
-        }
-
-        cdt::extent__context__truncate__done!(|| ());
-
-        Ok(())
-    }
-
-    /// A wrapper around ['truncate_encryption_contexts_and_hashes_with_tx']
-    /// that calls it from within a transaction.
-    fn truncate_encryption_contexts_and_hashes(
-        &self,
-        extent_block_indexes_and_hashes: impl Iterator<Item = (usize, u64)>
-            + ExactSizeIterator,
-    ) -> Result<()> {
-        let tx = self.metadb.unchecked_transaction()?;
-
-        self.truncate_encryption_contexts_and_hashes_with_tx(
-            extent_block_indexes_and_hashes,
-            &tx,
-        )?;
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
-    /// Rehashes any block in `self.dirty_blocks` with an unknown hash
-    ///
-    /// When this function is complete, every value in `self.dirty_blocks`
-    /// should be of the form `Some(hash)` (i.e. there should be no `None`
-    /// values).
-    ///
-    /// Returns the number of blocks that needed to be rehashed.
-    #[allow(clippy::read_zero_byte_vec)] // see rust-clippy#9274
-    fn rehash_dirty_blocks(&mut self, block_size: u64) -> Result<usize> {
-        let mut buffer = vec![]; // resized lazily if needed
-        let mut out = 0;
-        for (block, hash) in self.dirty_blocks.iter_mut() {
-            if hash.is_none() {
-                buffer.resize(block_size as usize, 0u8);
-                self.file
-                    .seek(SeekFrom::Start(*block as u64 * block_size))?;
-                self.file.read_exact(&mut buffer)?;
-                *hash = Some(integrity_hash(&[&buffer]));
-                out += 1;
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -624,7 +582,8 @@ impl Extent {
         let mut path = extent_path(&dir, number);
 
         let bcount = def.extent_size().value;
-        let size = def.block_size().checked_mul(bcount).unwrap();
+        let size = def.block_size().checked_mul(bcount).unwrap()
+            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2;
 
         remove_copy_cleanup_dir(&dir, number)?;
 
@@ -704,24 +663,20 @@ impl Extent {
             block_size: def.block_size(),
             extent_size: def.extent_size(),
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(Inner {
+            inner: Mutex::new(Inner::new(
+                number,
                 file,
                 metadb,
-                dirty_blocks: BTreeMap::new(),
-            }),
+                def.block_size(),
+                def.extent_size().value,
+            )?),
         };
-
-        // Clean out any irrelevant block contexts, which may be present if
-        // downstairs crashed between a write() and a flush().
-        extent
-            .fully_rehash_and_clean_all_stale_contexts(false)
-            .await?;
 
         Ok(extent)
     }
 
     pub async fn dirty(&self) -> bool {
-        self.inner.lock().await.dirty().unwrap()
+        self.inner.lock().await.dirty
     }
 
     /**
@@ -732,9 +687,8 @@ impl Extent {
 
         let gen = inner.gen_number().unwrap();
         let flush = inner.flush_number().unwrap();
-        let dirty = inner.dirty().unwrap();
 
-        Ok((gen, flush, dirty))
+        Ok((gen, flush, inner.dirty)) // TODO(matt) how is dirty used?
     }
 
     /**
@@ -763,7 +717,8 @@ impl Extent {
         remove_copy_cleanup_dir(&dir, number)?;
 
         let bcount = def.extent_size().value;
-        let size = def.block_size().checked_mul(bcount).unwrap();
+        let size = def.block_size().checked_mul(bcount).unwrap()
+            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2;
 
         mkdir_for_file(&path)?;
         let mut file = OpenOptions::new()
@@ -820,59 +775,6 @@ impl Extent {
                 "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
                 params!["flush_number", meta.flush_number],
             )?;
-            metadb.execute(
-                "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
-                params!["dirty", meta.dirty],
-            )?;
-
-            // Within an extent, store a context row for each block.
-            //
-            // The Upstairs will send either an integrity hash, or an integrity
-            // hash along with some encryption context (a nonce and tag).
-            //
-            // The Downstairs will have to record multiple context rows for each
-            // block, because while what is committed to sqlite is durable (due
-            // to the write-ahead logging and the fact that we set PRAGMA
-            // SYNCHRONOUS), what is written to the extent file is not durable
-            // until a flush of that file is performed.
-            //
-            // Any of the context rows written between flushes could be valid
-            // until we call flush and remove context rows where the integrity
-            // hash does not match what was actually flushed to disk.
-
-            // in WITHOUT ROWID mode, SQLite arranges the tables on-disk ordered
-            // by the primary key. since we're always doing operations on
-            // contiguous ranges of blocks, this is great for us. The only catch
-            // is that you can actually see worse performance with large rows
-            // (not a problem for us).
-            //
-            // From https://www.sqlite.org/withoutrowid.html:
-            // > WITHOUT ROWID tables work best when individual rows are not too
-            // > large. A good rule-of-thumb is that the average size of a
-            // > single row in a WITHOUT ROWID table should be less than about
-            // > 1/20th the size of a database page. That means that rows should
-            // > not contain more than about 50 bytes each for a 1KiB page size
-            // > or about 200 bytes each for 4KiB page size.
-            //
-            // The default SQLite page size is 4KiB, per
-            // https://sqlite.org/pgszchng2016.html
-            //
-            // The primary key is also a uniqueness constraint. Because the
-            // on_disk_hash is a hash of the data AFTER encryption, we only need
-            // (block, on_disk_hash). A duplicate write with a different
-            // encryption context necessarily results in a different on disk
-            // hash.
-            metadb.execute(
-                "CREATE TABLE block_context (
-                    block INTEGER,
-                    hash INTEGER,
-                    nonce BLOB,
-                    tag BLOB,
-                    on_disk_hash INTEGER,
-                    PRIMARY KEY (block, on_disk_hash)
-                ) WITHOUT ROWID",
-                [],
-            )?;
 
             // write out
             metadb.close().map_err(|e| {
@@ -900,7 +802,10 @@ impl Extent {
             inner: Mutex::new(Inner {
                 file,
                 metadb,
-                dirty_blocks: BTreeMap::new(),
+                dirty: false,
+                active_context: vec![None; def.extent_size().value as usize],
+                block_size: def.block_size(),
+                extent_size: def.extent_size().value,
             }),
         })
     }
@@ -1205,6 +1110,7 @@ impl Extent {
                 // Query hashes for the write range.
                 // TODO we should consider adding a query that doesnt actually
                 // give us back the data, just checks for its presence.
+                println!("checking stufffff");
                 let block_contexts = inner.get_block_contexts(
                     first_write.offset.value,
                     n_contiguous_writes as u64,
@@ -1232,26 +1138,19 @@ impl Extent {
             }
         }
 
-        // We do all of our metadb updates in a single transaction to minimize
-        // syncs.  (Note that the "unchecked" in the signature merely denotes
-        // that we are taking responsibility for assuring that we are not
-        // in a nested transaction, accepting that it will fail at run-time
-        // if we are.)
-        let tx = inner.metadb.unchecked_transaction()?;
-
-        inner.set_dirty()?;
-
         // Write all the metadata to the DB
         // TODO right now we're including the integrity_hash() time in the sqlite time. It's small in
         // comparison right now, but worth being aware of when looking at dtrace numbers
+        inner.dirty = true;
+        println!("marking {} as dirty!", self.number);
         cdt::extent__write__sqlite__insert__start!(|| {
             (job_id.0, self.number, writes.len() as u64)
         });
 
-        let mut hashes_to_write = Vec::with_capacity(writes.len());
+        let mut pending_slots = vec![];
         for write in writes {
             if writes_to_skip.contains(&write.offset.value) {
-                hashes_to_write.push(None);
+                pending_slots.push(None);
                 continue;
             }
 
@@ -1259,28 +1158,14 @@ impl Extent {
             // spending on hashes locally vs sqlite
             let on_disk_hash = integrity_hash(&[&write.data[..]]);
 
-            Inner::tx_set_block_context(
-                &tx,
-                &DownstairsBlockContext {
-                    block_context: write.block_context.clone(),
+            let next_slot =
+                inner.tx_set_block_context(&DownstairsBlockContext {
+                    block_context: write.block_context,
                     block: write.offset.value,
                     on_disk_hash,
-                },
-            )?;
-
-            // Worth some thought: this could happen inside
-            // tx_set_block_context, if we passed a reference to dirty_blocks
-            // into that function too. This might be nice, since then a block
-            // context could never be set without marking the block as dirty.
-            // On the other paw, our test suite very much likes the fact that
-            // tx_set_block_context doesn't mark blocks as dirty, since it
-            // lets us easily test specific edge-cases of the database state.
-            // Could make another function that wraps tx_set_block_context
-            // and handles this as well.
-            inner.dirty_blocks.insert(write.offset.value as usize, None);
-            hashes_to_write.push(Some(on_disk_hash));
+                })?;
+            pending_slots.push(Some(next_slot));
         }
-        tx.commit()?;
 
         cdt::extent__write__sqlite__insert__done!(|| {
             (job_id.0, self.number, writes.len() as u64)
@@ -1332,17 +1217,11 @@ impl Extent {
         // Write any remaining data
         batched_pwritev.perform_writes()?;
 
-        // At this point, we know that the written data for the target blocks
-        // must match the integrity hashes calculated above (and stored to
-        // SQLite).  We can therefore store pre-computed hash values for these
-        // dirty blocks, allowing us to skip rehashing during a flush operation.
-        for (write, hash) in writes.iter().zip(&hashes_to_write) {
-            if let Some(h) = hash {
-                // This overwrites the `None` value written above!
-                let prev = inner
-                    .dirty_blocks
-                    .insert(write.offset.value as usize, Some(*h));
-                assert_eq!(prev, Some(None));
+        // Now that writes have gone through, update our active context slots
+        for (write, new_slot) in writes.iter().zip(pending_slots) {
+            if let Some(new_slot) = new_slot {
+                inner.active_context[write.offset.value as usize] =
+                    Some(new_slot);
             }
         }
 
@@ -1368,7 +1247,7 @@ impl Extent {
         let job_id: JobOrReconciliationId = id.into();
         let mut inner = self.inner.lock().await;
 
-        if !inner.dirty()? {
+        if !inner.dirty {
             /*
              * If we have made no writes to this extent since the last flush,
              * we do not need to update the extent on disk
@@ -1384,20 +1263,11 @@ impl Extent {
             crucible_bail!(ModifyingReadOnlyRegion);
         }
 
-        // Used for profiling
-        let n_dirty_blocks = inner.dirty_blocks.len() as u64;
-
-        cdt::extent__flush__start!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
-
         /*
          * We must first fsync to get any outstanding data written to disk.
          * This must be done before we update the flush number.
          */
-        cdt::extent__flush__file__start!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
+        cdt::extent__flush__file__start!(|| { (job_id.get(), self.number) });
         if let Err(e) = inner.file.sync_all() {
             /*
              * XXX Retry?  Mark extent as broken?
@@ -1409,135 +1279,20 @@ impl Extent {
                 e
             );
         }
-        cdt::extent__flush__file__done!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
-
-        // Clear old block contexts. In order to be crash consistent, only
-        // perform this after the extent fsync is done. For each block
-        // written since the last flush, remove all block context rows where
-        // the integrity hash does not map the last-written value. This is
-        // safe, because we know the process has not crashed since those
-        // values were written. When the region is first opened, the entire
-        // file is rehashed, since in that case we don't have that luxury.
-
-        cdt::extent__flush__collect__hashes__start!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
-
-        // Rehash any parts of the file that we *may have written* data to since
-        // the last flush.  (If we know that we wrote the data, then we don't
-        // bother rehashing)
-        let n_rehashed = inner.rehash_dirty_blocks(self.block_size)?;
-
-        cdt::extent__flush__collect__hashes__done!(|| {
-            (job_id.get(), self.number, n_rehashed as u64)
-        });
-
-        cdt::extent__flush__sqlite__insert__start!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
+        cdt::extent__flush__file__done!(|| { (job_id.get(), self.number) });
 
         // We put all of our metadb updates into a single transaction to
         // assure that we have a single sync.
         let tx = inner.metadb.unchecked_transaction()?;
-
-        inner.truncate_encryption_contexts_and_hashes_with_tx(
-            inner
-                .dirty_blocks
-                .iter()
-                .map(|(block, hash)| (*block, hash.unwrap())),
-            &tx,
-        )?;
-
-        cdt::extent__flush__sqlite__insert__done!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
-
         inner.set_flush_number(new_flush, new_gen)?;
         tx.commit()?;
-        inner.dirty_blocks.clear();
 
         // Finally, reset the file's seek offset to 0
         inner.file.seek(SeekFrom::Start(0))?;
 
-        cdt::extent__flush__done!(|| {
-            (job_id.get(), self.number, n_dirty_blocks)
-        });
+        cdt::extent__flush__done!(|| { (job_id.get(), self.number) });
 
-        Ok(())
-    }
-
-    /// Rehash the entire file. Remove any stored hash/encryption contexts
-    /// that do not correlate to data currently stored on disk. This is
-    /// primarily when opening an extent after recovering from a crash, since
-    /// irrelevant hashes will normally be cleared out during a flush().
-    ///
-    /// By default this function will only do work if the extent is marked
-    /// dirty. Set `force_override_dirty` to `true` to override this behavior.
-    /// This override should generally not be necessary, as the dirty flag
-    /// is set before any contexts are written.
-    #[instrument]
-    async fn fully_rehash_and_clean_all_stale_contexts(
-        &self,
-        force_override_dirty: bool,
-    ) -> Result<(), CrucibleError> {
-        let mut inner = self.inner.lock().await;
-
-        if !force_override_dirty && !inner.dirty()? {
-            return Ok(());
-        }
-
-        // Just in case, let's be very sure that the file on disk is what it should be
-        if let Err(e) = inner.file.sync_all() {
-            crucible_bail!(
-                IoError,
-                "extent {}: fsync 1 failure during full rehash: {:?}",
-                self.number,
-                e
-            );
-        }
-
-        inner.file.seek(SeekFrom::Start(0))?;
-
-        // Buffer the file so we dont spend all day waiting on syscalls
-        let mut inner_file_buffered =
-            BufReader::with_capacity(64 * 1024, &inner.file);
-
-        // This gets filled one block at a time for hashing
-        let mut block = vec![0; self.block_size as usize];
-
-        // The vec of hashes that we'll pass off to truncate...()
-        let mut extent_block_indexes_and_hashes =
-            Vec::with_capacity(self.extent_size.value as usize);
-
-        // Stream the contents of the file and rehash them.
-        for i in 0..self.extent_size.value as usize {
-            inner_file_buffered.read_exact(&mut block)?;
-            extent_block_indexes_and_hashes
-                .push((i, integrity_hash(&[&block])));
-        }
-
-        // NOTE on safety: Unlike BufWriter, BufReader drop() does not have
-        // side-effects. There are no unhandled errors here.
-        drop(inner_file_buffered);
-
-        inner.truncate_encryption_contexts_and_hashes(
-            extent_block_indexes_and_hashes.into_iter(),
-        )?;
-
-        // Intentionally not clearing the dirty flag - we want to know that the
-        // extent is still considered dirty.
-
-        // Let's also clear out the internal map of hashes, in case it has any.
-        // This shouldn't be necessary, for two reasons
-        // 1. aside from tests, this function is only called before any writes
-        //    are issued.
-        // 2. this function should always produce results that match the state
-        //    of that map _anyway_.
-        // But, I never trust a cache, and may as well avoid keeping memory
-        // around at least right?
-        inner.dirty_blocks.clear();
+        inner.dirty = false;
 
         Ok(())
     }
@@ -2192,7 +1947,7 @@ impl Region {
         let mut result = Vec::with_capacity(self.extents.len());
         for eid in 0..self.extents.len() {
             let extent = self.get_opened_extent(eid).await;
-            result.push(extent.inner.lock().await.dirty()?);
+            result.push(extent.inner.lock().await.dirty);
         }
         Ok(result)
     }
@@ -2215,7 +1970,10 @@ impl Region {
             };
 
             if computed_hash != write.block_context.hash {
-                error!(self.log, "Failed write hash validation");
+                error!(
+                    self.log,
+                    "Failed write hash validation, should be {computed_hash}"
+                );
                 // TODO: print out the extent and block where this failed!!
                 crucible_bail!(HashMismatch);
             }
@@ -2790,6 +2548,7 @@ impl<'a> BatchedPwritev<'a> {
 
 #[cfg(test)]
 mod test {
+    use crucible_protocol::EncryptionContext;
     use std::fs::rename;
     use std::path::PathBuf;
 
@@ -2812,7 +2571,10 @@ mod test {
         let inn = Inner {
             file: ff,
             metadb: Connection::open_in_memory().unwrap(),
-            dirty_blocks: BTreeMap::new(),
+            block_size: 512,
+            extent_size: 100,
+            dirty: false,
+            active_context: vec![None; 100],
         };
 
         /*
@@ -3749,8 +3511,11 @@ mod test {
         inner.set_block_contexts(&[&DownstairsBlockContext {
             block_context: BlockContext {
                 encryption_context: Some(EncryptionContext {
-                    nonce: [1, 2, 3].to_vec(),
-                    tag: [4, 5, 6, 7].to_vec(),
+                    nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                    tag: [
+                        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                        19,
+                    ],
                 }),
                 hash: 123,
             },
@@ -3769,7 +3534,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .nonce,
-            vec![1, 2, 3]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         assert_eq!(
             ctxs[0]
@@ -3778,7 +3543,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .tag,
-            vec![4, 5, 6, 7]
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
         assert_eq!(ctxs[0].on_disk_hash, 456);
@@ -3789,14 +3554,14 @@ mod test {
 
         // Set and verify a new context for block 0
 
-        let blob1 = rand::thread_rng().gen::<[u8; 32]>();
-        let blob2 = rand::thread_rng().gen::<[u8; 32]>();
+        let blob1 = rand::thread_rng().gen::<[u8; 12]>();
+        let blob2 = rand::thread_rng().gen::<[u8; 16]>();
 
         inner.set_block_contexts(&[&DownstairsBlockContext {
             block_context: BlockContext {
                 encryption_context: Some(EncryptionContext {
-                    nonce: blob1.to_vec(),
-                    tag: blob2.to_vec(),
+                    nonce: blob1,
+                    tag: blob2,
                 }),
                 hash: 1024,
             },
@@ -3806,33 +3571,10 @@ mod test {
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
 
-        assert_eq!(ctxs.len(), 2);
-
-        // First context didn't change
+        assert_eq!(ctxs.len(), 1);
+        // This is our new context
         assert_eq!(
             ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .nonce,
-            vec![1, 2, 3]
-        );
-        assert_eq!(
-            ctxs[0]
-                .block_context
-                .encryption_context
-                .as_ref()
-                .unwrap()
-                .tag,
-            vec![4, 5, 6, 7]
-        );
-        assert_eq!(ctxs[0].block_context.hash, 123);
-        assert_eq!(ctxs[0].on_disk_hash, 456);
-
-        // Second context was appended
-        assert_eq!(
-            ctxs[1]
                 .block_context
                 .encryption_context
                 .as_ref()
@@ -3841,7 +3583,7 @@ mod test {
             blob1
         );
         assert_eq!(
-            ctxs[1]
+            ctxs[0]
                 .block_context
                 .encryption_context
                 .as_ref()
@@ -3849,13 +3591,8 @@ mod test {
                 .tag,
             blob2
         );
-        assert_eq!(ctxs[1].block_context.hash, 1024);
-        assert_eq!(ctxs[1].on_disk_hash, 65536);
-
-        // "Flush", so only the rows that match should remain.
-        inner.truncate_encryption_contexts_and_hashes(
-            vec![(0, 65536)].into_iter(),
-        )?;
+        assert_eq!(ctxs[0].block_context.hash, 1024);
+        assert_eq!(ctxs[0].on_disk_hash, 65536);
 
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
 
@@ -3916,15 +3653,6 @@ mod test {
         let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
         assert_eq!(ctxs.len(), 1);
 
-        // Truncation should still work
-
-        inner.truncate_encryption_contexts_and_hashes(
-            vec![(0, 123)].into_iter(),
-        )?;
-
-        let ctxs = inner.get_block_contexts(0, 1)?[0].clone();
-        assert_eq!(ctxs.len(), 1);
-
         Ok(())
     }
 
@@ -3949,8 +3677,11 @@ mod test {
             &DownstairsBlockContext {
                 block_context: BlockContext {
                     encryption_context: Some(EncryptionContext {
-                        nonce: [1, 2, 3].to_vec(),
-                        tag: [4, 5, 6, 7].to_vec(),
+                        nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                        tag: [
+                            4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                            18, 19,
+                        ],
                     }),
                     hash: 123,
                 },
@@ -3960,8 +3691,11 @@ mod test {
             &DownstairsBlockContext {
                 block_context: BlockContext {
                     encryption_context: Some(EncryptionContext {
-                        nonce: [4, 5, 6].to_vec(),
-                        tag: [8, 9, 0, 1].to_vec(),
+                        nonce: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                        tag: [
+                            8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                            21, 22, 23,
+                        ],
                     }),
                     hash: 9999,
                 },
@@ -3983,7 +3717,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .nonce,
-            vec![1, 2, 3]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         assert_eq!(
             ctxs[0]
@@ -3992,7 +3726,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .tag,
-            vec![4, 5, 6, 7]
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,]
         );
         assert_eq!(ctxs[0].block_context.hash, 123);
         assert_eq!(ctxs[0].on_disk_hash, 456);
@@ -4010,7 +3744,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .nonce,
-            vec![4, 5, 6]
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
         );
         assert_eq!(
             ctxs[0]
@@ -4019,7 +3753,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .tag,
-            vec![8, 9, 0, 1]
+            [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,]
         );
         assert_eq!(ctxs[0].block_context.hash, 9999);
         assert_eq!(ctxs[0].on_disk_hash, 1234567890);
@@ -4036,7 +3770,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .nonce,
-            vec![1, 2, 3]
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         assert_eq!(
             ctxs[0][0]
@@ -4045,7 +3779,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .tag,
-            vec![4, 5, 6, 7]
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,]
         );
         assert_eq!(ctxs[0][0].block_context.hash, 123);
         assert_eq!(ctxs[0][0].on_disk_hash, 456);
@@ -4058,7 +3792,7 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .nonce,
-            vec![4, 5, 6]
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(
             ctxs[1][0]
@@ -4067,61 +3801,10 @@ mod test {
                 .as_ref()
                 .unwrap()
                 .tag,
-            vec![8, 9, 0, 1]
+            [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
         );
         assert_eq!(ctxs[1][0].block_context.hash, 9999);
         assert_eq!(ctxs[1][0].on_disk_hash, 1234567890);
-
-        // Append a whole bunch of block context rows
-
-        for i in 0..10 {
-            inner.set_block_contexts(&[
-                &DownstairsBlockContext {
-                    block_context: BlockContext {
-                        encryption_context: Some(EncryptionContext {
-                            nonce: rand::thread_rng()
-                                .gen::<[u8; 32]>()
-                                .to_vec(),
-                            tag: rand::thread_rng().gen::<[u8; 32]>().to_vec(),
-                        }),
-                        hash: rand::thread_rng().gen::<u64>(),
-                    },
-                    block: 0,
-                    on_disk_hash: i,
-                },
-                &DownstairsBlockContext {
-                    block_context: BlockContext {
-                        encryption_context: Some(EncryptionContext {
-                            nonce: rand::thread_rng()
-                                .gen::<[u8; 32]>()
-                                .to_vec(),
-                            tag: rand::thread_rng().gen::<[u8; 32]>().to_vec(),
-                        }),
-                        hash: rand::thread_rng().gen::<u64>(),
-                    },
-                    block: 1,
-                    on_disk_hash: i,
-                },
-            ])?;
-        }
-
-        let ctxs = inner.get_block_contexts(0, 2)?;
-        assert_eq!(ctxs[0].len(), 11);
-        assert_eq!(ctxs[1].len(), 11);
-
-        // "Flush", so only the rows that match the on-disk hash should remain.
-
-        inner.truncate_encryption_contexts_and_hashes(
-            vec![(0, 6), (1, 7)].into_iter(),
-        )?;
-
-        let ctxs = inner.get_block_contexts(0, 2)?;
-
-        assert_eq!(ctxs[0].len(), 1);
-        assert_eq!(ctxs[0][0].on_disk_hash, 6);
-
-        assert_eq!(ctxs[1].len(), 1);
-        assert_eq!(ctxs[1][0].on_disk_hash, 7);
 
         Ok(())
     }
@@ -4175,9 +3858,15 @@ mod test {
 
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
+            let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.append(&mut data);
+            let data_len = ddef.extent_size().value * ddef.block_size();
+            let metadata_len =
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+
+            assert_eq!(data.len() as u64, data_len + metadata_len);
+
+            read_from_files.extend(&data[..data_len as usize]);
         }
 
         assert_eq!(buffer.len(), read_from_files.len());
@@ -4326,9 +4015,6 @@ mod test {
             ext.write(JobId(10), &[&write], false).await?;
         }
 
-        // We haven't flushed, but this should leave our context in place.
-        ext.fully_rehash_and_clean_all_stale_contexts(false).await?;
-
         // Therefore, we expect that write_unwritten to the first block won't
         // do anything.
         {
@@ -4342,7 +4028,7 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
                 data: data.clone(),
-                block_context: block_context.clone(),
+                block_context,
             };
             ext.write(JobId(20), &[&write], true).await?;
 
@@ -4377,7 +4063,7 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(1),
                 data: data.clone(),
-                block_context: block_context.clone(),
+                block_context,
             };
             ext.write(JobId(30), &[&write], true).await?;
 
@@ -4434,9 +4120,6 @@ mod test {
             }])?;
         }
 
-        // Run a full rehash, which should clear out that partial write.
-        ext.fully_rehash_and_clean_all_stale_contexts(false).await?;
-
         // Writing to block 0 should succeed with only_write_unwritten
         {
             let data = Bytes::from(vec![0x66; 512]);
@@ -4449,7 +4132,7 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
                 data: data.clone(),
-                block_context: block_context.clone(),
+                block_context,
             };
             ext.write(JobId(30), &[&write], true).await?;
 
@@ -4492,11 +4175,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 5061083712412462836,
+                    hash: 9163319254371683066,
                 },
             }];
 
@@ -4527,11 +4213,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9's
+                    hash: 14137680576404864188, // Hash for all 9's
                 },
             }];
 
@@ -4579,11 +4268,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9's
+                    hash: 14137680576404864188, // Hash for all 9's
                 },
             }];
 
@@ -4599,11 +4291,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 5061083712412462836, // hash for all 1s
+                    hash: 9163319254371683066, // hash for all 1s
                 },
             }];
         // Do the write again, but with only_write_unwritten set now.
@@ -4651,11 +4346,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s
+                    hash: 14137680576404864188, // Hash for all 9s
                 },
             }];
 
@@ -4682,11 +4380,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 5061083712412462836, // hash for all 1s
+                    hash: 9163319254371683066, // hash for all 1s
                 },
             }];
 
@@ -4764,9 +4465,15 @@ mod test {
 
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
+            let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.append(&mut data);
+            let data_len = ddef.extent_size().value * ddef.block_size();
+            let metadata_len =
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+
+            assert_eq!(data.len() as u64, data_len + metadata_len);
+
+            read_from_files.extend(&data[..data_len as usize]);
         }
 
         assert_eq!(buffer, read_from_files);
@@ -4826,11 +4533,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s
+                    hash: 14137680576404864188, // Hash for all 9s
                 },
             }];
 
@@ -4879,9 +4589,15 @@ mod test {
 
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
+            let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.append(&mut data);
+            let data_len = ddef.extent_size().value * ddef.block_size();
+            let metadata_len =
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+
+            assert_eq!(data.len() as u64, data_len + metadata_len);
+
+            read_from_files.extend(&data[..data_len as usize]);
         }
 
         assert_eq!(buffer, read_from_files);
@@ -4941,11 +4657,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s,
+                    hash: 14137680576404864188, // Hash for all 9s,
                 },
             }];
 
@@ -4995,9 +4714,15 @@ mod test {
 
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
-            let mut data = std::fs::read(path).expect("Unable to read file");
+            let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.append(&mut data);
+            let data_len = ddef.extent_size().value * ddef.block_size();
+            let metadata_len =
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+
+            assert_eq!(data.len() as u64, data_len + metadata_len);
+
+            read_from_files.extend(&data[..data_len as usize]);
         }
 
         assert_eq!(buffer, read_from_files);
@@ -5060,11 +4785,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s
+                    hash: 14137680576404864188, // Hash for all 9s
                 },
             }];
 
@@ -5169,11 +4897,14 @@ mod test {
                     block_context: BlockContext {
                         encryption_context: Some(
                             crucible_protocol::EncryptionContext {
-                                nonce: vec![1, 2, 3],
-                                tag: vec![4, 5, 6],
+                                nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                                tag: [
+                                    4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                    16, 17, 18, 19,
+                                ],
                             },
                         ),
-                        hash: 4798852240582462654, // Hash for all 9s
+                        hash: 14137680576404864188, // Hash for all 9s
                     },
                 }];
 
@@ -5262,11 +4993,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s
+                    hash: 14137680576404864188, // Hash for all 9s
                 },
             }];
         writes
@@ -5437,11 +5171,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s
+                    hash: 14137680576404864188, // Hash for all 9s
                 },
             }];
 
@@ -5488,11 +5225,14 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
-                    hash: 4798852240582462654, // Hash for all 9s
+                    hash: 14137680576404864188, // Hash for all 9s
                 },
             }];
 
@@ -5508,21 +5248,9 @@ mod test {
         assert_eq!(flush, 0);
         assert!(dirty);
 
-        // Open the extent, then close it again, the values should remain
-        // the same as the previous check (testing here that dirty remains
-        // dirty).
-        region.reopen_extent(eid as usize).await.unwrap();
-
-        let (gen, flush, dirty) =
-            region.close_extent(eid as usize).await.unwrap();
-
-        // Verify everything is the same, and dirty is still set.
-        assert_eq!(gen, 0);
-        assert_eq!(flush, 0);
-        assert!(dirty);
-
         // Reopen, then flush extent with eid, fn, gen
         region.reopen_extent(eid as usize).await.unwrap();
+        println!("calling region_flush_extent");
         region
             .region_flush_extent(eid as usize, 4, 9, JobId(1))
             .await
@@ -5725,8 +5453,11 @@ mod test {
                 block_context: BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: vec![1, 2, 3],
-                            tag: vec![4, 5, 6],
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
                         },
                     ),
                     hash: 2398419238764,

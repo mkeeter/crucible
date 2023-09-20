@@ -426,8 +426,8 @@ pub(crate) mod up_test {
                 hash: read_response_hash,
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext {
-                        nonce: nonce.to_vec(),
-                        tag: tag.to_vec(),
+                        nonce: nonce.into(),
+                        tag: tag.into(),
                     },
                 ),
             }],
@@ -485,8 +485,8 @@ pub(crate) mod up_test {
                     hash: thread_rng().gen(),
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: thread_rng().gen::<[u8; 12]>().to_vec(),
-                            tag: thread_rng().gen::<[u8; 16]>().to_vec(),
+                            nonce: thread_rng().gen::<[u8; 12]>(),
+                            tag: thread_rng().gen::<[u8; 16]>(),
                         },
                     ),
                 },
@@ -495,8 +495,8 @@ pub(crate) mod up_test {
                     hash: read_response_hash,
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: nonce.to_vec(),
-                            tag: tag.to_vec(),
+                            nonce: nonce.into(),
+                            tag: tag.into(),
                         },
                     ),
                 },
@@ -505,8 +505,8 @@ pub(crate) mod up_test {
                     hash: thread_rng().gen(),
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext {
-                            nonce: thread_rng().gen::<[u8; 12]>().to_vec(),
-                            tag: thread_rng().gen::<[u8; 16]>().to_vec(),
+                            nonce: thread_rng().gen::<[u8; 12]>(),
+                            tag: thread_rng().gen::<[u8; 16]>(),
                         },
                     ),
                 },
@@ -5136,8 +5136,7 @@ pub(crate) mod up_test {
 
         let (nonce, tag, _) = context.encrypt_in_place(&mut data).unwrap();
 
-        let nonce = nonce.to_vec();
-        let mut tag = tag.to_vec();
+        let mut tag: [u8; 16] = tag.into();
 
         // alter tag
         if tag[3] == 0xFF {
@@ -5157,7 +5156,10 @@ pub(crate) mod up_test {
             data: BytesMut::from(&data[..]),
             block_contexts: vec![BlockContext {
                 encryption_context: Some(
-                    crucible_protocol::EncryptionContext { nonce, tag },
+                    crucible_protocol::EncryptionContext {
+                        nonce: nonce.into(),
+                        tag,
+                    },
                 ),
                 hash,
             }],
@@ -5250,9 +5252,6 @@ pub(crate) mod up_test {
 
         let (nonce, tag, _) = context.encrypt_in_place(&mut data).unwrap();
 
-        let nonce = nonce.to_vec();
-        let tag = tag.to_vec();
-
         let response = Ok(vec![ReadResponse {
             eid: request.eid,
             offset: request.offset,
@@ -5260,7 +5259,10 @@ pub(crate) mod up_test {
             data: BytesMut::from(&data[..]),
             block_contexts: vec![BlockContext {
                 encryption_context: Some(
-                    crucible_protocol::EncryptionContext { nonce, tag },
+                    crucible_protocol::EncryptionContext {
+                        nonce: nonce.into(),
+                        tag: tag.into(),
+                    },
                 ),
                 hash: 10000, // junk hash,
             }],
