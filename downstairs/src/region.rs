@@ -106,6 +106,11 @@ pub struct Inner {
 
     /// Is the `ping` or `pong` context slot active?
     active_context: Vec<Option<bool>>,
+
+    /// Local cache for the SQLite `dirty` value
+    ///
+    /// This allows us to only call into SQLite when the value needs to change
+    dirty: bool,
 }
 
 /// An extent can be Opened or Closed. If Closed, it is probably being updated
@@ -171,10 +176,21 @@ impl Inner {
             }
         }
 
+        let dirty = {
+            let mut stmt = metadb.prepare_cached(
+                "SELECT value FROM metadata where name='dirty'",
+            )?;
+            let mut dirty_iter = stmt.query_map([], |row| row.get(0))?;
+            let dirty = dirty_iter.next().unwrap()?;
+            assert!(dirty_iter.next().is_none());
+            dirty
+        };
+
         Ok(Self {
             file,
             metadb,
             active_context,
+            dirty,
             block_size,
             extent_size,
         })
@@ -204,7 +220,9 @@ impl Inner {
     /*
      * The flush and generation numbers will be updated at the same time.
      */
-    fn set_flush_number(&self, new_flush: u64, new_gen: u64) -> Result<()> {
+    fn set_flush_number(&mut self, new_flush: u64, new_gen: u64) -> Result<()> {
+        // TODO: put this into a transaction
+        let tx = self.metadb.unchecked_transaction()?;
         let mut stmt = self.metadb.prepare_cached(
             "UPDATE metadata SET value=?1 WHERE name='flush_number'",
         )?;
@@ -225,18 +243,15 @@ impl Inner {
             .metadb
             .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
         let _rows_affected = stmt.execute([])?;
+        tx.commit()?;
+
+        self.dirty = false;
 
         Ok(())
     }
 
     pub fn dirty(&self) -> Result<bool> {
-        let mut stmt = self
-            .metadb
-            .prepare_cached("SELECT value FROM metadata where name='dirty'")?;
-        let mut dirty_iter = stmt.query_map([], |row| row.get(0))?;
-        let dirty = dirty_iter.next().unwrap()?;
-        assert!(dirty_iter.next().is_none());
-        Ok(dirty)
+        Ok(self.dirty)
     }
 
     fn get_block_context(
@@ -262,13 +277,16 @@ impl Inner {
         Ok(out)
     }
 
-    fn set_dirty(&self) -> Result<()> {
-        let _ = self
-            .metadb
-            .prepare_cached(
-                "UPDATE metadata SET value=1 WHERE name='dirty' AND value=0",
-            )?
-            .execute([])?;
+    fn set_dirty(&mut self) -> Result<()> {
+        if !self.dirty {
+            let _ = self
+                .metadb
+                .prepare_cached(
+                    "UPDATE metadata SET value=1 WHERE name='dirty' AND value=0",
+                )?
+                .execute([])?;
+            self.dirty = true;
+        }
         Ok(())
     }
 
@@ -829,6 +847,7 @@ impl Extent {
             inner: Mutex::new(Inner {
                 file,
                 metadb,
+                dirty: false, // TODO read this from metadb to confirm
                 active_context: vec![None; def.extent_size().value as usize],
                 block_size: def.block_size(),
                 extent_size: def.extent_size().value,
@@ -1308,9 +1327,7 @@ impl Extent {
 
         // We put all of our metadb updates into a single transaction to
         // assure that we have a single sync.
-        let tx = inner.metadb.unchecked_transaction()?;
         inner.set_flush_number(new_flush, new_gen)?;
-        tx.commit()?;
 
         // Finally, reset the file's seek offset to 0
         inner.file.seek(SeekFrom::Start(0))?;
@@ -2596,6 +2613,7 @@ mod test {
             metadb: Connection::open_in_memory().unwrap(),
             block_size: 512,
             extent_size: 100,
+            dirty: false,
             active_context: vec![None; 100],
         };
 
