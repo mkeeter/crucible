@@ -106,7 +106,7 @@ pub async fn dump_region(
                 ext_version: 0,
                 gen_number: inner.gen_number().unwrap(),
                 flush_number: inner.flush_number().unwrap(),
-                dirty: inner.dirty().unwrap(),
+                dirty: inner.dirty,
             };
 
             /*

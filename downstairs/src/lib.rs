@@ -375,43 +375,18 @@ pub mod cdt {
     fn submit__write__done(_: u64) {}
     fn submit__flush__done(_: u64) {}
     fn extent__flush__start(job_id: u64, extent_id: u32, extent_size: u64) {}
-    fn extent__flush__done(job_id: u64, extent_id: u32, extent_size: u64) {}
-    fn extent__flush__file__start(
-        job_id: u64,
-        extent_id: u32,
-        extent_size: u64,
-    ) {
-    }
-    fn extent__flush__file__done(
-        job_id: u64,
-        extent_id: u32,
-        extent_size: u64,
-    ) {
-    }
-    fn extent__flush__collect__hashes__start(
-        job_id: u64,
-        extent_id: u32,
-        num_dirty: u64,
-    ) {
-    }
+    fn extent__flush__done(job_id: u64, extent_id: u32) {}
+    fn extent__flush__file__start(job_id: u64, extent_id: u32) {}
+    fn extent__flush__file__done(job_id: u64, extent_id: u32) {}
+    fn extent__flush__collect__hashes__start(job_id: u64, extent_id: u32) {}
     fn extent__flush__collect__hashes__done(
         job_id: u64,
         extent_id: u32,
         num_rehashed: u64,
     ) {
     }
-    fn extent__flush__sqlite__insert__start(
-        job_id: u64,
-        extent_id: u32,
-        extent_size: u64,
-    ) {
-    }
-    fn extent__flush__sqlite__insert__done(
-        _job_id: u64,
-        _extent_id: u32,
-        extent_size: u64,
-    ) {
-    }
+    fn extent__flush__sqlite__insert__start(job_id: u64, extent_id: u32) {}
+    fn extent__flush__sqlite__insert__done(_job_id: u64, _extent_id: u32) {}
     fn extent__write__start(job_id: u64, extent_id: u32, n_blocks: u64) {}
     fn extent__write__done(job_id: u64, extent_id: u32, n_blocks: u64) {}
     fn extent__write__get__hashes__start(
@@ -3771,11 +3746,14 @@ mod test {
             block_context: BlockContext {
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext {
-                        nonce: vec![1, 2, 3],
-                        tag: vec![4, 5, 6],
+                        nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                        tag: [
+                            4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                            18, 19,
+                        ],
                     },
                 ),
-                hash: 4798852240582462654, // Hash for all 9s
+                hash: 14137680576404864188, // Hash for all 9s
             },
         }]
     }

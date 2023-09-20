@@ -5981,8 +5981,8 @@ impl Upstairs {
                 (
                     Bytes::copy_from_slice(&mut_data),
                     Some(crucible_protocol::EncryptionContext {
-                        nonce: Vec::from(nonce.as_slice()),
-                        tag: Vec::from(tag.as_slice()),
+                        nonce: nonce.into(),
+                        tag: tag.into(),
                     }),
                     hash,
                 )
@@ -10406,7 +10406,7 @@ async fn show_all_work(up: &Arc<Upstairs>) -> WQCounts {
     let gior = up.guest_io_ready().await;
     let up_count = up.guest.guest_work.lock().await.active.len();
 
-    let mut ds = up.downstairs.lock().await;
+    let ds = up.downstairs.lock().await;
     let ds_count = ds.ds_active.len();
 
     println!(
