@@ -38,12 +38,16 @@ pub async fn dynamometer(
         let block = (0..ddef.block_size() as usize)
             .map(|_| rng.sample(rand::distributions::Standard))
             .collect::<Vec<u8>>();
-        let nonce = (0..12)
+        let nonce: [u8; 12] = (0..12)
             .map(|_| rng.sample(rand::distributions::Standard))
-            .collect::<Vec<u8>>();
-        let tag = (0..16)
+            .collect::<Vec<u8>>()
+            .try_into()
+            .unwrap();
+        let tag: [u8; 16] = (0..16)
             .map(|_| rng.sample(rand::distributions::Standard))
-            .collect::<Vec<u8>>();
+            .collect::<Vec<u8>>()
+            .try_into()
+            .unwrap();
 
         let hash = integrity_hash(&[&nonce, &tag, &block]);
 
@@ -55,8 +59,6 @@ pub async fn dynamometer(
                 }
 
                 let block = block.clone();
-                let nonce = nonce.clone();
-                let tag = tag.clone();
 
                 let writes: Vec<_> = (0..num_writes)
                     .map(|i| crucible_protocol::Write {
@@ -70,8 +72,8 @@ pub async fn dynamometer(
                             hash,
                             encryption_context: Some(
                                 crucible_protocol::EncryptionContext {
-                                    nonce: nonce.clone(),
-                                    tag: tag.clone(),
+                                    nonce,
+                                    tag,
                                 },
                             ),
                         },
