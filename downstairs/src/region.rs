@@ -1136,7 +1136,6 @@ impl Extent {
                 // Query hashes for the write range.
                 // TODO we should consider adding a query that doesnt actually
                 // give us back the data, just checks for its presence.
-                println!("checking stufffff");
                 let block_contexts = inner.get_block_contexts(
                     first_write.offset.value,
                     n_contiguous_writes as u64,
@@ -1169,7 +1168,6 @@ impl Extent {
         // Write all the metadata to the DB
         // TODO right now we're including the integrity_hash() time in the sqlite time. It's small in
         // comparison right now, but worth being aware of when looking at dtrace numbers
-        println!("marking {} as dirty!", self.number);
         cdt::extent__write__sqlite__insert__start!(|| {
             (job_id.0, self.number, writes.len() as u64)
         });
@@ -5277,7 +5275,6 @@ mod test {
 
         // Reopen, then flush extent with eid, fn, gen
         region.reopen_extent(eid as usize).await.unwrap();
-        println!("calling region_flush_extent");
         region
             .region_flush_extent(eid as usize, 4, 9, JobId(1))
             .await
