@@ -4133,17 +4133,20 @@ mod test {
         let ext = region.get_opened_extent(0).await;
 
         // Partial write, the data never hits disk, but there's a context
-        // in the DB
+        // in the DB.  In our actual code, we don't store the new slot in
+        // `inner.active_context` until after the write succeeds, so we also
+        // drop it on the floor here.
         {
             let mut inner = ext.inner.lock().await;
-            inner.set_block_contexts(&[&DownstairsBlockContext {
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash: 1024,
-                },
-                block: 0,
-                on_disk_hash: 65536,
-            }])?;
+            let _new_slot =
+                inner.tx_set_block_context(&DownstairsBlockContext {
+                    block_context: BlockContext {
+                        encryption_context: None,
+                        hash: 1024,
+                    },
+                    block: 0,
+                    on_disk_hash: 65536,
+                })?;
         }
 
         // Writing to block 0 should succeed with only_write_unwritten
