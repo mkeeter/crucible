@@ -437,6 +437,8 @@ async fn cmd_write<T: BlockIO>(
     let cmd_count = num_bytes / (opt.iocmd_block_count * native_block_size);
     let remainder = num_bytes % (opt.iocmd_block_count * native_block_size);
 
+    println!("starting write");
+    let mut times = vec![];
     // Issue all of our write commands
     for i in 0..cmd_count {
         // which blocks in the underlying store are we accessing?
@@ -460,6 +462,7 @@ async fn cmd_write<T: BlockIO>(
         }
         total_bytes_written += n_read;
 
+        let mut start = None;
         if n_read < w_buf.capacity() {
             eprintln!("n_read was {}, returning early", n_read);
             write_remainder_and_finalize(
@@ -474,13 +477,16 @@ async fn cmd_write<T: BlockIO>(
             return Ok(total_bytes_written);
         } else {
             // good to go for a write
-            let w_future = crucible.write(offset, w_buf.freeze());
-            futures.push_back(w_future);
+            start = Some(std::time::Instant::now());
+            futures.push_back(crucible.write(offset, w_buf.freeze()));
         }
 
         // Block on oldest future so we dont get a backlog
         if futures.len() == opt.pipeline_length {
             futures.pop_front().unwrap().await?;
+            let dt = start.unwrap().elapsed();
+            //println!("{:?}", dt);
+            times.push(dt);
         }
 
         if early_shutdown.try_recv().is_ok() {
@@ -490,6 +496,15 @@ async fn cmd_write<T: BlockIO>(
             return Ok(total_bytes_written);
         }
     }
+    let sum: f64 = times.iter().map(|t| t.as_micros() as f64).sum();
+    let mean = sum / times.len() as f64;
+    let variance = times
+        .iter()
+        .map(|t| (t.as_micros() as f64 - mean).powf(2.0))
+        .sum::<f64>()
+        / times.len() as f64;
+    let stdev = variance.sqrt();
+    println!("{mean} ± {stdev} microseconds");
 
     // Finalize. RMW if needed for alignment
     if remainder > 0 {
