@@ -332,6 +332,7 @@ mod cdt {
     fn ds__read__io__done(_: u64, _: u8) {}
     fn ds__write__io__done(_: u64, _: u8) {}
     fn ds__write__unwritten__io__done(_: u64, _: u8) {}
+    fn ds__lock__time(_: u64) {}
     fn ds__flush__io__done(_: u64, _: u8) {}
     fn ds__close__done(_: u64, _: u8) {}
     fn ds__repair__done(_: u64, _: u8) {}
@@ -5146,7 +5147,7 @@ pub struct Upstairs {
      * upstairs and downstairs. New work for downstairs is generated
      * inside the upstairs on behalf of IO requests coming from the guest.
      */
-    downstairs: Mutex<Downstairs>,
+    downstairs: FunMutex<Downstairs>,
 
     /*
      * The flush info Vec is only used when first connecting or
@@ -5209,6 +5210,19 @@ pub struct Upstairs {
      * Logger used by the upstairs
      */
     log: Logger,
+}
+
+#[derive(Debug)]
+struct FunMutex<T>(Mutex<T>);
+
+impl<T> FunMutex<T> {
+    async fn lock(&self) -> MutexGuard<T> {
+        let start = std::time::Instant::now();
+        let out = self.0.lock().await;
+        let dt = start.elapsed().as_micros();
+        cdt::ds__lock__time!(|| dt as u64);
+        out
+    }
 }
 
 impl Upstairs {
@@ -5287,7 +5301,7 @@ impl Upstairs {
             session_id: Uuid::new_v4(),
             generation: Mutex::new(gen),
             guest,
-            downstairs: Mutex::new(Downstairs::new(log.clone(), ds_target)),
+            downstairs: FunMutex(Mutex::new(Downstairs::new(log.clone(), ds_target))),
             flush_info: Mutex::new(FlushInfo::new()),
             ddef: Mutex::new(rd_status),
             encryption_context,
@@ -5871,13 +5885,6 @@ impl Upstairs {
             return Err(());
         }
 
-        /*
-         * Get the next ID for the guest work struct we will make at the
-         * end. This ID is also put into the IO struct we create that
-         * handles the operation(s) on the storage side.
-         */
-        let mut gw = self.guest.guest_work.lock().await;
-        let mut downstairs = self.downstairs.lock().await;
         let ddef = self.ddef.lock().await.get_def().unwrap();
 
         /*
@@ -5906,26 +5913,6 @@ impl Upstairs {
             offset,
             Block::from_bytes(data.len(), &ddef),
         );
-
-        /*
-         * Grab this ID after extent_from_offset: in case of Err we don't
-         * want to create a gap in the IDs.
-         */
-        let gw_id: u64 = gw.next_gw_id();
-        if is_write_unwritten {
-            cdt::gw__write__unwritten__start!(|| (gw_id));
-        } else {
-            cdt::gw__write__start!(|| (gw_id));
-        }
-
-        // The impacted blocks may span our extent under repair.  If that's the
-        // case, then reserve repair jobs now (but do not enqueue them); this
-        // makes our dependencies correct.
-        downstairs.check_repair_ids_for_range(impacted_blocks);
-
-        // After reserving any LiveRepair IDs, go get one for this job.
-        // This is required to avoid circular dependencies.
-        let next_id = downstairs.next_id();
 
         let mut writes: Vec<crucible_protocol::Write> =
             Vec::with_capacity(impacted_blocks.len(&ddef));
@@ -5983,6 +5970,33 @@ impl Upstairs {
 
             cur_offset += byte_len;
         }
+
+        /*
+         * Get the next ID for the guest work struct we will make at the
+         * end. This ID is also put into the IO struct we create that
+         * handles the operation(s) on the storage side.
+         */
+        let mut gw = self.guest.guest_work.lock().await;
+        let mut downstairs = self.downstairs.lock().await;
+        /*
+         * Grab this ID after extent_from_offset: in case of Err we don't
+         * want to create a gap in the IDs.
+         */
+        let gw_id: u64 = gw.next_gw_id();
+        if is_write_unwritten {
+            cdt::gw__write__unwritten__start!(|| (gw_id));
+        } else {
+            cdt::gw__write__start!(|| (gw_id));
+        }
+
+        // The impacted blocks may span our extent under repair.  If that's the
+        // case, then reserve repair jobs now (but do not enqueue them); this
+        // makes our dependencies correct.
+        downstairs.check_repair_ids_for_range(impacted_blocks);
+
+        // After reserving any LiveRepair IDs, go get one for this job.
+        // This is required to avoid circular dependencies.
+        let next_id = downstairs.next_id();
 
         let wr = create_write_eob(
             &mut downstairs,
@@ -9461,12 +9475,12 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
          * process the set of things we know are done now, then the
          * ds_done_rx.recv() should trigger when we loop.
          */
-        let ack_list = up.downstairs.lock().await.ackable_work();
 
+        let mut gw_complete = vec![];
+        let mut ds = up.downstairs.lock().await;
+        let ack_list = ds.ackable_work();
         let jobs_checked = ack_list.len();
-        let mut gw = up.guest.guest_work.lock().await;
         for ds_id_done in ack_list.iter() {
-            let mut ds = up.downstairs.lock().await;
             debug!(up.log, "up_ds_listen process {}", ds_id_done);
 
             let mut handle = ds.ds_active.get_mut(ds_id_done).unwrap();
@@ -9494,12 +9508,17 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
             ds.ack(ds_id);
             debug!(ds.log, "[A] ack job {}:{}", ds_id, gw_id);
 
-            gw.gw_ds_complete(gw_id, ds_id, data, ds.result(ds_id), &up.log)
-                .await;
+            gw_complete.push((gw_id, ds_id, data, ds.result(ds_id)));
 
             ds.cdt_gw_work_done(ds_id, gw_id, io_size, &up.stats).await;
 
             ds.retire_check(ds_id);
+        }
+        drop(ds);
+        let mut gw = up.guest.guest_work.lock().await;
+        for (gw_id, ds_id, data, result) in gw_complete {
+            gw.gw_ds_complete(gw_id, ds_id, data, result, &up.log)
+                .await;
         }
         debug!(
             up.log,

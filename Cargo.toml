@@ -125,3 +125,5 @@ repair-client = { path = "./repair-client" }
 [profile.dev]
 panic = 'abort'
 
+[profile.release]
+debug = true
