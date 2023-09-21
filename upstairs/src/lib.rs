@@ -732,7 +732,8 @@ where
      * This XXX is for coming back here and making a better job of
      * flow control.
      */
-    let mut new_work = u.downstairs.lock().await.new_work(client_id);
+    let mut ds = u.downstairs.lock().await;
+    let mut new_work = ds.new_work(client_id);
 
     /*
      * Now we have a list of all the job IDs that are new for our client id.
@@ -742,7 +743,9 @@ where
      * to do work, we would have to start over and look at all jobs in the
      * map to see if they are new.
      */
-    let mut active_count = u.downstairs.lock().await.submitted_work(client_id);
+    let mut active_count = ds.submitted_work(client_id);
+    drop(ds);
+
     while let Some(new_id) = new_work.pop_first() {
         if active_count >= MAX_ACTIVE_COUNT {
             // Flow control enacted, stop sending work -- and requeue all of
@@ -781,15 +784,12 @@ where
                 dependencies,
                 writes,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__write__io__start!(|| (new_id.0, client_id.get()));
                 fw.send(Message::Write {
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps,
+                    dependencies,
                     writes,
                 })
                 .await?
@@ -798,9 +798,6 @@ where
                 dependencies,
                 writes,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__write__unwritten__io__start!(|| (
                     new_id.0,
                     client_id.get()
@@ -809,7 +806,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps,
+                    dependencies,
                     writes,
                 })
                 .await?
@@ -821,9 +818,6 @@ where
                 snapshot_details,
                 extent_limit,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 // If our downstairs is under repair, then include any extent
                 // limit sent in the IOop.
                 let my_extent_limit = if u.downstairs.lock().await.ds_state
@@ -839,7 +833,7 @@ where
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps,
+                    dependencies,
                     flush_number,
                     gen_number,
                     snapshot_details,
@@ -851,15 +845,12 @@ where
                 dependencies,
                 requests,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__read__io__start!(|| (new_id.0, client_id.get()));
                 fw.send(Message::ReadRequest {
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps,
+                    dependencies,
                     requests,
                 })
                 .await?
@@ -881,9 +872,6 @@ where
                 source_downstairs: _,
                 repair_downstairs,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__close__start!(|| (new_id.0, client_id.get(), extent));
                 if repair_downstairs.contains(&client_id) {
                     // We are the downstairs being repaired, so just close.
@@ -891,7 +879,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps,
+                        dependencies,
                         extent_id: extent,
                     })
                     .await?
@@ -900,7 +888,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps,
+                        dependencies,
                         extent_id: extent,
                         flush_number,
                         gen_number,
@@ -915,16 +903,13 @@ where
                 source_repair_address,
                 repair_downstairs,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__repair__start!(|| (new_id.0, client_id.get(), extent));
                 if repair_downstairs.contains(&client_id) {
                     fw.send(Message::ExtentLiveRepair {
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps,
+                        dependencies,
                         extent_id: extent,
                         source_client_id: source_downstairs,
                         source_repair_address,
@@ -935,7 +920,7 @@ where
                         upstairs_id: u.uuid,
                         session_id: u.session_id,
                         job_id: new_id,
-                        dependencies: deps,
+                        dependencies,
                     })
                     .await?
                 }
@@ -944,29 +929,23 @@ where
                 dependencies,
                 extent,
             } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__reopen__start!(|| (new_id.0, client_id.get(), extent));
                 fw.send(Message::ExtentLiveReopen {
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps,
+                    dependencies,
                     extent_id: extent,
                 })
                 .await?
             }
             IOop::ExtentLiveNoOp { dependencies } => {
-                let deps = u
-                    .live_repair_dep_check(client_id, dependencies, new_id)
-                    .await;
                 cdt::ds__noop__start!(|| (new_id.0, client_id.get()));
                 fw.send(Message::ExtentLiveNoOp {
                     upstairs_id: u.uuid,
                     session_id: u.session_id,
                     job_id: new_id,
-                    dependencies: deps,
+                    dependencies,
                 })
                 .await?
             }
@@ -3064,6 +3043,25 @@ impl Downstairs {
         self.next_id
     }
 
+    /// Look to see if this specific downstairs is in LiveRepair, and if so,
+    /// apply special consideration for dependencies, as they could be unique
+    /// for this downstairs.
+    ///
+    /// First off, any job that was "skipped" should not be a dependency for
+    /// this specific downstairs.  In addition, any job that happened before
+    /// the skipped jobs that was marked as "Done" should also be removed, as
+    /// there will be no replay here and we are basically rebuilding this
+    /// downstairs from other downstairs.
+    fn live_repair_dep_check(
+        &mut self,
+        client_id: ClientId,
+        deps: &mut Vec<JobId>,
+        ds_id: JobId,
+    ) {
+        if self.dependencies_need_cleanup(client_id) {
+            self.remove_dep_if_live_repair(client_id, deps, ds_id)
+        }
+    }
     /**
      * Mark this request as in progress for this client, and return a copy
      * of the details of the request.
@@ -3098,7 +3096,28 @@ impl Downstairs {
         assert_eq!(old_state, IOState::New);
         self.io_state_count.decr(&old_state, client_id);
         self.io_state_count.incr(&new_state, client_id);
-        Some(job.work.clone())
+
+        let mut out = job.work.clone();
+        drop(handle);
+        match &mut out {
+            IOop::Write { dependencies, .. }
+            | IOop::WriteUnwritten { dependencies, .. }
+            | IOop::Flush { dependencies, .. }
+            | IOop::Read { dependencies, .. }
+            | IOop::ExtentFlushClose { dependencies, .. }
+            | IOop::ExtentLiveRepair { dependencies, .. }
+            | IOop::ExtentLiveReopen { dependencies, .. }
+            | IOop::ExtentLiveNoOp { dependencies } => {
+                self.live_repair_dep_check(client_id, dependencies, ds_id);
+            }
+            IOop::ExtentClose { .. } => {
+                // This command should never exist on the upstairs side.
+                // We only construct it for downstairs IO, after
+                // receiving ExtentLiveClose from the upstairs.
+                panic!("[{}] Received illegal IOop::ExtentClose", client_id);
+            }
+        }
+        Some(out)
     }
 
     /*
@@ -3119,9 +3138,9 @@ impl Downstairs {
     fn remove_dep_if_live_repair(
         &mut self,
         client_id: ClientId,
-        mut deps: Vec<JobId>,
+        deps: &mut Vec<JobId>,
         ds_id: JobId,
-    ) -> Vec<JobId> {
+    ) {
         debug!(
             self.log,
             "[{}] {} Remove check skipped:{:?} from deps:{:?}",
@@ -3152,7 +3171,6 @@ impl Downstairs {
             self.log,
             "[{}] {} final dependency list {:?}", client_id, ds_id, deps
         );
-        deps
     }
 
     /**
@@ -5301,7 +5319,10 @@ impl Upstairs {
             session_id: Uuid::new_v4(),
             generation: Mutex::new(gen),
             guest,
-            downstairs: FunMutex(Mutex::new(Downstairs::new(log.clone(), ds_target))),
+            downstairs: FunMutex(Mutex::new(Downstairs::new(
+                log.clone(),
+                ds_target,
+            ))),
             flush_info: Mutex::new(FlushInfo::new()),
             ddef: Mutex::new(rd_status),
             encryption_context,
@@ -5554,32 +5575,6 @@ impl Upstairs {
                 info!(self.log, "All DS in the proper state! -> INIT");
                 active.up_state = UpState::Initializing;
             }
-        }
-    }
-
-    /*
-     * Look to see if this specific downstairs is in LiveRepair, and if so,
-     * apply special consideration for dependencies, as they could be unique
-     * for this downstairs.
-     *
-     * First off, any job that was "skipped" should not be a dependency for
-     * this specific downstairs.  In addition, any job that happened before
-     * the skipped jobs that was marked as "Done" should also be removed, as
-     * there will be no replay here and we are basically rebuilding this
-     * downstairs from other downstairs.
-     */
-    async fn live_repair_dep_check(
-        &self,
-        client_id: ClientId,
-        deps: Vec<JobId>,
-        ds_id: JobId,
-    ) -> Vec<JobId> {
-        let mut ds = self.downstairs.lock().await;
-
-        if ds.dependencies_need_cleanup(client_id) {
-            ds.remove_dep_if_live_repair(client_id, deps, ds_id)
-        } else {
-            deps
         }
     }
 
@@ -9517,8 +9512,7 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
         drop(ds);
         let mut gw = up.guest.guest_work.lock().await;
         for (gw_id, ds_id, data, result) in gw_complete {
-            gw.gw_ds_complete(gw_id, ds_id, data, result, &up.log)
-                .await;
+            gw.gw_ds_complete(gw_id, ds_id, data, result, &up.log).await;
         }
         debug!(
             up.log,
