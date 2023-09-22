@@ -332,7 +332,7 @@ mod cdt {
     fn ds__read__io__done(_: u64, _: u8) {}
     fn ds__write__io__done(_: u64, _: u8) {}
     fn ds__write__unwritten__io__done(_: u64, _: u8) {}
-    fn ds__lock__time(_: u64) {}
+    fn ds__lock__time(_: u64, _: u64) {}
     fn ds__flush__io__done(_: u64, _: u8) {}
     fn ds__close__done(_: u64, _: u8) {}
     fn ds__repair__done(_: u64, _: u8) {}
@@ -5158,7 +5158,7 @@ pub struct Upstairs {
     /*
      * Is this Upstairs active, or just attaching inactive?
      */
-    active: Mutex<UpstairsState>,
+    active: FunMutex<UpstairsState, 1>,
 
     /*
      * Upstairs UUID
@@ -5187,7 +5187,7 @@ pub struct Upstairs {
      * upstairs and downstairs. New work for downstairs is generated
      * inside the upstairs on behalf of IO requests coming from the guest.
      */
-    downstairs: FunMutex<Downstairs>,
+    downstairs: FunMutex<Downstairs, 0>,
 
     /*
      * `ClientInfo<DsState>` that's shared with the downstairs atomically
@@ -5258,14 +5258,14 @@ pub struct Upstairs {
 }
 
 #[derive(Debug)]
-struct FunMutex<T>(Mutex<T>);
+struct FunMutex<T, const N: u64>(Mutex<T>);
 
-impl<T> FunMutex<T> {
+impl<T, const N: u64> FunMutex<T, N> {
     async fn lock(&self) -> MutexGuard<T> {
         let start = std::time::Instant::now();
         let out = self.0.lock().await;
         let dt = start.elapsed().as_micros();
-        cdt::ds__lock__time!(|| dt as u64);
+        cdt::ds__lock__time!(|| (dt as u64, N));
         out
     }
 }
@@ -5343,7 +5343,7 @@ impl Upstairs {
         let ds = Downstairs::new(log.clone(), ds_target);
         let ds_state = ds.ds_state.clone();
         Arc::new(Upstairs {
-            active: Mutex::new(UpstairsState::default()),
+            active: FunMutex(Mutex::new(UpstairsState::default())),
             uuid,
             session_id: Uuid::new_v4(),
             generation: Mutex::new(gen),
@@ -8920,7 +8920,7 @@ pub struct Guest {
      * the submission task tells the listening task that new work has been
      * added.
      */
-    reqs: Mutex<VecDeque<BlockReq>>,
+    reqs: FunMutex<VecDeque<BlockReq>, 2>,
     notify: Notify,
 
     /*
@@ -8935,7 +8935,7 @@ pub struct Guest {
      * data is decrypted back to the guest provided buffer after all the
      * required downstairs operations are completed.
      */
-    guest_work: Mutex<GuestWork>,
+    guest_work: FunMutex<GuestWork, 3>,
 
     /*
      * Setting an IOP limit means that the rate at which block reqs are
@@ -8968,7 +8968,7 @@ impl Guest {
             /*
              * Incoming I/O requests are added to this queue.
              */
-            reqs: Mutex::new(VecDeque::new()),
+            reqs: FunMutex(Mutex::new(VecDeque::new())),
             notify: Notify::new(),
             /*
              * The active hashmap is for in-flight I/O operations
@@ -8977,11 +8977,11 @@ impl Guest {
              * Note that a single IO from outside may have multiple I/O
              * requests that need to finish before we can complete that IO.
              */
-            guest_work: Mutex::new(GuestWork {
+            guest_work: FunMutex(Mutex::new(GuestWork {
                 active: HashMap::new(), // GtoS
                 next_gw_id: 1,
                 completed: AllocRingBuffer::new(2048),
-            }),
+            })),
 
             iop_tokens: Mutex::new(0),
             bytes_per_iop: None,
