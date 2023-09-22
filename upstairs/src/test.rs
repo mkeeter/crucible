@@ -167,7 +167,7 @@ pub(crate) mod up_test {
         offset: Block,
         num_blocks: u64,
     ) -> Vec<(u64, Block)> {
-        let ddef = &up.ddef.lock().await.get_def().unwrap();
+        let ddef = &up.ddef.lock().unwrap().get_def().unwrap();
         let num_blocks = Block::new_with_ddef(num_blocks, ddef);
         extent_from_offset(ddef, offset, num_blocks)
             .blocks(ddef)
@@ -746,14 +746,14 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(next_id);
 
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -808,14 +808,14 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(next_id);
 
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -874,14 +874,14 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(next_id);
 
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -936,13 +936,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1007,13 +1007,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1076,13 +1076,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1142,13 +1142,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
         let (_request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1207,7 +1207,7 @@ pub(crate) mod up_test {
 
         let (request, iblocks) = generic_read_request();
         let next_id = {
-            let mut ds = upstairs.downstairs.lock().await;
+            let mut ds = upstairs.downstairs.lock();
 
             let next_id = ds.next_id();
 
@@ -1219,7 +1219,7 @@ pub(crate) mod up_test {
                 vec![request.clone()],
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             ds.in_progress(next_id, ClientId::new(0));
             ds.in_progress(next_id, ClientId::new(1));
@@ -1249,7 +1249,7 @@ pub(crate) mod up_test {
         {
             // emulated run in up_ds_listen
 
-            let mut ds = upstairs.downstairs.lock().await;
+            let mut ds = upstairs.downstairs.lock();
             let state = ds.ds_active.get(&next_id).unwrap().ack_status;
             assert_eq!(state, AckStatus::AckReady);
             ds.ack(next_id);
@@ -1268,7 +1268,7 @@ pub(crate) mod up_test {
             .unwrap());
 
         {
-            let mut ds = upstairs.downstairs.lock().await;
+            let mut ds = upstairs.downstairs.lock();
             assert_eq!(ds.ackable_work().len(), 0);
             // Work won't be completed until we get a flush.
             assert_eq!(ds.completed.len(), 0);
@@ -1281,13 +1281,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1335,13 +1335,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1392,7 +1392,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1448,13 +1448,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1510,13 +1510,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1565,13 +1565,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1613,13 +1613,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1673,7 +1673,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
@@ -1689,7 +1689,7 @@ pub(crate) mod up_test {
             is_write_unwritten,
         );
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -1770,7 +1770,7 @@ pub(crate) mod up_test {
         up.ds_transition(ClientId::new(1), DsState::Faulted).await;
 
         let mut gw = up.guest.guest_work.lock().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let gw_id = 19;
         let next_id = JobId(1010);
@@ -1795,7 +1795,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
@@ -1865,7 +1865,7 @@ pub(crate) mod up_test {
         up.ds_transition(ClientId::new(2), DsState::Faulted).await;
 
         let mut gw = up.guest.guest_work.lock().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let gw_id = 19;
         let next_id = JobId(1010);
@@ -1890,7 +1890,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
 
         ds.process_ds_completion(
@@ -1947,7 +1947,7 @@ pub(crate) mod up_test {
         up.ds_transition(ClientId::new(2), DsState::Faulted).await;
 
         let mut gw = up.guest.guest_work.lock().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let gw_id = 19;
         let next_id = JobId(1010);
@@ -1972,7 +1972,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
 
@@ -2037,7 +2037,7 @@ pub(crate) mod up_test {
         up.ds_transition(ClientId::new(1), DsState::Faulted).await;
 
         let mut gw = up.guest.guest_work.lock().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let gw_id = 19;
         let next_id = JobId(1010);
@@ -2059,7 +2059,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
@@ -2118,7 +2118,7 @@ pub(crate) mod up_test {
         up.ds_transition(ClientId::new(2), DsState::Faulted).await;
 
         let mut gw = up.guest.guest_work.lock().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let gw_id = 19;
         let next_id = JobId(1010);
@@ -2140,7 +2140,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
 
         ds.process_ds_completion(
@@ -2186,7 +2186,7 @@ pub(crate) mod up_test {
         up.ds_transition(ClientId::new(0), DsState::Faulted).await;
 
         let mut gw = up.guest.guest_work.lock().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let gw_id = 19;
         let next_id = JobId(1010);
@@ -2208,7 +2208,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
 
@@ -2261,7 +2261,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
@@ -2269,7 +2269,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -2335,7 +2335,7 @@ pub(crate) mod up_test {
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -2399,14 +2399,14 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Build our read, put it into the work queue
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Move the work to submitted like we sent it to each downstairs
         ds.in_progress(next_id, ClientId::new(0));
@@ -2477,7 +2477,7 @@ pub(crate) mod up_test {
         let deps = ds.ds_active.deps_for_flush(next_id);
         let op = create_flush(next_id, deps, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -2536,14 +2536,14 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Build our read, put it into the work queue
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Move the work to submitted like we sent it to each downstairs
         ds.in_progress(next_id, ClientId::new(0));
@@ -2578,7 +2578,7 @@ pub(crate) mod up_test {
         let deps = ds.ds_active.deps_for_flush(next_id);
         let op = create_flush(next_id, deps, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Send and complete the Flush at each downstairs.
         for cid in ClientId::iter() {
@@ -2628,7 +2628,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         upstairs.set_active().await.unwrap();
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Create two writes, put them on the work queue
         let id1 = ds.next_id();
@@ -2643,7 +2643,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         let (request, iblocks) = generic_write_request();
         let op = create_write_eob(
@@ -2654,7 +2654,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Simulate sending both writes to downstairs 0 and 1
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -2716,7 +2716,7 @@ pub(crate) mod up_test {
         let flush_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(flush_id);
         let op = create_flush(flush_id, dep, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Simulate sending the flush to downstairs 0 and 1
         ds.in_progress(flush_id, ClientId::new(0));
@@ -2823,7 +2823,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Build our write IO.
         let next_id = ds.next_id();
@@ -2838,7 +2838,7 @@ pub(crate) mod up_test {
             is_write_unwritten,
         );
         // Put the write on the queue.
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the write to all three downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -2888,7 +2888,7 @@ pub(crate) mod up_test {
         let next_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(next_id);
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the flush to all three downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -2956,7 +2956,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Build two writes, put them on the work queue.
         let id1 = ds.next_id();
@@ -2971,7 +2971,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         let (request, iblocks) = generic_write_request();
         let op = create_write_eob(
@@ -2982,7 +2982,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the two writes, to 2/3 of the downstairs.
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3044,7 +3044,7 @@ pub(crate) mod up_test {
         let flush_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(flush_id);
         let op = create_flush(flush_id, dep, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Send the flush to two downstairs.
         ds.in_progress(flush_id, ClientId::new(0));
@@ -3140,12 +3140,12 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Build our read IO and submit it to the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to all three downstairs
         ds.in_progress(next_id, ClientId::new(0));
@@ -3190,12 +3190,12 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Build a read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3276,12 +3276,12 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Create the read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3370,12 +3370,12 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Create the read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3463,12 +3463,12 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Create the read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3566,7 +3566,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Create the write and put it on the work queue.
         let id1 = ds.next_id();
@@ -3579,7 +3579,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to two downstairs.
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3661,7 +3661,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         // Create the write and put it on the work queue.
         let id1 = ds.next_id();
@@ -3674,7 +3674,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the write to two downstairs.
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3877,7 +3877,7 @@ pub(crate) mod up_test {
         let up = make_upstairs();
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ds_state.set(ClientId::new(0), DsState::Active);
         ds.ds_state.set(ClientId::new(1), DsState::Active);
         ds.ds_state.set(ClientId::new(2), DsState::Active);
@@ -3894,7 +3894,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the writes
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3908,7 +3908,7 @@ pub(crate) mod up_test {
         up.set_deactivate(None, ds_done_tx.clone()).await.unwrap();
         let flush_id = JobId(id1.0 + 1);
 
-        ds = up.downstairs.lock().await;
+        ds = up.downstairs.lock();
         // Complete the writes
         ds.process_ds_completion(
             id1,
@@ -3983,7 +3983,7 @@ pub(crate) mod up_test {
         up.deactivate_transition_check().await;
         assert!(up.is_deactivating().await);
 
-        ds = up.downstairs.lock().await;
+        ds = up.downstairs.lock();
         // Make sure the correct DS have changed state.
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Deactivated);
         assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::Deactivated);
@@ -4017,7 +4017,7 @@ pub(crate) mod up_test {
         assert!(!up.is_deactivating().await);
 
         // Verify after the ds_missing, all downstairs are New
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::New);
         assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::New);
         assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::New);
@@ -4033,7 +4033,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ds_state.set(ClientId::new(0), DsState::Active);
         ds.ds_state.set(ClientId::new(1), DsState::Active);
         ds.ds_state.set(ClientId::new(2), DsState::Active);
@@ -4046,7 +4046,7 @@ pub(crate) mod up_test {
         assert!(up.ds_deactivate(ClientId::new(1)).await);
         assert!(up.ds_deactivate(ClientId::new(2)).await);
 
-        ds = up.downstairs.lock().await;
+        ds = up.downstairs.lock();
         // Make sure the correct DS have changed state.
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Deactivated);
         assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Deactivated);
@@ -4080,7 +4080,7 @@ pub(crate) mod up_test {
         let up = make_upstairs();
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ds_state.set(ClientId::new(0), DsState::Active);
         ds.ds_state.set(ClientId::new(1), DsState::Active);
         ds.ds_state.set(ClientId::new(2), DsState::Active);
@@ -4097,7 +4097,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the writes
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -4106,7 +4106,7 @@ pub(crate) mod up_test {
 
         drop(ds);
         up.set_deactivate(None, ds_done_tx.clone()).await.unwrap();
-        ds = up.downstairs.lock().await;
+        ds = up.downstairs.lock();
 
         // Complete the writes
         ds.process_ds_completion(
@@ -4150,7 +4150,7 @@ pub(crate) mod up_test {
         up.deactivate_transition_check().await;
         assert!(up.is_deactivating().await);
 
-        ds = up.downstairs.lock().await;
+        ds = up.downstairs.lock();
         // Make sure no DS have changed state.
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
         assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::Active);
@@ -4179,7 +4179,7 @@ pub(crate) mod up_test {
 
         let up = Upstairs::test_default(None);
         up.set_active().await.unwrap();
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ds_state.set(ClientId::new(0), DsState::Active);
         ds.ds_state.set(ClientId::new(1), DsState::Active);
         ds.ds_state.set(ClientId::new(2), DsState::Active);
@@ -4191,7 +4191,7 @@ pub(crate) mod up_test {
         assert!(!up.ds_deactivate(ClientId::new(1)).await);
         assert!(!up.ds_deactivate(ClientId::new(2)).await);
 
-        ds = up.downstairs.lock().await;
+        ds = up.downstairs.lock();
         // Make sure no DS have changed state.
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
         assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Active);
@@ -4209,7 +4209,7 @@ pub(crate) mod up_test {
         assert!(!up.ds_deactivate(ClientId::new(1)).await);
         assert!(!up.ds_deactivate(ClientId::new(2)).await);
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         // Make sure no DS have changed state.
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::New);
         assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::New);
@@ -4377,7 +4377,7 @@ pub(crate) mod up_test {
             .connect_region_set(&d, &mut lastcast, &mut ds_reconcile_done_rx)
             .await;
         assert!(res.is_ok());
-        let active = up.active.lock().await;
+        let active = up.active.lock();
         assert_ne!(active.up_state, UpState::Active)
     }
 
@@ -4386,7 +4386,7 @@ pub(crate) mod up_test {
     async fn reconcile_rep_in_progress_none() {
         // No repairs on the queue, should return None
         let up = Upstairs::test_default(None);
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ds_state.set(ClientId::new(0), DsState::Repair);
         ds.ds_state.set(ClientId::new(1), DsState::Repair);
         ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4402,7 +4402,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             // Put a jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4419,7 +4419,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.is_err());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::FailedRepair);
         assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::WaitQuorum);
         assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::FailedRepair);
@@ -4439,7 +4439,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4455,7 +4455,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
@@ -4473,7 +4473,7 @@ pub(crate) mod up_test {
         drop(ds);
         let nw = up.new_rec_work().await;
         assert!(nw.is_err());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::FailedRepair);
         assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::New);
         assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::FailedRepair);
@@ -4492,7 +4492,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4508,7 +4508,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
@@ -4528,7 +4528,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4543,7 +4543,7 @@ pub(crate) mod up_test {
         }
         // Move that job to next to do.
         let _ = up.new_rec_work().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
     }
@@ -4555,7 +4555,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4570,7 +4570,7 @@ pub(crate) mod up_test {
         }
         // Move that job to next to do.
         let _ = up.new_rec_work().await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.rep_done(ClientId::new(0), rep_id);
     }
 
@@ -4579,7 +4579,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let mut rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4602,7 +4602,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
@@ -4617,7 +4617,7 @@ pub(crate) mod up_test {
         drop(ds);
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
@@ -4641,7 +4641,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4664,7 +4664,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
@@ -4687,7 +4687,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4703,7 +4703,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         if let Some(job) = &mut ds.reconcile_current_work {
@@ -4728,7 +4728,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4744,7 +4744,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Mark one as skipped
         if let Some(job) = &mut ds.reconcile_current_work {
             let oldstate = job.state.insert(ClientId::new(1), IOState::Skipped);
@@ -4764,7 +4764,7 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let rep_id = ReconciliationId(0);
         {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
             ds.ds_state.set(ClientId::new(0), DsState::Repair);
             ds.ds_state.set(ClientId::new(1), DsState::Repair);
             ds.ds_state.set(ClientId::new(2), DsState::Repair);
@@ -4780,7 +4780,7 @@ pub(crate) mod up_test {
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.unwrap());
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         // Jump straight to done.
         // Now, make sure we consider this done only after all three are done
         ds.rep_done(ClientId::new(0), rep_id);
@@ -4792,7 +4792,7 @@ pub(crate) mod up_test {
         // are sent to the downstairs.  Verify that the resulting
         // messages are what we expect
         let up = Upstairs::test_default(None);
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         let r0 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 801);
         let r1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 802);
         let r2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 803);
@@ -4912,7 +4912,7 @@ pub(crate) mod up_test {
         // are sent to the downstairs.  Verify that the resulting
         // messages are what we expect
         let up = Upstairs::test_default(None);
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         let r0 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 801);
         let r1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 802);
         let r2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 803);
@@ -5033,7 +5033,7 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
@@ -5048,7 +5048,7 @@ pub(crate) mod up_test {
             512,
         ));
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
 
@@ -5107,13 +5107,13 @@ pub(crate) mod up_test {
         let upstairs = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         upstairs.set_active().await.unwrap();
-        let mut ds = upstairs.downstairs.lock().await;
+        let mut ds = upstairs.downstairs.lock();
 
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         ds.in_progress(next_id, ClientId::new(0));
 
         // fake read response from downstairs that will fail integrity hash
@@ -5164,7 +5164,7 @@ pub(crate) mod up_test {
             512,
         ));
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
 
@@ -5609,7 +5609,7 @@ pub(crate) mod up_test {
         up.set_active().await.unwrap();
 
         let next_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
 
@@ -5623,7 +5623,7 @@ pub(crate) mod up_test {
                 false,
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
             assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -5676,7 +5676,7 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Faulted);
 
         // Verify we can still ack this (failed) work
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         assert_eq!(ds.ackable_work().len(), 1);
     }
 
@@ -5698,7 +5698,7 @@ pub(crate) mod up_test {
 
         // Create the write that fails on one DS
         let next_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
 
@@ -5712,7 +5712,7 @@ pub(crate) mod up_test {
                 false,
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             ds.in_progress(next_id, ClientId::new(0));
             ds.in_progress(next_id, ClientId::new(1));
@@ -5754,14 +5754,14 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
 
         // Verify we can ack this work, then ack it.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
-        up.downstairs.lock().await.ack(next_id);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
+        up.downstairs.lock().ack(next_id);
 
         // Now, do a read.
         let (request, iblocks) = generic_read_request();
 
         let next_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
             let op = create_read_eob(
@@ -5772,7 +5772,7 @@ pub(crate) mod up_test {
                 vec![request.clone()],
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             // As this DS is failed, it should return none
             assert_eq!(ds.in_progress(next_id, ClientId::new(0)), None);
@@ -5809,17 +5809,17 @@ pub(crate) mod up_test {
             .unwrap());
 
         // Verify we can ack this work, then ack it.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
-        up.downstairs.lock().await.ack(next_id);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
+        up.downstairs.lock().ack(next_id);
 
         // Perform the flush.
         let next_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
             let dep = ds.ds_active.deps_for_flush(next_id);
             let op = create_flush(next_id, dep, 10, 0, 0, None, None);
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             // As this DS is failed, it should return none
             assert_eq!(ds.in_progress(next_id, ClientId::new(0)), None);
@@ -5848,11 +5848,11 @@ pub(crate) mod up_test {
             .unwrap());
 
         // ACK the flush and let retire_check move things along.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
-        up.downstairs.lock().await.ack(next_id);
-        up.downstairs.lock().await.retire_check(next_id);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
+        up.downstairs.lock().ack(next_id);
+        up.downstairs.lock().retire_check(next_id);
 
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         assert_eq!(ds.ackable_work().len(), 0);
 
         // The write, the read, and now the flush should be completed.
@@ -5879,7 +5879,7 @@ pub(crate) mod up_test {
 
         // Create the write that fails on two DS
         let next_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
 
@@ -5893,7 +5893,7 @@ pub(crate) mod up_test {
                 false,
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             ds.in_progress(next_id, ClientId::new(0));
             ds.in_progress(next_id, ClientId::new(1));
@@ -5940,13 +5940,13 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
 
         // Verify we can ack this work
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
         // Now, do a read.
 
         let (request, iblocks) = generic_read_request();
         let next_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
 
@@ -5958,7 +5958,7 @@ pub(crate) mod up_test {
                 vec![request.clone()],
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             // As this DS is failed, it should return none
             assert_eq!(ds.in_progress(next_id, ClientId::new(0)), None);
@@ -5991,14 +5991,14 @@ pub(crate) mod up_test {
         make_in_progress: bool,
         ds_done_tx: mpsc::Sender<()>,
     ) -> JobId {
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let id = ds.next_id();
 
         let (request, iblocks) = generic_write_request();
         let op =
             create_write_eob(&mut ds, id, iblocks, 10, vec![request], false);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         if make_in_progress {
             ds.in_progress(id, ClientId::new(0));
@@ -6017,13 +6017,13 @@ pub(crate) mod up_test {
         make_in_progress: bool,
         ds_done_tx: mpsc::Sender<()>,
     ) -> JobId {
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let id = ds.next_id();
 
         let deps = ds.ds_active.deps_for_flush(id);
         let op = create_flush(id, deps, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         if make_in_progress {
             ds.in_progress(id, ClientId::new(0));
@@ -6043,14 +6043,14 @@ pub(crate) mod up_test {
         make_in_progress: bool,
         ds_done_tx: mpsc::Sender<()>,
     ) -> JobId {
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let read_id = ds.next_id();
 
         let op = create_read_eob(&mut ds, read_id, iblocks, 10, vec![request]);
 
         // Add the reads
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         if make_in_progress {
             ds.in_progress(read_id, ClientId::new(0));
@@ -6227,19 +6227,19 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
 
         // A faulted write won't change skipped job count.
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
         assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
         assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
         drop(ds);
 
         // Verify we can ack this work
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
         let first_id = next_id;
         // Now, do another write.
         let next_id = enqueue_write(&up, false, ds_done_tx.clone()).await;
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.in_progress(next_id, ClientId::new(0));
         assert_eq!(ds.in_progress(next_id, ClientId::new(1)), None);
         ds.in_progress(next_id, ClientId::new(2));
@@ -6266,10 +6266,10 @@ pub(crate) mod up_test {
             .unwrap());
 
         // Verify we can ack this work, the total is now 2 jobs to ack
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 2);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 2);
 
         // One downstairs should have a skipped job on its list.
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
         assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
         assert!(ds.ds_skipped_jobs[ClientId::new(1)].contains(&JobId(1001)));
@@ -6278,12 +6278,12 @@ pub(crate) mod up_test {
 
         // Enqueue the flush.
         let flush_id = {
-            let mut ds = up.downstairs.lock().await;
+            let mut ds = up.downstairs.lock();
 
             let next_id = ds.next_id();
             let dep = ds.ds_active.deps_for_flush(next_id);
             let op = create_flush(next_id, dep, 10, 0, 0, None, None);
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
             // As this DS is failed, it should return none
@@ -6312,7 +6312,7 @@ pub(crate) mod up_test {
             .unwrap());
 
         // ACK all the jobs and let retire_check move things along.
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         assert_eq!(ds.ackable_work().len(), 3);
         ds.ack(first_id);
         ds.ack(next_id);
@@ -6362,7 +6362,7 @@ pub(crate) mod up_test {
         .await;
 
         // Verify the read is all new still
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&read_id).unwrap();
 
         assert_eq!(job.state[ClientId::new(0)], IOState::New);
@@ -6403,10 +6403,10 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
 
         // Verify we can ack this work
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
         // Verify the read switched from new to skipped
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&read_id).unwrap();
 
         assert_eq!(job.state[ClientId::new(0)], IOState::New);
@@ -6479,10 +6479,10 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
 
         // Verify we can ack this work
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
         // Verify the read switched from new to skipped
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&read_id).unwrap();
 
         assert_eq!(job.state[ClientId::new(0)], IOState::InProgress);
@@ -6534,10 +6534,10 @@ pub(crate) mod up_test {
         }
 
         // Verify two jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 2);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 2);
 
         // Verify all IOs are done
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         for cid in ClientId::iter() {
             let job = ds.ds_active.get(&read_one).unwrap();
             assert_eq!(job.state[cid], IOState::Done);
@@ -6577,10 +6577,10 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Faulted);
 
         // Verify we can ack this work plus the previous two
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 3);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 3);
 
         // Verify all IOs are done
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         for cid in ClientId::iter() {
             let job = ds.ds_active.get(&read_one).unwrap();
             assert_eq!(job.state[cid], IOState::Done);
@@ -6644,10 +6644,10 @@ pub(crate) mod up_test {
         }
 
         // Verify two jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 2);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 2);
 
         // Verify all IOs are done
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         for cid in ClientId::iter() {
             let job = ds.ds_active.get(&read_one).unwrap();
             assert_eq!(job.state[cid], IOState::Done);
@@ -6694,10 +6694,10 @@ pub(crate) mod up_test {
         assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Faulted);
 
         // Verify we can ack this work plus the previous two
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 3);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 3);
 
         // Verify all IOs are done
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         for cid in ClientId::iter() {
             // First read, still Done
             let job = ds.ds_active.get(&read_one).unwrap();
@@ -6759,7 +6759,7 @@ pub(crate) mod up_test {
 
         let flush_one = enqueue_flush(&up, false, ds_done_tx.clone()).await;
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&write_one).unwrap();
         assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(1)], IOState::New);
@@ -6814,7 +6814,7 @@ pub(crate) mod up_test {
         // Finally, add a flush
         let flush_one = enqueue_flush(&up, true, ds_done_tx.clone()).await;
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&write_one).unwrap();
         assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(1)], IOState::InProgress);
@@ -6863,10 +6863,10 @@ pub(crate) mod up_test {
             .unwrap();
 
         // Verify three jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 3);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 3);
 
         // Verify all IOs are done
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let job = ds.ds_active.get(&read_one).unwrap();
         assert_eq!(job.state[ClientId::new(1)], IOState::Done);
@@ -6930,7 +6930,7 @@ pub(crate) mod up_test {
         // Finally, add a flush
         let flush_one = enqueue_flush(&up, true, ds_done_tx.clone()).await;
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&write_one).unwrap();
         assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(1)], IOState::InProgress);
@@ -6970,10 +6970,10 @@ pub(crate) mod up_test {
             .unwrap();
 
         // Verify three jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 3);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 3);
 
         // Verify all IOs are done
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         let job = ds.ds_active.get(&read_one).unwrap();
         assert_eq!(job.state[ClientId::new(1)], IOState::Done);
@@ -7031,7 +7031,7 @@ pub(crate) mod up_test {
         )
         .await;
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&read_one).unwrap();
         assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
@@ -7043,12 +7043,12 @@ pub(crate) mod up_test {
         drop(ds);
 
         // Verify jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
         // Verify all IOs are done
         // We are simulating what would happen here by the up_ds_listen
         // task, after it receives a notification from the ds_done_tx.
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ack(read_one);
 
         ds.retire_check(read_one);
@@ -7080,7 +7080,7 @@ pub(crate) mod up_test {
         // Create a write.
         let write_one = enqueue_write(&up, true, ds_done_tx.clone()).await;
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&write_one).unwrap();
         assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
@@ -7092,12 +7092,12 @@ pub(crate) mod up_test {
         drop(ds);
 
         // Verify jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
         // Verify all IOs are done
         // We are simulating what would happen here by the up_ds_listen
         // task, after it receives a notification from the ds_done_tx.
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ack(write_one);
 
         ds.retire_check(write_one);
@@ -7129,7 +7129,7 @@ pub(crate) mod up_test {
         // Create a flush.
         let flush_one = enqueue_flush(&up, false, ds_done_tx.clone()).await;
 
-        let ds = up.downstairs.lock().await;
+        let ds = up.downstairs.lock();
         let job = ds.ds_active.get(&flush_one).unwrap();
         assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
@@ -7141,9 +7141,9 @@ pub(crate) mod up_test {
         drop(ds);
 
         // Verify jobs can be acked.
-        assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
+        assert_eq!(up.downstairs.lock().ackable_work().len(), 1);
 
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
         ds.ack(flush_one);
 
         ds.retire_check(flush_one);
@@ -7198,7 +7198,7 @@ pub(crate) mod up_test {
         let write_one = enqueue_write(&up, true, ds_done_tx.clone()).await;
         let flush_one = enqueue_flush(&up, false, ds_done_tx.clone()).await;
 
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         // Verify all jobs can be acked.
         assert_eq!(ds.ackable_work().len(), 3);
@@ -7285,7 +7285,7 @@ pub(crate) mod up_test {
         let _write_two = enqueue_write(&up, true, ds_done_tx.clone()).await;
         let _flush_two = enqueue_flush(&up, false, ds_done_tx.clone()).await;
 
-        let mut ds = up.downstairs.lock().await;
+        let mut ds = up.downstairs.lock();
 
         // Six jobs have been skipped.
         for cid in ClientId::iter() {
@@ -7393,7 +7393,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7454,7 +7454,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7510,7 +7510,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7574,7 +7574,7 @@ pub(crate) mod up_test {
                 .unwrap();
         }
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7636,7 +7636,7 @@ pub(crate) mod up_test {
                 .unwrap();
         }
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7708,7 +7708,7 @@ pub(crate) mod up_test {
                 .unwrap();
         }
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7776,7 +7776,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7829,7 +7829,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7880,7 +7880,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7934,7 +7934,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -7993,7 +7993,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8048,7 +8048,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8089,7 +8089,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8166,7 +8166,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8229,7 +8229,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8288,7 +8288,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8386,7 +8386,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8433,7 +8433,7 @@ pub(crate) mod up_test {
                 .unwrap();
         }
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8477,7 +8477,7 @@ pub(crate) mod up_test {
                 .unwrap();
         }
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8543,7 +8543,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8605,7 +8605,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8699,7 +8699,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8773,7 +8773,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8815,7 +8815,7 @@ pub(crate) mod up_test {
             .unwrap();
 
         {
-            let mut ds = upstairs.downstairs.lock().await;
+            let mut ds = upstairs.downstairs.lock();
             let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
             let jobs: Vec<&DownstairsIO> =
                 keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8853,7 +8853,7 @@ pub(crate) mod up_test {
             .unwrap();
 
         {
-            let ds = upstairs.downstairs.lock().await;
+            let ds = upstairs.downstairs.lock();
             let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
             let jobs: Vec<&DownstairsIO> =
                 keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();
@@ -8910,7 +8910,7 @@ pub(crate) mod up_test {
             .await
             .unwrap();
 
-        let ds = upstairs.downstairs.lock().await;
+        let ds = upstairs.downstairs.lock();
         let keys: Vec<&JobId> = ds.ds_active.keys().sorted().collect();
         let jobs: Vec<&DownstairsIO> =
             keys.iter().map(|k| ds.ds_active.get(k).unwrap()).collect();

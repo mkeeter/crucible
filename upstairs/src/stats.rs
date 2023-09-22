@@ -105,6 +105,43 @@ impl UpCountStat {
             extent_reopen_count: Default::default(),
         }
     }
+
+    pub fn add_activation(&mut self) {
+        let datum = self.activated_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_write(&mut self, bytes: i64) {
+        let datum = self.write_bytes.datum_mut();
+        *datum += bytes;
+        let datum = self.write_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_read(&mut self, bytes: i64) {
+        let datum = self.read_bytes.datum_mut();
+        *datum += bytes;
+        let datum = self.read_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_flush(&mut self) {
+        let datum = self.flush_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_flush_close(&mut self) {
+        let datum = self.flush_close_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_extent_repair(&mut self) {
+        let datum = self.extent_repair_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_extent_noop(&mut self) {
+        let datum = self.extent_noop_count.datum_mut();
+        *datum += 1;
+    }
+    pub fn add_extent_reopen(&mut self) {
+        let datum = self.extent_reopen_count.datum_mut();
+        *datum += 1;
+    }
 }
 
 // This struct wraps the stat struct in an Arc/Mutex so the worker tasks can
@@ -119,48 +156,28 @@ impl UpStatOuter {
     // one of these methods will be called.  Each method will get the
     // correct field of UpCountStat to record the update.
     pub async fn add_activation(&self) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.activated_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_activation();
     }
     pub async fn add_write(&self, bytes: i64) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.write_bytes.datum_mut();
-        *datum += bytes;
-        let datum = ups.write_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_write(bytes);
     }
     pub async fn add_read(&self, bytes: i64) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.read_bytes.datum_mut();
-        *datum += bytes;
-        let datum = ups.read_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_read(bytes);
     }
     pub async fn add_flush(&self) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.flush_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_flush();
     }
     pub async fn add_flush_close(&self) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.flush_close_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_flush_close();
     }
     pub async fn add_extent_repair(&self) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.extent_repair_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_extent_repair();
     }
     pub async fn add_extent_noop(&self) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.extent_noop_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_extent_noop();
     }
     pub async fn add_extent_reopen(&self) {
-        let mut ups = self.up_stat_wrap.lock().await;
-        let datum = ups.extent_reopen_count.datum_mut();
-        *datum += 1;
+        self.up_stat_wrap.lock().await.add_extent_reopen();
     }
 }
 

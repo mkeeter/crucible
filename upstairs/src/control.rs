@@ -136,10 +136,10 @@ async fn upstairs_fill_info(
 ) -> Result<HttpResponseOk<UpstairsStats>, HttpError> {
     let api_context = rqctx.context();
 
-    let act = api_context.up.active.lock().await.up_state;
+    let act = api_context.up.active.lock().up_state;
     let ds_state = api_context.up.ds_state_copy().await;
     let up_jobs = api_context.up.guest.guest_work.lock().await.active.len();
-    let ds = api_context.up.downstairs.lock().await;
+    let ds = api_context.up.downstairs.lock();
     let ds_jobs = ds.ds_active.len();
     let repair_done = ds.reconcile_repaired;
     let repair_needed = ds.reconcile_repair_needed;
@@ -179,7 +179,7 @@ struct DownstairsWork {
 }
 
 async fn build_downstairs_job_list(up: &Arc<Upstairs>) -> Vec<WorkSummary> {
-    let ds = up.downstairs.lock().await;
+    let ds = up.downstairs.lock();
     let mut kvec: Vec<_> = ds.ds_active.keys().cloned().collect();
     kvec.sort_unstable();
 
@@ -207,7 +207,7 @@ async fn downstairs_work_queue(
     let api_context = rqctx.context();
 
     let jobs = build_downstairs_job_list(&api_context.up.clone()).await;
-    let ds = api_context.up.downstairs.lock().await;
+    let ds = api_context.up.downstairs.lock();
     let completed = ds.completed_jobs.to_vec();
 
     Ok(HttpResponseOk(DownstairsWork { jobs, completed }))
@@ -245,45 +245,48 @@ async fn fault_downstairs(
      * transition it to faulted without causing a panic in the
      * upstairs.
      */
-    let active = api_context.up.active.lock().await;
-    let up_state = active.up_state;
-    if up_state != UpState::Active {
-        return Err(HttpError::for_bad_request(
-            Some(String::from("InvalidState")),
-            format!("Upstairs not active: {:?}", up_state),
-        ));
-    }
-    let mut ds = api_context.up.downstairs.lock().await;
-    match ds.ds_state.get(cid) {
-        DsState::Active
-        | DsState::Offline
-        | DsState::LiveRepair
-        | DsState::LiveRepairReady => {}
-        x => {
+    let send_done = {
+        // This scope is to hold the locks
+        let active = api_context.up.active.lock();
+        let up_state = active.up_state;
+        if up_state != UpState::Active {
             return Err(HttpError::for_bad_request(
                 Some(String::from("InvalidState")),
-                format!("downstairs {} in invalid state {:?}", cid, x),
+                format!("Upstairs not active: {:?}", up_state),
             ));
         }
-    }
-    drop(active);
+        let mut ds = api_context.up.downstairs.lock();
+        match ds.ds_state.get(cid) {
+            DsState::Active
+            | DsState::Offline
+            | DsState::LiveRepair
+            | DsState::LiveRepairReady => {}
+            x => {
+                return Err(HttpError::for_bad_request(
+                    Some(String::from("InvalidState")),
+                    format!("downstairs {} in invalid state {:?}", cid, x),
+                ));
+            }
+        }
 
-    /*
-     * Mark the downstairs client as faulted
-     */
-    api_context.up.ds_transition_with_lock(
-        &mut ds,
-        up_state,
-        cid,
-        DsState::Faulted,
-    );
+        /*
+         * Mark the downstairs client as faulted
+         */
+        api_context.up.ds_transition_with_lock(
+            &mut ds,
+            up_state,
+            cid,
+            DsState::Faulted,
+        );
 
-    /*
-     * Move all jobs to skipped for this downstairs.
-     * If this returns true, then we have to notify tasks that
-     * a job was "completed" (aka, skipped).
-     */
-    if ds.ds_set_faulted(cid) {
+        /*
+         * Move all jobs to skipped for this downstairs.
+         * If this returns true, then we have to notify tasks that
+         * a job was "completed" (aka, skipped).
+         */
+        ds.ds_set_faulted(cid)
+    };
+    if send_done {
         let _ = api_context.ds_done_tx.send(()).await;
     }
 
