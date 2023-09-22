@@ -820,14 +820,12 @@ where
             } => {
                 // If our downstairs is under repair, then include any extent
                 // limit sent in the IOop.
-                let my_extent_limit = if u.downstairs.lock().await.ds_state
-                    [client_id]
-                    == DsState::LiveRepair
-                {
-                    extent_limit
-                } else {
-                    None
-                };
+                let my_extent_limit =
+                    if u.ds_state.get(client_id) == DsState::LiveRepair {
+                        extent_limit
+                    } else {
+                        None
+                    };
                 cdt::ds__flush__io__start!(|| (new_id.0, client_id.get()));
                 fw.send(Message::Flush {
                     upstairs_id: u.uuid,
@@ -1013,7 +1011,7 @@ where
     // re_new.
     {
         let mut ds = up.downstairs.lock().await;
-        let my_state = ds.ds_state[up_coms.client_id];
+        let my_state = ds.ds_state.get(up_coms.client_id);
 
         info!(
             up.log,
@@ -1522,11 +1520,7 @@ where
                         up.add_ds_region(up_coms.client_id, region_def).await?;
 
                         // Match on the current state of this downstairs
-                        let my_state = {
-                            let state = &up.downstairs.lock().await.ds_state;
-                            state[up_coms.client_id]
-                        };
-                        match my_state {
+                        match up.ds_state.get(up_coms.client_id) {
                             DsState::Offline => {
                                 /*
                                  * If we are coming from state Offline, then it
@@ -1591,7 +1585,7 @@ where
                         let mut ds = up.downstairs.lock().await;
                         drop(active);
 
-                        let my_state = ds.ds_state[up_coms.client_id];
+                        let my_state = ds.ds_state.get(up_coms.client_id);
                         if my_state == DsState::Replacing {
                             bail!(
                                 "[{}] exits negotiation, replacing",
@@ -1635,7 +1629,7 @@ where
                         let mut ds = up.downstairs.lock().await;
                         drop(active);
 
-                        let my_state = ds.ds_state[up_coms.client_id];
+                        let my_state = ds.ds_state.get(up_coms.client_id);
                         match my_state {
                             DsState::WaitActive => {
                                 up.ds_transition_with_lock(
@@ -1835,7 +1829,7 @@ where
     };
     {
         let mut ds = up.downstairs.lock().await;
-        let state = ds.ds_state[up_coms.client_id];
+        let state = ds.ds_state.get(up_coms.client_id);
         match state {
             DsState::Replay => {
                 info!(
@@ -1941,7 +1935,7 @@ where
                  * tear down this connection and require the downstairs to
                  * reconnect and eventually go into LiveRepair mode.
                  */
-                let my_state = up_c.downstairs.lock().await.ds_state[client_id];
+                let my_state = up_c.ds_state.get(client_id);
                 if my_state == DsState::Faulted
                     || my_state == DsState::Replacing
                 {
@@ -2786,6 +2780,33 @@ impl WorkCounts {
     }
 }
 
+/// Helper type to share `ClientData<DsState>` across tasks without locks
+#[derive(Clone, Debug)]
+struct SharedDsState(Arc<ClientData<AtomicDsState>>);
+impl SharedDsState {
+    fn new() -> Self {
+        Self(Arc::new(ClientData([
+            AtomicDsState::new(DsState::New),
+            AtomicDsState::new(DsState::New),
+            AtomicDsState::new(DsState::New),
+        ])))
+    }
+    fn set(&self, i: ClientId, value: DsState) {
+        self.0[i].store(value, std::sync::atomic::Ordering::Release)
+    }
+    fn get(&self, i: ClientId) -> DsState {
+        self.0[i].load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn iter(&self) -> impl Iterator<Item = DsState> {
+        [
+            self.get(ClientId::new(0)),
+            self.get(ClientId::new(1)),
+            self.get(ClientId::new(2)),
+        ]
+        .into_iter()
+    }
+}
+
 /*
  * The structure that tracks information about the three downstairs
  * connections as well as the work that each is doing.
@@ -2812,7 +2833,7 @@ struct Downstairs {
      * The state of a downstairs connection, based on client ID
      * Ready here indicates it can receive IO.
      */
-    ds_state: ClientData<DsState>,
+    ds_state: SharedDsState,
 
     /**
      * The last flush job ID that each downstairs has acked.
@@ -2988,7 +3009,7 @@ impl Downstairs {
             ds_uuid: ClientMap::new(),
             ds_target,
             ds_repair: ClientMap::new(),
-            ds_state: ClientData::new(DsState::New),
+            ds_state: SharedDsState::new(),
             ds_last_flush: ClientData::new(JobId(0)),
             downstairs_errors: ClientData::new(0),
             ds_active: ActiveJobs::new(),
@@ -3127,7 +3148,7 @@ impl Downstairs {
      * jobs for this downstairs.
      */
     fn dependencies_need_cleanup(&mut self, client_id: ClientId) -> bool {
-        self.ds_state[client_id] == DsState::LiveRepair
+        self.ds_state.get(client_id) == DsState::LiveRepair
             && !self.ds_skipped_jobs[client_id].is_empty()
     }
 
@@ -3149,7 +3170,7 @@ impl Downstairs {
             self.ds_skipped_jobs[client_id],
             deps
         );
-        assert_eq!(self.ds_state[client_id], DsState::LiveRepair);
+        assert_eq!(self.ds_state.get(client_id), DsState::LiveRepair);
         assert!(self.repair_min_id.is_some());
 
         deps.retain(|x| !self.ds_skipped_jobs[client_id].contains(x));
@@ -3189,7 +3210,7 @@ impl Downstairs {
         let not_ready = self
             .ds_state
             .iter()
-            .filter(|state| **state != DsState::Repair)
+            .filter(|state| *state != DsState::Repair)
             .count();
 
         if not_ready > 0 {
@@ -3198,9 +3219,10 @@ impl Downstairs {
              * Mark any downstairs that have not changed as failed
              * and return error.
              */
-            for (i, s) in self.ds_state.iter_mut().enumerate() {
-                if *s == DsState::Repair {
-                    *s = DsState::FailedRepair;
+            for i in ClientId::iter() {
+                let s = self.ds_state.get(i);
+                if s == DsState::Repair {
+                    self.ds_state.set(i, DsState::FailedRepair);
                     error!(self.log, "Mark {} as FAILED REPAIR", i);
                 }
             }
@@ -3238,7 +3260,7 @@ impl Downstairs {
      *    should just continue waiting for work to show up.
      */
     fn rep_in_progress(&mut self, client_id: ClientId) -> Option<Message> {
-        if self.ds_state[client_id] != DsState::Repair {
+        if self.ds_state.get(client_id) != DsState::Repair {
             return None;
         }
         if let Some(job) = &mut self.reconcile_current_work {
@@ -3637,7 +3659,7 @@ impl Downstairs {
         for cid in ClientId::iter() {
             assert_eq!(io.state[cid], IOState::New);
 
-            let current = self.ds_state[cid];
+            let current = self.ds_state.get(cid);
             // If a downstairs is faulted or ready for repair, we can move
             // that job directly to IOState::Skipped
             // If a downstairs is in repair, then we need to see if this
@@ -3723,7 +3745,7 @@ impl Downstairs {
         for cid in ClientId::iter() {
             assert_eq!(io.state[cid], IOState::New);
 
-            let current = self.ds_state[cid];
+            let current = self.ds_state.get(cid);
             // If a downstairs is faulted, we can move that job directly
             // to IOState::Skipped.
             match current {
@@ -5168,6 +5190,11 @@ pub struct Upstairs {
     downstairs: FunMutex<Downstairs>,
 
     /*
+     * `ClientInfo<DsState>` that's shared with the downstairs atomically
+     */
+    ds_state: SharedDsState,
+
+    /*
      * The flush info Vec is only used when first connecting or
      * re-connecting to a downstairs. It is populated with the versions
      * the upstairs considers the "correct". If a downstairs disconnects
@@ -5313,16 +5340,16 @@ impl Upstairs {
 
         let session_id = Uuid::new_v4();
         info!(log, "Crucible {} has session id: {}", uuid, session_id);
+        let ds = Downstairs::new(log.clone(), ds_target);
+        let ds_state = ds.ds_state.clone();
         Arc::new(Upstairs {
             active: Mutex::new(UpstairsState::default()),
             uuid,
             session_id: Uuid::new_v4(),
             generation: Mutex::new(gen),
             guest,
-            downstairs: FunMutex(Mutex::new(Downstairs::new(
-                log.clone(),
-                ds_target,
-            ))),
+            downstairs: FunMutex(Mutex::new(ds)),
+            ds_state,
             flush_info: Mutex::new(FlushInfo::new()),
             ddef: Mutex::new(rd_status),
             encryption_context,
@@ -5508,7 +5535,7 @@ impl Upstairs {
          */
         let mut offline_ds = Vec::new();
         for (index, state) in ds.ds_state.iter().enumerate() {
-            if *state == DsState::Offline {
+            if state == DsState::Offline {
                 offline_ds.push(ClientId::new(index as u8));
             }
         }
@@ -5554,23 +5581,23 @@ impl Upstairs {
         let mut active = self.active.lock().await;
         if active.up_state == UpState::Deactivating {
             info!(self.log, "deactivate transition checking...");
-            let mut ds = self.downstairs.lock().await;
+            let ds = self.downstairs.lock().await;
             let mut de_done = true;
-            ds.ds_state.iter_mut().for_each(|ds_state| {
-                if *ds_state == DsState::New || *ds_state == DsState::WaitActive
-                {
+            for i in ClientId::iter() {
+                let ds_state = ds.ds_state.get(i);
+                if ds_state == DsState::New || ds_state == DsState::WaitActive {
                     info!(
                         self.log,
-                        "deactivate_transition {} Maybe ", *ds_state
+                        "deactivate_transition {} Maybe ", ds_state
                     );
-                } else if *ds_state == DsState::Offline {
+                } else if ds_state == DsState::Offline {
                     // TODO: support this
                     panic!("Can't deactivate when a downstairs is offline");
                 } else {
-                    info!(self.log, "deactivate_transition {} NO", *ds_state);
+                    info!(self.log, "deactivate_transition {} NO", ds_state);
                     de_done = false;
                 }
-            });
+            }
             if de_done {
                 info!(self.log, "All DS in the proper state! -> INIT");
                 active.up_state = UpState::Initializing;
@@ -6145,8 +6172,8 @@ impl Upstairs {
      * out, then we should go back to New.
      */
     async fn ds_missing(&self, client_id: ClientId) {
-        let mut ds = self.downstairs.lock().await;
-        let current = ds.ds_state[client_id];
+        let ds = self.downstairs.lock().await;
+        let current = ds.ds_state.get(client_id);
         let new_state = match current {
             DsState::Active => DsState::Offline,
             DsState::Replay => DsState::Offline,
@@ -6180,7 +6207,7 @@ impl Upstairs {
 
         // Should we move jobs now?  When do we move work that has
         // been submitted over to "skipped"
-        ds.ds_state[client_id] = new_state;
+        ds.ds_state.set(client_id, new_state);
     }
 
     /*
@@ -6193,15 +6220,16 @@ impl Upstairs {
      * repair path and reconcile with the other downstairs.
      */
     async fn _ds_is_replay(&self, client_id: ClientId) -> bool {
-        let mut ds = self.downstairs.lock().await;
-        if ds.ds_state[client_id] == DsState::Replay {
+        let ds = self.downstairs.lock().await;
+        // TODO: atomic transition here?
+        if ds.ds_state.get(client_id) == DsState::Replay {
             info!(
                 self.log,
                 "[{}] {} Transition from Replay to Active",
                 client_id,
                 self.uuid
             );
-            ds.ds_state[client_id] = DsState::Active;
+            ds.ds_state.set(client_id, DsState::Active);
             return true;
         }
         false
@@ -6236,13 +6264,13 @@ impl Upstairs {
             client_id,
             self.uuid,
             self.session_id,
-            ds.ds_state[ClientId::new(0)],
-            ds.ds_state[ClientId::new(1)],
-            ds.ds_state[ClientId::new(2)],
+            ds.ds_state.get(ClientId::new(0)),
+            ds.ds_state.get(ClientId::new(1)),
+            ds.ds_state.get(ClientId::new(2)),
             new_state
         );
 
-        let old_state = ds.ds_state[client_id];
+        let old_state = ds.ds_state.get(client_id);
 
         /*
          * Check that this is a valid transition
@@ -6408,10 +6436,10 @@ impl Upstairs {
                 self.log,
                 "[{}] Transition from {} to {}",
                 client_id,
-                ds.ds_state[client_id],
+                ds.ds_state.get(client_id),
                 new_state,
             );
-            ds.ds_state[client_id] = new_state;
+            ds.ds_state.set(client_id, new_state);
         } else {
             panic!("[{}] transition to same state: {}", client_id, new_state);
         }
@@ -6419,7 +6447,7 @@ impl Upstairs {
 
     async fn ds_state(&self, client_id: ClientId) -> DsState {
         let ds = self.downstairs.lock().await;
-        ds.ds_state[client_id]
+        ds.ds_state.get(client_id)
     }
 
     /*
@@ -6621,16 +6649,17 @@ impl Upstairs {
              * while we have the downstairs lock.  This will insure that
              * all downstairs enter the repair path.
              */
-            ds.ds_state.iter_mut().for_each(|ds_state| {
-                info!(self.log, "Transition from {} to Repair", *ds_state);
+            for i in ClientId::iter() {
+                let ds_state = ds.ds_state.get(i);
+                info!(self.log, "Transition from {} to Repair", ds_state);
                 /*
                  * This is a panic and not an error because we should
                  * not call this method without already verifying the
                  * downstairs are in the proper state.
                  */
-                assert_eq!(*ds_state, DsState::WaitQuorum);
-                *ds_state = DsState::Repair;
-            });
+                assert_eq!(ds_state, DsState::WaitQuorum);
+                ds.ds_state.set(i, DsState::Repair);
+            }
 
             info!(
                 self.log,
@@ -6824,7 +6853,7 @@ impl Upstairs {
             let not_ready = ds
                 .ds_state
                 .iter()
-                .filter(|state| **state != DsState::WaitQuorum)
+                .filter(|state| *state != DsState::WaitQuorum)
                 .count();
             if not_ready > 0 {
                 info!(
@@ -6854,7 +6883,7 @@ impl Upstairs {
                 // downstairs to FailedRepair
                 self.set_inactive(e).await;
                 let _active = self.active.lock().await;
-                let mut ds = self.downstairs.lock().await;
+                let ds = self.downstairs.lock().await;
 
                 // While collating, downstairs should all be DsState::Repair.
                 // As we have released then locked the downstairs, we have to
@@ -6865,9 +6894,10 @@ impl Upstairs {
                 assert_eq!(ds.ds_active.len(), 0);
                 assert_eq!(ds.reconcile_task_list.len(), 0);
 
-                for (i, s) in ds.ds_state.iter_mut().enumerate() {
-                    if *s == DsState::WaitQuorum {
-                        *s = DsState::FailedRepair;
+                for i in ClientId::iter() {
+                    let s = ds.ds_state.get(i);
+                    if s == DsState::WaitQuorum {
+                        ds.ds_state.set(i, DsState::FailedRepair);
                         warn!(
                             self.log,
                             "Mark {} as FAILED Collate in final check", i
@@ -6875,7 +6905,7 @@ impl Upstairs {
                     } else {
                         warn!(
                             self.log,
-                            "downstairs in state {} after failed collate", *s
+                            "downstairs in state {} after failed collate", s
                         );
                     }
                 }
@@ -6892,7 +6922,7 @@ impl Upstairs {
                 .await?;
 
                 let mut active = self.active.lock().await;
-                let mut ds = self.downstairs.lock().await;
+                let ds = self.downstairs.lock().await;
                 /*
                  * Now that we have completed reconciliation, we move all
                  * the downstairs to the next state.  If we fail here, it means
@@ -6914,7 +6944,7 @@ impl Upstairs {
                 let ready = ds
                     .ds_state
                     .iter()
-                    .filter(|s| **s == DsState::Repair)
+                    .filter(|s| *s == DsState::Repair)
                     .count();
 
                 if ready != 3 {
@@ -6925,9 +6955,10 @@ impl Upstairs {
                      * they were still repairing to FailedRepair which will
                      * trigger a reconnect.
                      */
-                    for (i, s) in ds.ds_state.iter_mut().enumerate() {
-                        if *s == DsState::Repair {
-                            *s = DsState::FailedRepair;
+                    for i in ClientId::iter() {
+                        let s = ds.ds_state.get(i);
+                        if s == DsState::Repair {
+                            ds.ds_state.set(i, DsState::FailedRepair);
                             warn!(
                                 self.log,
                                 "Mark {} as FAILED REPAIR in final check", i
@@ -6949,8 +6980,8 @@ impl Upstairs {
                         bail!("Upstairs in unexpected state while reconciling");
                     }
 
-                    for s in ds.ds_state.iter_mut() {
-                        *s = DsState::Active;
+                    for i in ClientId::iter() {
+                        ds.ds_state.set(i, DsState::Active);
                     }
                     active.set_active().await?;
                     info!(
@@ -6969,12 +7000,12 @@ impl Upstairs {
                  * we expect them to be.
                  */
                 let mut active = self.active.lock().await;
-                let mut ds = self.downstairs.lock().await;
+                let ds = self.downstairs.lock().await;
 
                 let ready = ds
                     .ds_state
                     .iter()
-                    .filter(|s| **s == DsState::WaitQuorum)
+                    .filter(|s| *s == DsState::WaitQuorum)
                     .count();
 
                 if ready != 3 {
@@ -6985,8 +7016,8 @@ impl Upstairs {
                     if active.up_state != UpState::Initializing {
                         bail!("Upstairs in unexpected state while reconciling");
                     }
-                    for s in ds.ds_state.iter_mut() {
-                        *s = DsState::Active;
+                    for i in ClientId::iter() {
+                        ds.ds_state.set(i, DsState::Active);
                     }
                     active.set_active().await?;
                     info!(
@@ -7029,7 +7060,11 @@ impl Upstairs {
      * DTraces uses this.
      */
     async fn ds_state_copy(&self) -> ClientData<DsState> {
-        self.downstairs.lock().await.ds_state
+        ClientData([
+            self.ds_state.get(ClientId::new(0)),
+            self.ds_state.get(ClientId::new(1)),
+            self.ds_state.get(ClientId::new(2)),
+        ])
     }
 
     /**
@@ -7102,7 +7137,7 @@ impl Upstairs {
             if *uuid != client_ddef.uuid() {
                 // If we are replacing the downstairs, then a new UUID is
                 // okay.
-                if ds.ds_state[client_id] == DsState::Replaced {
+                if ds.ds_state.get(client_id) == DsState::Replaced {
                     warn!(
                         self.log,
                         "[{}] replace downstairs uuid:{} with {}",
@@ -7210,7 +7245,7 @@ impl Upstairs {
          * While the downstairs is away, it's OK to act on the result that
          * we already received, because it may never come back.
          */
-        let ds_state = ds.ds_state[client_id];
+        let ds_state = ds.ds_state.get(client_id);
         match ds_state {
             DsState::Active | DsState::Repair | DsState::LiveRepair => {}
             DsState::Faulted => {
@@ -7407,7 +7442,7 @@ impl Upstairs {
 
             // We don't really know if the "old" matches what was old,
             // as that info is gone to us now, so assume it was true.
-            match ds.ds_state[new_client_id.unwrap()] {
+            match ds.ds_state.get(new_client_id.unwrap()) {
                 DsState::Replacing
                 | DsState::Replaced
                 | DsState::LiveRepairReady
@@ -7438,7 +7473,7 @@ impl Upstairs {
             if client_id == old_client_id {
                 continue;
             }
-            match ds.ds_state[client_id] {
+            match ds.ds_state.get(client_id) {
                 DsState::Replacing
                 | DsState::Replaced
                 | DsState::LiveRepairReady
@@ -7446,7 +7481,7 @@ impl Upstairs {
                     crucible_bail!(
                         ReplaceRequestInvalid,
                         "Replace {old} failed, downstairs {client_id} is {:?}",
-                        ds.ds_state[client_id]
+                        ds.ds_state.get(client_id)
                     );
                 }
                 _ => {}
@@ -7573,8 +7608,9 @@ impl FlushInfo {
  *      │ Disabled  │
  *      └───────────┘
  */
+#[atomic_enum::atomic_enum]
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DsState {
     /*
@@ -9538,7 +9574,7 @@ async fn gone_too_long(up: &Arc<Upstairs>, ds_done_tx: mpsc::Sender<()>) {
     let mut notify_guest = false;
     for cid in ClientId::iter() {
         // Only downstairs in these states are checked.
-        match ds.ds_state[cid] {
+        match ds.ds_state.get(cid) {
             DsState::Active
             | DsState::LiveRepair
             | DsState::Offline
@@ -9802,7 +9838,7 @@ async fn process_new_io(
             let active_count = ds
                 .ds_state
                 .iter()
-                .filter(|state| **state == DsState::Active)
+                .filter(|state| *state == DsState::Active)
                 .count();
             drop(ds);
             *data.lock().await = WQCounts {
@@ -10493,7 +10529,7 @@ async fn show_all_work(up: &Arc<Upstairs>) -> WQCounts {
     let active_count = ds
         .ds_state
         .iter()
-        .filter(|state| **state == DsState::Active)
+        .filter(|state| *state == DsState::Active)
         .count();
     drop(ds);
 

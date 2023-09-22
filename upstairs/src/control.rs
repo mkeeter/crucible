@@ -254,7 +254,7 @@ async fn fault_downstairs(
         ));
     }
     let mut ds = api_context.up.downstairs.lock().await;
-    match ds.ds_state[cid] {
+    match ds.ds_state.get(cid) {
         DsState::Active
         | DsState::Offline
         | DsState::LiveRepair

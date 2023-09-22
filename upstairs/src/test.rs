@@ -3878,9 +3878,9 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.ds_state[ClientId::new(0)] = DsState::Active;
-        ds.ds_state[ClientId::new(1)] = DsState::Active;
-        ds.ds_state[ClientId::new(2)] = DsState::Active;
+        ds.ds_state.set(ClientId::new(0), DsState::Active);
+        ds.ds_state.set(ClientId::new(1), DsState::Active);
+        ds.ds_state.set(ClientId::new(2), DsState::Active);
 
         // Build a write, put it on the work queue.
         let id1 = ds.next_id();
@@ -3985,9 +3985,9 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure the correct DS have changed state.
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Deactivated);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::Deactivated);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Deactivated);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::Deactivated);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Active);
 
         // Send and complete the flush
         ds.in_progress(flush_id, ClientId::new(1));
@@ -4018,9 +4018,9 @@ pub(crate) mod up_test {
 
         // Verify after the ds_missing, all downstairs are New
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::New);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::New);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::New);
     }
 
     #[tokio::test]
@@ -4034,9 +4034,9 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.ds_state[ClientId::new(0)] = DsState::Active;
-        ds.ds_state[ClientId::new(1)] = DsState::Active;
-        ds.ds_state[ClientId::new(2)] = DsState::Active;
+        ds.ds_state.set(ClientId::new(0), DsState::Active);
+        ds.ds_state.set(ClientId::new(1), DsState::Active);
+        ds.ds_state.set(ClientId::new(2), DsState::Active);
 
         drop(ds);
         up.set_deactivate(None, ds_done_tx.clone()).await.unwrap();
@@ -4048,9 +4048,9 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure the correct DS have changed state.
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Deactivated);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::Deactivated);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::Deactivated);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Deactivated);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Deactivated);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::Deactivated);
         drop(ds);
 
         // Mark all three DS as missing, which moves their state to New
@@ -4081,9 +4081,9 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.ds_state[ClientId::new(0)] = DsState::Active;
-        ds.ds_state[ClientId::new(1)] = DsState::Active;
-        ds.ds_state[ClientId::new(2)] = DsState::Active;
+        ds.ds_state.set(ClientId::new(0), DsState::Active);
+        ds.ds_state.set(ClientId::new(1), DsState::Active);
+        ds.ds_state.set(ClientId::new(2), DsState::Active);
 
         // Build a write, put it on the work queue.
         let id1 = ds.next_id();
@@ -4152,9 +4152,9 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure no DS have changed state.
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Active);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::Active);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Active);
     }
 
     #[tokio::test]
@@ -4180,9 +4180,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.ds_state[ClientId::new(0)] = DsState::Active;
-        ds.ds_state[ClientId::new(1)] = DsState::Active;
-        ds.ds_state[ClientId::new(2)] = DsState::Active;
+        ds.ds_state.set(ClientId::new(0), DsState::Active);
+        ds.ds_state.set(ClientId::new(1), DsState::Active);
+        ds.ds_state.set(ClientId::new(2), DsState::Active);
 
         drop(ds);
 
@@ -4193,9 +4193,9 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure no DS have changed state.
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Active);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::Active);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::Active);
     }
 
     #[tokio::test]
@@ -4211,9 +4211,9 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         // Make sure no DS have changed state.
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::New);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::New);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::New);
     }
 
     #[tokio::test]
@@ -4387,9 +4387,9 @@ pub(crate) mod up_test {
         // No repairs on the queue, should return None
         let up = Upstairs::test_default(None);
         let mut ds = up.downstairs.lock().await;
-        ds.ds_state[ClientId::new(0)] = DsState::Repair;
-        ds.ds_state[ClientId::new(1)] = DsState::Repair;
-        ds.ds_state[ClientId::new(2)] = DsState::Repair;
+        ds.ds_state.set(ClientId::new(0), DsState::Repair);
+        ds.ds_state.set(ClientId::new(1), DsState::Repair);
+        ds.ds_state.set(ClientId::new(2), DsState::Repair);
         let w = ds.rep_in_progress(ClientId::new(0));
         assert_eq!(w, None);
     }
@@ -4412,17 +4412,17 @@ pub(crate) mod up_test {
                 },
             ));
             // A downstairs is not in Repair state
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::WaitQuorum;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::WaitQuorum);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
         }
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.is_err());
         let mut ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::FailedRepair);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::WaitQuorum);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::FailedRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::FailedRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::WaitQuorum);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::FailedRepair);
 
         // Verify rep_in_progress now returns none for all DS
         assert!(ds.reconcile_task_list.is_empty());
@@ -4440,9 +4440,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put two jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4462,7 +4462,7 @@ pub(crate) mod up_test {
         assert!(ds.rep_in_progress(ClientId::new(2)).is_some());
 
         // Now verify we can be done even if a DS is gone
-        ds.ds_state[ClientId::new(1)] = DsState::New;
+        ds.ds_state.set(ClientId::new(1), DsState::New);
         // Now, make sure we consider this done only after all three are done
         assert!(!ds.rep_done(ClientId::new(0), rep_id));
         assert!(!ds.rep_done(ClientId::new(1), rep_id));
@@ -4474,9 +4474,9 @@ pub(crate) mod up_test {
         let nw = up.new_rec_work().await;
         assert!(nw.is_err());
         let mut ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::FailedRepair);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::New);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::FailedRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::FailedRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::New);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::FailedRepair);
 
         // Verify rep_in_progress now returns none for all DS
         assert!(ds.reconcile_task_list.is_empty());
@@ -4493,9 +4493,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4512,12 +4512,12 @@ pub(crate) mod up_test {
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
-        ds.ds_state[ClientId::new(2)] = DsState::New;
+        ds.ds_state.set(ClientId::new(2), DsState::New);
         assert!(ds.rep_in_progress(ClientId::new(2)).is_none());
 
         // Okay, now the DS is back and ready for repair, verify it will
         // start taking work.
-        ds.ds_state[ClientId::new(2)] = DsState::Repair;
+        ds.ds_state.set(ClientId::new(2), DsState::Repair);
         assert!(ds.rep_in_progress(ClientId::new(2)).is_some());
     }
 
@@ -4529,9 +4529,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4556,9 +4556,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4580,9 +4580,9 @@ pub(crate) mod up_test {
         let mut rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put two jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4642,9 +4642,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put two jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4688,9 +4688,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4729,9 +4729,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4765,9 +4765,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.ds_state[ClientId::new(0)] = DsState::Repair;
-            ds.ds_state[ClientId::new(1)] = DsState::Repair;
-            ds.ds_state[ClientId::new(2)] = DsState::Repair;
+            ds.ds_state.set(ClientId::new(0), DsState::Repair);
+            ds.ds_state.set(ClientId::new(1), DsState::Repair);
+            ds.ds_state.set(ClientId::new(2), DsState::Repair);
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,

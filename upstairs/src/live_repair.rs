@@ -116,13 +116,13 @@ pub async fn check_for_repair(
     let repair = ds
         .ds_state
         .iter()
-        .filter(|state| **state == DsState::LiveRepair)
+        .filter(|state| *state == DsState::LiveRepair)
         .count();
 
     let repair_ready = ds
         .ds_state
         .iter()
-        .filter(|state| **state == DsState::LiveRepairReady)
+        .filter(|state| *state == DsState::LiveRepairReady)
         .count();
 
     if repair_ready == 0 {
@@ -151,7 +151,7 @@ pub async fn check_for_repair(
         // We do this now while we have the lock to avoid having to do all
         // these checks again in live_repair_main
         for cid in ClientId::iter() {
-            if ds.ds_state[cid] == DsState::LiveRepairReady {
+            if ds.ds_state.get(cid) == DsState::LiveRepairReady {
                 up.ds_transition_with_lock(
                     &mut ds,
                     up_state,
@@ -231,7 +231,7 @@ async fn live_repair_main(
     assert!(ds.repair_min_id.is_some());
 
     for cid in ClientId::iter() {
-        match ds.ds_state[cid] {
+        match ds.ds_state.get(cid) {
             DsState::LiveRepair => {
                 repair_downstairs.push(cid);
             }
@@ -310,7 +310,7 @@ async fn live_repair_main(
             // Verify state has been cleared.
             for cid in ClientId::iter() {
                 assert!(ds.extent_limit.get(&cid).is_none());
-                assert!(ds.ds_state[cid] != DsState::LiveRepair);
+                assert!(ds.ds_state.get(cid) != DsState::LiveRepair);
             }
             // This will not be set until the repair task exits.
             assert!(ds.repair_min_id.is_some());
@@ -388,7 +388,7 @@ async fn live_repair_main(
     if failed_repair {
         for cid in ClientId::iter() {
             assert!(ds.extent_limit.get(&cid).is_none());
-            assert!(ds.ds_state[cid] != DsState::LiveRepair);
+            assert!(ds.ds_state.get(cid) != DsState::LiveRepair);
         }
         for &cid in repair_downstairs.iter() {
             ds.live_repair_aborted[cid] += 1;
@@ -723,11 +723,11 @@ fn repair_ds_state_change(
     repair: &[ClientId],
 ) -> bool {
     for &cid in repair.iter() {
-        if ds.ds_state[cid] != DsState::LiveRepair {
+        if ds.ds_state.get(cid) != DsState::LiveRepair {
             return true;
         }
     }
-    ds.ds_state[source] != DsState::Active
+    ds.ds_state.get(source) != DsState::Active
 }
 
 impl Upstairs {
@@ -742,7 +742,7 @@ impl Upstairs {
     ) {
         let mut notify_guest = false;
         for cid in ClientId::iter() {
-            if ds.ds_state[cid] == DsState::LiveRepair {
+            if ds.ds_state.get(cid) == DsState::LiveRepair {
                 if ds.ds_set_faulted(cid) {
                     notify_guest = true;
                 }
@@ -791,7 +791,7 @@ impl Upstairs {
             if ds
                 .ds_state
                 .iter()
-                .filter(|state| **state == DsState::Faulted)
+                .filter(|state| *state == DsState::Faulted)
                 .count()
                 == 3
             {
@@ -1273,7 +1273,7 @@ impl Upstairs {
             assert_eq!(
                 ds.ds_state
                     .iter()
-                    .filter(|state| **state == DsState::LiveRepair)
+                    .filter(|state| *state == DsState::LiveRepair)
                     .count(),
                 0
             );
@@ -1494,7 +1494,7 @@ pub mod repair_test {
         // No downstairs should change state.
         let ds = up.downstairs.lock().await;
         for cid in ClientId::iter() {
-            assert_eq!(ds.ds_state[cid], DsState::Active);
+            assert_eq!(ds.ds_state.get(cid), DsState::Active);
         }
         assert!(ds.repair_min_id.is_none())
     }
@@ -1523,7 +1523,7 @@ pub mod repair_test {
             RepairCheck::RepairStarted
         );
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::LiveRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::LiveRepair);
         assert!(ds.repair_min_id.is_some())
     }
 
@@ -1554,9 +1554,9 @@ pub mod repair_test {
             RepairCheck::RepairStarted
         );
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Active);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::LiveRepair);
-        assert_eq!(ds.ds_state[ClientId::new(2)], DsState::LiveRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::LiveRepair);
+        assert_eq!(ds.ds_state.get(ClientId::new(2)), DsState::LiveRepair);
         assert!(ds.repair_min_id.is_some())
     }
 
@@ -1935,7 +1935,7 @@ pub mod repair_test {
         }
 
         assert_eq!(job.state_count().done, 3);
-        assert_eq!(ds.ds_state[or_ds], DsState::LiveRepair);
+        assert_eq!(ds.ds_state.get(or_ds), DsState::LiveRepair);
     }
 
     #[tokio::test]
@@ -2006,10 +2006,7 @@ pub mod repair_test {
         }
 
         // process_ds_operation should force the downstairs to fail
-        assert_eq!(
-            up.downstairs.lock().await.ds_state[err_ds],
-            DsState::Faulted
-        );
+        assert_eq!(up.ds_state.get(err_ds), DsState::Faulted);
 
         let my_err = Err(CrucibleError::GenericError("bad".to_string()));
         info!(up.log, "Now ACK the close job");
@@ -2125,8 +2122,8 @@ pub mod repair_test {
             assert_eq!(job.state_count().skipped, 2);
         }
 
-        assert_eq!(ds.ds_state[err_ds], DsState::Faulted);
-        assert_eq!(ds.ds_state[or_ds], DsState::Faulted);
+        assert_eq!(ds.ds_state.get(err_ds), DsState::Faulted);
+        assert_eq!(ds.ds_state.get(or_ds), DsState::Faulted);
     }
 
     #[tokio::test]
@@ -2232,10 +2229,7 @@ pub mod repair_test {
         // process_ds_completion should force both the downstairs that
         // reported the error, and the downstairs that is under repair to
         // fail.
-        assert_eq!(
-            up.downstairs.lock().await.ds_state[err_ds],
-            DsState::Faulted
-        );
+        assert_eq!(up.ds_state.get(err_ds), DsState::Faulted);
         // When we completed the repair jobs, the repair_extent should
         // have gone ahead and issued the NoOp that should be issued
         // next.  Loop here waiting for that job to arrive.
@@ -2316,8 +2310,8 @@ pub mod repair_test {
             assert_eq!(job.state_count().skipped, 1);
         }
 
-        assert_eq!(ds.ds_state[err_ds], DsState::Faulted);
-        assert_eq!(ds.ds_state[or_ds], DsState::Faulted);
+        assert_eq!(ds.ds_state.get(err_ds), DsState::Faulted);
+        assert_eq!(ds.ds_state.get(or_ds), DsState::Faulted);
     }
 
     #[tokio::test]
@@ -2470,8 +2464,8 @@ pub mod repair_test {
             assert_eq!(job.state_count().skipped, 1);
         }
 
-        assert_eq!(ds.ds_state[err_ds], DsState::Faulted);
-        assert_eq!(ds.ds_state[or_ds], DsState::Faulted);
+        assert_eq!(ds.ds_state.get(err_ds), DsState::Faulted);
+        assert_eq!(ds.ds_state.get(or_ds), DsState::Faulted);
     }
 
     #[tokio::test]
@@ -2600,8 +2594,8 @@ pub mod repair_test {
         assert_eq!(job.state_count().done, 2);
         assert_eq!(job.state_count().error, 1);
 
-        assert_eq!(ds.ds_state[err_ds], DsState::Faulted);
-        assert_eq!(ds.ds_state[or_ds], DsState::Faulted);
+        assert_eq!(ds.ds_state.get(err_ds), DsState::Faulted);
+        assert_eq!(ds.ds_state.get(or_ds), DsState::Faulted);
     }
 
     #[tokio::test]
@@ -5443,9 +5437,9 @@ pub mod repair_test {
             .await;
         up.abort_repair_extent(&mut gw, &mut ds, eid).await;
 
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Active);
-        assert_eq!(ds.ds_state[ClientId::new(1)], DsState::Faulted);
-        assert_eq!(ds.ds_state[ClientId::new(0)], DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
+        assert_eq!(ds.ds_state.get(ClientId::new(1)), DsState::Faulted);
+        assert_eq!(ds.ds_state.get(ClientId::new(0)), DsState::Active);
 
         // Check all three IOs again, downstairs 1 will be skipped..
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
