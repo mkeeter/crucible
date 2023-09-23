@@ -8524,6 +8524,11 @@ impl Buffer {
         self.len == 0
     }
 
+    #[deprecated(note = "please use `lock` instead")]
+    pub async fn as_vec(&self) -> tokio::sync::MappedMutexGuard<'_, Vec<u8>> {
+        MutexGuard::map(self.lock().await, |v| &mut v.data)
+    }
+
     pub async fn lock(&self) -> MutexGuard<'_, BufferData> {
         self.data.lock().await
     }
