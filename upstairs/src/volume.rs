@@ -409,7 +409,7 @@ impl Volume {
                 // TODO: Nexus needs to know about this failure.
                 self.write_unwritten(
                     Block::new(offset, bs.trailing_zeros()),
-                    Bytes::from(buffer.as_vec().await.clone()),
+                    Bytes::from(buffer.lock().await.data.clone()),
                 )
                 .await?;
 
@@ -681,12 +681,10 @@ impl BlockIO for Volume {
                     .read(parent_offset, parent_buffer.clone())
                     .await?;
 
-                let mut data_vec = data.as_vec().await;
-                let mut owned_vec = data.owned_vec().await;
+                let mut buf = data.lock().await;
 
-                let sub_data_vec = sub_buffer.as_vec().await;
-                let sub_owned_vec = sub_buffer.owned_vec().await;
-                let parent_data_vec = parent_buffer.as_vec().await;
+                let sub_buf = sub_buffer.lock().await;
+                let parent_buf = parent_buffer.lock().await;
 
                 // "ownership" comes back from the downstairs per byte but all
                 // writes occur per block. Iterate over the blocks that both the
@@ -697,18 +695,18 @@ impl BlockIO for Volume {
                 for i in 0..(sub_sz as u64 / self.block_size) {
                     let start_of_block = (i * self.block_size) as usize;
 
-                    if sub_owned_vec[start_of_block] {
+                    if sub_buf.owned[start_of_block] {
                         // sub volume has written to this block, use it
                         for block_offset in 0..self.block_size {
                             let inside_block =
                                 start_of_block + block_offset as usize;
 
-                            data_vec[data_index + inside_block] =
-                                sub_data_vec[inside_block];
+                            buf.data[data_index + inside_block] =
+                                sub_buf.data[inside_block];
 
                             // this layer of the volume does own this
                             // block, it was written to the subvolume
-                            owned_vec[data_index + inside_block] = true;
+                            buf.owned[data_index + inside_block] = true;
                         }
                     } else {
                         // sub volume hasn't written to this block, use the
@@ -717,15 +715,15 @@ impl BlockIO for Volume {
                             let inside_block =
                                 start_of_block + block_offset as usize;
 
-                            data_vec[data_index + inside_block] =
-                                parent_data_vec[inside_block];
+                            buf.data[data_index + inside_block] =
+                                parent_buf.data[inside_block];
 
                             // this layer of the volume doesn't own this
                             // block, it came from the read only parent. Note
                             // this doesn't depend if the block was owned by
                             // the read only parent, just that the subvolume
                             // doesn't own it.
-                            owned_vec[data_index + inside_block] = false;
+                            buf.owned[data_index + inside_block] = false;
                         }
                     }
                 }
@@ -740,25 +738,25 @@ impl BlockIO for Volume {
                         let inside_block =
                             start_of_block + block_offset as usize;
 
-                        data_vec[data_index + inside_block] =
-                            sub_data_vec[inside_block];
+                        buf.data[data_index + inside_block] =
+                            sub_buf.data[inside_block];
 
                         // this layer of the volume does own this block, it came
                         // from the subvolume's LBA - the read-only parent
                         // cannot own this block because it's outside their LBA.
-                        owned_vec[data_index + inside_block] = true;
+                        buf.owned[data_index + inside_block] = true;
                     }
                 }
             } else {
-                let mut data_vec = data.as_vec().await;
-                let mut owned_vec = data.owned_vec().await;
+                let mut buf = data.lock().await;
+                let sub_buf = sub_buffer.lock().await;
 
                 // In the case where this volume has no read only parent,
                 // propagate the sub volume information up.
-                data_vec[data_index..(data_index + sz)]
-                    .copy_from_slice(&sub_buffer.as_vec().await);
-                owned_vec[data_index..(data_index + sz)]
-                    .copy_from_slice(&sub_buffer.owned_vec().await);
+                buf.data[data_index..(data_index + sz)]
+                    .copy_from_slice(&sub_buf.data);
+                buf.owned[data_index..(data_index + sz)]
+                    .copy_from_slice(&sub_buf.owned);
             }
 
             data_index += sz;
@@ -1819,7 +1817,7 @@ mod test {
         let buffer = Buffer::new(4096);
         disk.read(Block::new(0, BLOCK_SIZE.trailing_zeros()), buffer.clone())
             .await?;
-        assert_eq!(*buffer.as_vec().await, vec![0; 4096]);
+        assert_eq!(*buffer.lock().await.data, vec![0; 4096]);
 
         // Write ones to second block
         disk.write(
@@ -1844,7 +1842,7 @@ mod test {
         let mut expected = vec![0; 512];
         expected.extend(vec![1; 512]);
         expected.extend(vec![0; 4096 - 1024]);
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // Write twos to first block
         disk.write(
@@ -1861,7 +1859,7 @@ mod test {
         let mut expected = vec![2; 512];
         expected.extend(vec![1; 512]);
         expected.extend(vec![0; 4096 - 1024]);
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // Write sevens to third and fourth blocks
         disk.write(
@@ -1887,7 +1885,7 @@ mod test {
         expected.extend(vec![7; 1024]);
         expected.extend(vec![8; 1024]);
         expected.extend(vec![0; 1024]);
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         Ok(())
     }
@@ -1927,7 +1925,7 @@ mod test {
         let mut expected = vec![read_only_parent_init_value; 512 * 4];
         expected.extend(vec![0x00; 512 * 4]);
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // If the parent volume has data, it should be returned. Write ones to
         // the first block of the parent:
@@ -1952,7 +1950,7 @@ mod test {
         expected.extend(vec![read_only_parent_init_value; 512 * 3]);
         expected.extend(vec![0x00; 512 * 4]); // <- from subvolume, still "-"
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // If the volume is written to and it doesn't overlap, still return the
         // parent data. Write twos to the volume:
@@ -1979,7 +1977,7 @@ mod test {
             let mut expected = vec![1; 512];
             expected.extend(vec![read_only_parent_init_value; 2048 - 512]);
 
-            assert_eq!(*buffer.as_vec().await, expected);
+            assert_eq!(*buffer.lock().await.data, expected);
         }
 
         // Read whole volume and verify
@@ -1993,7 +1991,7 @@ mod test {
         expected.extend(vec![read_only_parent_init_value; 512]);
         expected.extend(vec![0x00; 512 * 4]); // <- from subvolume, still "-"
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // If the volume is written to and it does overlap, return the volume
         // data. Write threes to the volume:
@@ -2020,7 +2018,7 @@ mod test {
             let mut expected = vec![1; 512];
             expected.extend(vec![read_only_parent_init_value; 2048 - 512]);
 
-            assert_eq!(*buffer.as_vec().await, expected);
+            assert_eq!(*buffer.lock().await.data, expected);
         }
 
         // Read whole volume and verify
@@ -2034,7 +2032,7 @@ mod test {
         expected.extend(vec![read_only_parent_init_value; 512]);
         expected.extend(vec![0x00; 512 * 4]); // <- from subvolume, still "-"
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // If the whole parent is now written to, only the last block should be
         // returned. Write fours to the parent
@@ -2059,7 +2057,7 @@ mod test {
         expected.extend(vec![4; 512]);
         expected.extend(vec![0x00; 512 * 4]); // <- from subvolume, still "-"
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // If the parent goes away, then the sub volume data should still be
         // readable.
@@ -2076,7 +2074,7 @@ mod test {
         expected.extend(vec![0; 512]); // <- was previously from parent, now "-"
         expected.extend(vec![0x00; 512 * 4]); // <- from subvolume, still "-"
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         // Write to the whole volume. There's no more read-only parent (it was
         // dropped above)
@@ -2092,7 +2090,7 @@ mod test {
             .read(Block::new(0, block_size.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(*buffer.as_vec().await, vec![9; 4096]);
+        assert_eq!(*buffer.lock().await.data, vec![9; 4096]);
 
         Ok(())
     }
@@ -2373,7 +2371,7 @@ mod test {
 
         let expected = vec![128; 2048];
 
-        assert_eq!(*buffer.as_vec().await, expected);
+        assert_eq!(*buffer.lock().await.data, expected);
 
         Ok(())
     }
@@ -2487,7 +2485,7 @@ mod test {
                 )
                 .await?;
 
-            assert_eq!(vec![0x55; BLOCK_SIZE * 10], *buffer.as_vec().await);
+            assert_eq!(vec![0x55; BLOCK_SIZE * 10], *buffer.lock().await.data);
 
             volume
                 .write(
@@ -2504,7 +2502,7 @@ mod test {
                 )
                 .await?;
 
-            assert_eq!(vec![0xFF; BLOCK_SIZE * 10], *buffer.as_vec().await);
+            assert_eq!(vec![0xFF; BLOCK_SIZE * 10], *buffer.lock().await.data);
         }
 
         // Create the same volume, verify data was written
@@ -2518,7 +2516,7 @@ mod test {
             .read(Block::new(0, BLOCK_SIZE.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(vec![0xFF; BLOCK_SIZE * 10], *buffer.as_vec().await);
+        assert_eq!(vec![0xFF; BLOCK_SIZE * 10], *buffer.lock().await.data);
 
         Ok(())
     }
@@ -2546,7 +2544,7 @@ mod test {
             .read(Block::new(0, BLOCK_SIZE.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(vec![0x55; BLOCK_SIZE * 10], *buffer.as_vec().await);
+        assert_eq!(vec![0x55; BLOCK_SIZE * 10], *buffer.lock().await.data);
 
         let mut parent_volume = Volume::new(BLOCK_SIZE as u64, csl());
         parent_volume.add_subvolume(parent).await?;
@@ -2580,7 +2578,7 @@ mod test {
             .read(Block::new(0, BLOCK_SIZE.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(vec![0x55; BLOCK_SIZE * 10], *buffer.as_vec().await);
+        assert_eq!(vec![0x55; BLOCK_SIZE * 10], *buffer.lock().await.data);
 
         // Write over whole volume
         volume
@@ -2596,7 +2594,7 @@ mod test {
             .read(Block::new(0, BLOCK_SIZE.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(vec![0xFF; BLOCK_SIZE * 10], *buffer.as_vec().await);
+        assert_eq!(vec![0xFF; BLOCK_SIZE * 10], *buffer.lock().await.data);
 
         Ok(())
     }
@@ -2630,7 +2628,7 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(vec![0x0; BLOCK_SIZE], *buffer.as_vec().await);
+        assert_eq!(vec![0x0; BLOCK_SIZE], *buffer.lock().await.data);
 
         let buffer = Buffer::new(BLOCK_SIZE);
         volume
@@ -2638,7 +2636,7 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(vec![0x5; BLOCK_SIZE], *buffer.as_vec().await);
+        assert_eq!(vec![0x5; BLOCK_SIZE], *buffer.lock().await.data);
     }
 
     // Test that blocks are correctly returned during read-only parent +
@@ -2668,7 +2666,7 @@ mod test {
             .read(Block::new(0, block_size.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(vec![11; block_size * 5], *buffer.as_vec().await);
+        assert_eq!(vec![11; block_size * 5], *buffer.lock().await.data);
 
         // Create a volume out of this parent and the argument subvolume parts
         let mut volume = Volume::new(block_size as u64, csl());
@@ -2691,7 +2689,7 @@ mod test {
 
         let mut expected = vec![11; block_size * 5];
         expected.extend(vec![0x00; block_size * 5]);
-        assert_eq!(expected, *buffer.as_vec().await);
+        assert_eq!(expected, *buffer.lock().await.data);
 
         // One big write!
         volume
@@ -2707,7 +2705,7 @@ mod test {
             .read(Block::new(0, block_size.trailing_zeros()), buffer.clone())
             .await?;
 
-        assert_eq!(vec![55; block_size * 10], *buffer.as_vec().await);
+        assert_eq!(vec![55; block_size * 10], *buffer.lock().await.data);
 
         Ok(())
     }

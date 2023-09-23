@@ -61,14 +61,13 @@ impl BlockIO for InMemoryBlockIO {
     ) -> Result<(), CrucibleError> {
         let inner = self.inner.lock().await;
 
-        let mut data_vec = data.as_vec().await;
-        let mut owned_vec = data.owned_vec().await;
+        let mut buf = data.lock().await;
 
         let start = offset.value as usize * self.block_size as usize;
 
-        for i in 0..data_vec.len() {
-            data_vec[i] = inner.bytes[start + i];
-            owned_vec[i] = inner.owned[start + i];
+        for i in 0..buf.data.len() {
+            buf.data[i] = inner.bytes[start + i];
+            buf.owned[i] = inner.owned[start + i];
         }
 
         Ok(())

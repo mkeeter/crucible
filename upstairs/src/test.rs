@@ -131,24 +131,24 @@ pub(crate) mod up_test {
             .await;
 
         for i in 0..500 {
-            assert_eq!(span.buffer().as_vec().await[i], 0);
+            assert_eq!(span.buffer().lock().await.data[i], 0);
         }
         for i in 500..512 {
-            assert_eq!(span.buffer().as_vec().await[i], 1);
+            assert_eq!(span.buffer().lock().await.data[i], 1);
         }
         for i in 512..(512 + 64 - 12) {
-            assert_eq!(span.buffer().as_vec().await[i], 1);
+            assert_eq!(span.buffer().lock().await.data[i], 1);
         }
         for i in (512 + 64 - 12)..1024 {
-            assert_eq!(span.buffer().as_vec().await[i], 0);
+            assert_eq!(span.buffer().lock().await.data[i], 0);
         }
 
         let data = Buffer::new(64);
-        span.read_from_blocks_into_buffer(&mut data.as_vec().await[..])
+        span.read_from_blocks_into_buffer(&mut data.lock().await.data[..])
             .await;
 
         for i in 0..64 {
-            assert_eq!(data.as_vec().await[i], 1);
+            assert_eq!(data.lock().await.data[i], 1);
         }
     }
 

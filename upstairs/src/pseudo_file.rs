@@ -86,7 +86,7 @@ impl IOSpan {
         &self,
         block_io: &Arc<T>,
     ) -> Result<(), CrucibleError> {
-        let bytes = Bytes::from(self.buffer.as_vec().await.clone());
+        let bytes = Bytes::from(self.buffer.lock().await.data.clone());
 
         block_io
             .write(
@@ -103,18 +103,16 @@ impl IOSpan {
     pub async fn read_from_blocks_into_buffer(&self, data: &mut [u8]) {
         assert_eq!(data.len(), self.sz as usize);
 
-        for (i, item) in data.iter_mut().enumerate() {
-            *item = self.buffer.as_vec().await[self.phase as usize + i];
-        }
+        let buf = self.buffer.lock().await;
+        data.copy_from_slice(&buf.data[self.phase as usize..][..data.len()]);
     }
 
     #[instrument]
     pub async fn write_from_buffer_into_blocks(&self, data: &[u8]) {
         assert_eq!(data.len(), self.sz as usize);
 
-        for (i, item) in data.iter().enumerate() {
-            self.buffer.as_vec().await[self.phase as usize + i] = *item;
-        }
+        let mut buf = self.buffer.lock().await;
+        buf.data[self.phase as usize..][..data.len()].copy_from_slice(&data);
     }
 }
 

@@ -8472,8 +8472,26 @@ impl fmt::Display for AckStatus {
 #[derive(Clone, Debug)]
 pub struct Buffer {
     len: usize,
-    data: Arc<Mutex<Vec<u8>>>,
-    owned: Arc<Mutex<Vec<bool>>>,
+
+    data: Arc<Mutex<BufferData>>,
+}
+
+/// Tuple of byte data, owned flags
+///
+/// These two vecs must be the same length (enforced at construction)
+#[derive(Clone, Debug)]
+pub struct BufferData {
+    pub data: Vec<u8>,
+    pub owned: Vec<bool>,
+}
+
+impl BufferData {
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        BufferData {
+            owned: vec![false; data.len()],
+            data,
+        }
+    }
 }
 
 impl Buffer {
@@ -8481,17 +8499,12 @@ impl Buffer {
         let len = vec.len();
         Buffer {
             len,
-            data: Arc::new(Mutex::new(vec)),
-            owned: Arc::new(Mutex::new(vec![false; len])),
+            data: Arc::new(Mutex::new(BufferData::from_vec(vec))),
         }
     }
 
     pub fn new(len: usize) -> Buffer {
-        Buffer {
-            len,
-            data: Arc::new(Mutex::new(vec![0; len])),
-            owned: Arc::new(Mutex::new(vec![false; len])),
-        }
+        Self::from_vec(vec![0; len])
     }
 
     pub fn from_slice(buf: &[u8]) -> Buffer {
@@ -8511,12 +8524,8 @@ impl Buffer {
         self.len == 0
     }
 
-    pub async fn as_vec(&self) -> MutexGuard<'_, Vec<u8>> {
+    pub async fn lock(&self) -> MutexGuard<'_, BufferData> {
         self.data.lock().await
-    }
-
-    pub async fn owned_vec(&self) -> MutexGuard<'_, Vec<bool>> {
-        self.owned.lock().await
     }
 }
 
@@ -8548,11 +8557,11 @@ async fn test_buffer_len_index_overflow() {
     let data = Buffer::from_slice(&[0x99; READ_SIZE]);
     assert_eq!(data.len(), READ_SIZE);
 
-    let mut vec = data.as_vec().await;
-    assert_eq!(vec.len(), 512);
+    let data = &mut data.lock().await.data;
+    assert_eq!(data.len(), 512);
 
     for i in 0..(READ_SIZE + 1) {
-        vec[i] = 0x99;
+        data[i] = 0x99;
     }
 }
 
@@ -8786,8 +8795,7 @@ impl GtoS {
             assert!(!self.completed.is_empty());
 
             let mut offset = 0;
-            let mut vec = guest_buffer.as_vec().await;
-            let mut owned_vec = guest_buffer.owned_vec().await;
+            let mut buf = guest_buffer.lock().await;
 
             for ds_id in self.completed.iter() {
                 let responses = self.downstairs_buffer.remove(ds_id).unwrap();
@@ -8799,12 +8807,11 @@ impl GtoS {
                             span!(Level::TRACE, "copy to guest buffer")
                                 .entered();
 
-                        for i in &response.data {
-                            vec[offset] = *i;
-                            owned_vec[offset] =
-                                !response.block_contexts.is_empty();
-                            offset += 1;
-                        }
+                        let n = response.data.len();
+                        buf.data[offset..][..n].copy_from_slice(&response.data);
+                        buf.owned[offset..][..n]
+                            .fill(!response.block_contexts.is_empty());
+                        offset += n;
                     }
                 }
             }

@@ -267,7 +267,7 @@ impl PantryEntry {
             .read_from_byte_offset(offset, buffer.clone())
             .await?;
 
-        let response = buffer.as_vec().await;
+        let response = &buffer.lock().await.data;
         Ok(response.clone())
     }
 
@@ -310,7 +310,7 @@ impl PantryEntry {
                 .read_from_byte_offset(start, data.clone())
                 .await?;
 
-            hasher.update(&*data.as_vec().await);
+            hasher.update(&data.lock().await.data);
         }
 
         let digest = hex::encode(hasher.finalize());

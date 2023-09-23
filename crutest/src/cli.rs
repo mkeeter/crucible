@@ -230,7 +230,7 @@ async fn cli_read(
     println!("Read  at block {:5}, len:{:7}", offset.value, data.len());
     guest.read(offset, data.clone()).await?;
 
-    let mut dl = data.as_vec().await.to_vec();
+    let mut dl = data.lock().await.data.to_vec();
     match validate_vec(
         dl.clone(),
         block_index,
