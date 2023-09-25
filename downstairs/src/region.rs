@@ -307,6 +307,11 @@ impl Inner {
         Ok(out)
     }
 
+    /// Returns the byte offse of the given context slot
+    ///
+    /// Contexts slots are located after block data in the extent file.  There
+    /// are two context slots per block.  We use a ping-pong strategy to ensure
+    /// that one of them is always valid (i.e. matching the data in the file).
     pub fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
         self.block_size * self.extent_size
             + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
