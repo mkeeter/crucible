@@ -14,7 +14,6 @@ use tokio::task::JoinHandle;
 use anyhow::{anyhow, bail, Result};
 use futures::TryStreamExt;
 use nix::unistd::{sysconf, SysconfVar};
-use rusqlite::{params, Connection};
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -37,8 +36,7 @@ pub struct Extent {
     iov_max: usize,
 
     /// Inner contains information about the actual extent file that holds the
-    /// data, the metadata (stored in the database) about that extent, and the
-    /// set of dirty blocks that have been written to since last flush.
+    /// data and the metadata for that extent.
     pub inner: Mutex<Inner>,
 }
 
@@ -87,21 +85,43 @@ pub struct OnDiskDownstairsBlockContext {
     pub on_disk_hash: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnDiskMeta {
+    pub dirty: bool,
+    pub gen_number: u64,
+    pub flush_number: u64,
+}
+
 /// Size of backup data
 ///
 /// This must be large enough to contain an `Option<DownstairsBlockContext>`
 /// serialized using `bincode`.
 const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 64;
+const BLOCK_META_SIZE_BYTES: u64 = 64;
 
+/// `Inner` is a small wrapper around a [`std::fs::File`] representing an extent
+///
+/// The file is structured as follows:
+/// - Block data, structured as `block_size` × `extent_size`
+/// - Block contexts (for encryption).  Each block index (in the range
+///   `0..extent_size`) has two context slots; we use a ping-pong strategy when
+///   writing to ensure that one slot is always valid.  Each slot is
+///   [`BLOCK_CONTEXT_SLOT_SIZE_BYTES`] in size, so this region is
+///   `BLOCK_CONTEXT_SLOT_SIZE_BYTES * extent_size * 2` bytes in total.  The
+///   slots contain an `Option<OnDiskDownstairsBlockContext>`, serialized using
+///   `bincode`.
+/// - One byte marking whether the extent is dirty or not (0 if clean, 1 if
+///   dirty).
+/// - [`BLOCK_META_SIZE_BYTES`], which contains an [`OnDiskGenFlush`] serialized
+///   using `bincode`
 #[derive(Debug)]
 pub struct Inner {
     file: File,
-    metadb: Connection,
 
     /// Block size, in bytes
     block_size: u64,
 
-    /// Extent size, inblocks
+    /// Extent size, in blocks
     extent_size: u64,
 
     /// Is the `ping` or `pong` context slot active?
@@ -126,7 +146,6 @@ impl Inner {
     pub fn new(
         extent: u32,
         mut file: File,
-        metadb: Connection,
         block_size: u64,
         extent_size: u64,
     ) -> Result<Self> {
@@ -176,75 +195,56 @@ impl Inner {
             }
         }
 
-        let dirty = {
-            let mut stmt = metadb.prepare_cached(
-                "SELECT value FROM metadata where name='dirty'",
-            )?;
-            let mut dirty_iter = stmt.query_map([], |row| row.get(0))?;
-            let dirty = dirty_iter.next().unwrap()?;
-            assert!(dirty_iter.next().is_none());
-            dirty
+        let mut dirty = [0u8];
+        inner_file_buffered.read_exact(&mut dirty)?;
+        let dirty = match dirty[0] {
+            0 => false,
+            1 => true,
+            i => bail!("invalid dirty value: {i}"),
         };
 
         Ok(Self {
             file,
-            metadb,
             active_context,
             dirty,
             block_size,
             extent_size,
         })
     }
-    pub fn gen_number(&self) -> Result<u64> {
-        let mut stmt = self.metadb.prepare_cached(
-            "SELECT value FROM metadata where name='gen_number'",
-        )?;
-        let mut gen_number_iter = stmt.query_map([], |row| row.get(0))?;
-        let gen_number = gen_number_iter.next().unwrap()?;
-        assert!(gen_number_iter.next().is_none());
-
-        Ok(gen_number)
-    }
 
     pub fn flush_number(&self) -> Result<u64> {
-        let mut stmt = self.metadb.prepare_cached(
-            "SELECT value FROM metadata where name='flush_number'",
-        )?;
-        let mut flush_number_iter = stmt.query_map([], |row| row.get(0))?;
-        let flush_number = flush_number_iter.next().unwrap()?;
-        assert!(flush_number_iter.next().is_none());
+        self.get_metadata().map(|v| v.flush_number)
+    }
 
-        Ok(flush_number)
+    pub fn gen_number(&self) -> Result<u64> {
+        self.get_metadata().map(|v| v.gen_number)
+    }
+
+    pub fn get_metadata(&self) -> Result<OnDiskMeta> {
+        let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
+        let offset = self.meta_offset();
+        nix::sys::uio::pread(self.file.as_raw_fd(), &mut buf, offset as i64)
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+        let out: OnDiskMeta = bincode::deserialize(&buf)?;
+        Ok(out)
     }
 
     /*
      * The flush and generation numbers will be updated at the same time.
      */
     fn set_flush_number(&mut self, new_flush: u64, new_gen: u64) -> Result<()> {
-        // TODO: put this into a transaction
-        let tx = self.metadb.unchecked_transaction()?;
-        let mut stmt = self.metadb.prepare_cached(
-            "UPDATE metadata SET value=?1 WHERE name='flush_number'",
-        )?;
+        let d = OnDiskMeta {
+            dirty: false,
+            flush_number: new_flush,
+            gen_number: new_gen,
+        };
+        // Byte 0 is the dirty byte
+        let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
 
-        let _rows_affected = stmt.execute([new_flush])?;
-
-        let mut stmt = self.metadb.prepare_cached(
-            "UPDATE metadata SET value=?1 WHERE name='gen_number'",
-        )?;
-
-        let _rows_affected = stmt.execute([new_gen])?;
-
-        /*
-         * When we write out the new flush number, the dirty bit should be
-         * set back to false.
-         */
-        let mut stmt = self
-            .metadb
-            .prepare_cached("UPDATE metadata SET value=0 WHERE name='dirty'")?;
-        let _rows_affected = stmt.execute([])?;
-        tx.commit()?;
-
+        bincode::serialize_into(buf.as_mut_slice(), &d)?;
+        let offset = self.meta_offset();
+        nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
         self.dirty = false;
 
         Ok(())
@@ -277,15 +277,10 @@ impl Inner {
     }
 
     fn set_dirty(&mut self) -> Result<()> {
-        if !self.dirty {
-            let _ = self
-                .metadb
-                .prepare_cached(
-                    "UPDATE metadata SET value=1 WHERE name='dirty' AND value=0",
-                )?
-                .execute([])?;
-            self.dirty = true;
-        }
+        let offset = self.meta_offset();
+        nix::sys::uio::pwrite(self.file.as_raw_fd(), &[1u8], offset as i64)
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+        self.dirty = true;
         Ok(())
     }
 
@@ -307,7 +302,7 @@ impl Inner {
         Ok(out)
     }
 
-    /// Returns the byte offse of the given context slot
+    /// Returns the byte offset of the given context slot
     ///
     /// Contexts slots are located after block data in the extent file.  There
     /// are two context slots per block.  We use a ping-pong strategy to ensure
@@ -315,6 +310,14 @@ impl Inner {
     pub fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
         self.block_size * self.extent_size
             + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
+    }
+
+    /// Returns the byte offset of the metadata region
+    ///
+    /// The resulting offset points to serialized [`OnDiskMeta`] data.
+    pub fn meta_offset(&self) -> u64 {
+        self.block_size * self.extent_size
+            + (self.extent_size * 2) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
     }
 
     /*
@@ -404,33 +407,13 @@ impl Default for ExtentMeta {
 #[allow(clippy::enum_variant_names)]
 pub enum ExtentType {
     Data,
-    Db,
-    DbShm,
-    DbWal,
 }
 
 impl fmt::Display for ExtentType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    // `ExtentType::Data` has no extension
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ExtentType::Data => Ok(()),
-            ExtentType::Db => write!(f, "db"),
-            ExtentType::DbShm => write!(f, "db-shm"),
-            ExtentType::DbWal => write!(f, "db-wal"),
-        }
-    }
-}
-
-/**
- * Take an ExtentType and translate it into the corresponding
- * FileType from the repair client.
- */
-impl ExtentType {
-    fn to_file_type(&self) -> FileType {
-        match self {
-            ExtentType::Data => FileType::Data,
-            ExtentType::Db => FileType::Db,
-            ExtentType::DbShm => FileType::DbShm,
-            ExtentType::DbWal => FileType::DbWal,
         }
     }
 }
@@ -442,9 +425,6 @@ pub fn extent_file_name(number: u32, extent_type: ExtentType) -> String {
     match extent_type {
         ExtentType::Data => {
             format!("{:03X}", number & 0xFFF)
-        }
-        ExtentType::Db | ExtentType::DbShm | ExtentType::DbWal => {
-            format!("{:03X}.{}", number & 0xFFF, extent_type)
         }
     }
 }
@@ -537,76 +517,12 @@ pub fn remove_copy_cleanup_dir<P: AsRef<Path>>(dir: P, eid: u32) -> Result<()> {
 
 /**
  * Validate a list of sorted repair files.
- * There are either two or four files we expect to find, any more or less
- * and we have a bad list.  No duplicates.
+ * There should only be one repair file: the data file
  */
 pub fn validate_repair_files(eid: usize, files: &[String]) -> bool {
     let eid = eid as u32;
 
-    let some = vec![
-        extent_file_name(eid, ExtentType::Data),
-        extent_file_name(eid, ExtentType::Db),
-    ];
-
-    let mut all = some.clone();
-    all.extend(vec![
-        extent_file_name(eid, ExtentType::DbShm),
-        extent_file_name(eid, ExtentType::DbWal),
-    ]);
-
-    // Either we have some or all.
-    files == some || files == all
-}
-
-/// Always open sqlite with journaling, and synchronous.
-/// Note: these pragma_updates are not durable
-fn open_sqlite_connection<P: AsRef<Path>>(path: &P) -> Result<Connection> {
-    let metadb = Connection::open(path)?;
-
-    assert!(metadb.is_autocommit());
-    metadb.pragma_update(None, "journal_mode", "WAL")?;
-    metadb.pragma_update(None, "synchronous", "FULL")?;
-
-    // 16 page * 4KiB page size = 64KiB cache size
-    // Value chosen somewhat arbitrarily as a guess at a good starting point.
-    // the default is a 2000KiB cache size which was way too large, and we did
-    // not see any performance changes moving to a 64KiB cache size. But, this
-    // value may be something we want to reduce further, tune, or scale with
-    // extent size.
-    metadb.pragma_update(None, "cache_size", 16)?;
-
-    // rusqlite provides an LRU Cache (a cache which, when full, evicts the
-    // least-recently-used value). This caches prepared statements, allowing
-    // us to nullify the cost of parsing and compiling frequently used
-    // statements.  I've changed all sqlite queries in Inner to use
-    // `prepare_cached` to take advantage of this cache. I have not done this
-    // for `prepare_cached` region creation,
-    // since it wouldn't be relevant there.
-
-    // The result is a dramatic reduction in CPU time spent parsing queries.
-    // Prior to this change, sqlite3Prepare was taking 60% of CPU time
-    // during reads and 50% during writes based on dtrace flamegraphs.
-    // Afterwards, they don't even show up on the graph. I'm seeing a minimum
-    // doubling of actual throughput with `crudd` after this change on my
-    // local hardware.
-
-    // However, this does cost some amount of memory per-extent and thus will
-    // scale linearly . This cache size I'm setting now (64 statements) is
-    // chosen somewhat arbitrarily. If this becomes a significant consumer
-    // of memory, we should reduce the size of the LRU, and stop caching the
-    // statements in the coldest paths. At present, it doesn't seem to have any
-    // meaningful impact on memory usage.
-
-    // We could instead try to pre-generate and hold onto all the statements we
-    // need to use ourselves, but I looked into doing that, and basically
-    // the code required would be a mess due to lifetimes. We shouldn't do
-    // that except as a last resort.
-
-    // Also, if you're curious, the hashing function used is
-    // https://docs.rs/ahash/latest/ahash/index.html
-    metadb.set_prepared_statement_cache_capacity(64);
-
-    Ok(metadb)
+    files == [extent_file_name(eid, ExtentType::Data)]
 }
 
 impl Extent {
@@ -618,7 +534,7 @@ impl Extent {
 
     /**
      * Open an existing extent file at the location requested.
-     * Read in the metadata from the first block of the file.
+     * Read in the metadata from the end of the extent file
      */
     fn open<P: AsRef<Path>>(
         dir: P,
@@ -631,11 +547,12 @@ impl Extent {
          * Store extent data in files within a directory hierarchy so that
          * there are not too many files in any level of that hierarchy.
          */
-        let mut path = extent_path(&dir, number);
+        let path = extent_path(&dir, number);
 
         let bcount = def.extent_size().value;
         let size = def.block_size().checked_mul(bcount).unwrap()
-            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2;
+            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2
+            + BLOCK_META_SIZE_BYTES;
 
         remove_copy_cleanup_dir(&dir, number)?;
 
@@ -685,30 +602,6 @@ impl Extent {
             }
         };
 
-        /*
-         * Open a connection to the metadata db
-         */
-        path.set_extension("db");
-        let metadb =
-            match open_sqlite_connection(&path) {
-                Err(e) => {
-                    error!(
-                    log,
-                    "Error: Open of db file {:?} for extent#{} returned: {}",
-                    path, number, e
-                );
-                    bail!(
-                        "Open of db file {:?} for extent#{} returned: {}",
-                        path,
-                        number,
-                        e,
-                    );
-                }
-                Ok(m) => m,
-            };
-
-        // XXX: schema updates?
-
         let extent = Extent {
             number,
             read_only,
@@ -718,7 +611,6 @@ impl Extent {
             inner: Mutex::new(Inner::new(
                 number,
                 file,
-                metadb,
                 def.block_size(),
                 def.extent_size().value,
             )?),
@@ -732,16 +624,14 @@ impl Extent {
     }
 
     /**
-     * Close an extent and the metadata db files for it.
+     * Close an extent
      */
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
         let inner = self.inner.lock().await;
 
-        let gen = inner.gen_number().unwrap();
-        let flush = inner.flush_number().unwrap();
-        let dirty = inner.dirty().unwrap();
+        let m = inner.get_metadata().unwrap();
 
-        Ok((gen, flush, dirty))
+        Ok((m.gen_number, m.flush_number, m.dirty))
     }
 
     /**
@@ -759,7 +649,7 @@ impl Extent {
          * Store extent data in files within a directory hierarchy so that
          * there are not too many files in any level of that hierarchy.
          */
-        let mut path = extent_path(&dir, number);
+        let path = extent_path(&dir, number);
 
         /*
          * Verify there are not existing extent files.
@@ -771,7 +661,8 @@ impl Extent {
 
         let bcount = def.extent_size().value;
         let size = def.block_size().checked_mul(bcount).unwrap()
-            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2;
+            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2
+            + BLOCK_META_SIZE_BYTES;
 
         mkdir_for_file(&path)?;
         let mut file = OpenOptions::new()
@@ -780,72 +671,8 @@ impl Extent {
             .create(true)
             .open(&path)?;
 
-        file.set_len(size)?;
+        file.set_len(size)?; // 0s are a suitable default for everything here
         file.seek(SeekFrom::Start(0))?;
-
-        let mut seed = dir.as_ref().to_path_buf();
-        seed.push("seed");
-        seed.set_extension("db");
-        path.set_extension("db");
-
-        // Instead of creating the sqlite db for every extent, create it only
-        // once, and copy from a seed db when creating other extents. This
-        // minimizes Region create time.
-        let metadb = if Path::new(&seed).exists() {
-            std::fs::copy(&seed, &path)?;
-
-            open_sqlite_connection(&path)?
-        } else {
-            /*
-             * Create the metadata db
-             */
-            let metadb = open_sqlite_connection(&path)?;
-
-            /*
-             * Create tables and insert base data
-             */
-            metadb.execute(
-                "CREATE TABLE metadata (
-                    name TEXT PRIMARY KEY,
-                    value INTEGER NOT NULL
-                )",
-                [],
-            )?;
-
-            let meta = ExtentMeta::default();
-
-            metadb.execute(
-                "INSERT INTO metadata
-                (name, value) VALUES (?1, ?2)",
-                params!["ext_version", meta.ext_version],
-            )?;
-            metadb.execute(
-                "INSERT INTO metadata
-                (name, value) VALUES (?1, ?2)",
-                params!["gen_number", meta.gen_number],
-            )?;
-            metadb.execute(
-                "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
-                params!["flush_number", meta.flush_number],
-            )?;
-            metadb.execute(
-                "INSERT INTO metadata (name, value) VALUES (?1, ?2)",
-                params!["dirty", meta.dirty],
-            )?;
-
-            // write out
-            metadb.close().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("metadb.close() failed! {}", e.1),
-                )
-            })?;
-
-            // Save it as DB seed
-            std::fs::copy(&path, &seed)?;
-
-            open_sqlite_connection(&path)?
-        };
 
         /*
          * Complete the construction of our new extent
@@ -858,8 +685,7 @@ impl Extent {
             iov_max: Extent::get_iov_max()?,
             inner: Mutex::new(Inner {
                 file,
-                metadb,
-                dirty: false, // TODO read this from metadb to confirm
+                dirty: false,
                 active_context: vec![None; def.extent_size().value as usize],
                 block_size: def.block_size(),
                 extent_size: def.extent_size().value,
@@ -1337,8 +1163,10 @@ impl Extent {
         }
         cdt::extent__flush__file__done!(|| { (job_id.get(), self.number) });
 
-        // We put all of our metadb updates into a single transaction to
-        // assure that we have a single sync.
+        // We put all of our metadata updates into a single write to
+        // ensure that it lands on disk together.  However, we don't actually
+        // need to flush here; we must already be robust to failures before this
+        // point, so having the dirty update be non-persistent is fine.
         inner.set_flush_number(new_flush, new_gen)?;
 
         // Finally, reset the file's seek offset to 0
@@ -1729,18 +1557,13 @@ impl Region {
      *  4. Rename 012.copy dir to 012.replace dir
      *  5. fsync extent directory ( 00/000/ where the extent files live)
      *  6. Replace current extent 012 files with copied files of same name
-     *    from 012.replace dir
-     *  7. Remove any files in extent dir that don't exist in replacing dir
-     *     For example, if the replacement extent has 012 and 012.db, but
-     *     the current (bad) extent has 012 012.db 012.db-shm
-     *     and 012.db-wal, we want to remove the 012.db-shm and 012.db-wal
-     *     files when we replace 012 and 012.db with the new versions.
-     *  8. fsync files after copying them (new location).
-     *  9. fsync containing extent dir
-     * 10. Rename 012.replace dir to 012.completed dir.
-     * 11. fsync extent dir again (so dir rename is persisted)
-     * 12. Delete completed dir.
-     * 13. fsync extent dir again (so dir rename is persisted)
+     *     from 012.replace dir
+     *  7. fsync files after copying them (new location).
+     *  8. fsync containing extent dir
+     *  9. Rename 012.replace dir to 012.completed dir.
+     * 10. fsync extent dir again (so dir rename is persisted)
+     * 11. Delete completed dir.
+     * 12. fsync extent dir again (so dir rename is persisted)
      *
      *  This also requires the following behavior on every extent open:
      *   A. If xxx.copy directory found, delete it.
@@ -1855,58 +1678,6 @@ impl Region {
             }
         };
         save_stream_to_file(extent_copy, repair_stream.into_inner()).await?;
-
-        // The .db file is also required to exist for any valid extent.
-        let extent_db = Extent::create_copy_file(
-            copy_dir.clone(),
-            eid,
-            Some(ExtentType::Db),
-        )?;
-        let repair_stream = match repair_server
-            .get_extent_file(eid as u32, FileType::Db)
-            .await
-        {
-            Ok(rs) => rs,
-            Err(e) => {
-                crucible_bail!(
-                    RepairRequestError,
-                    "Failed to get extent {} db file: {:?}",
-                    eid,
-                    e,
-                );
-            }
-        };
-        save_stream_to_file(extent_db, repair_stream.into_inner()).await?;
-
-        // These next two are optional.
-        for opt_file in &[ExtentType::DbShm, ExtentType::DbWal] {
-            let filename = extent_file_name(eid as u32, opt_file.clone());
-
-            if repair_files.contains(&filename) {
-                let extent_shm = Extent::create_copy_file(
-                    copy_dir.clone(),
-                    eid,
-                    Some(opt_file.clone()),
-                )?;
-                let repair_stream = match repair_server
-                    .get_extent_file(eid as u32, opt_file.to_file_type())
-                    .await
-                {
-                    Ok(rs) => rs,
-                    Err(e) => {
-                        crucible_bail!(
-                            RepairRequestError,
-                            "Failed to get extent {} {} file: {:?}",
-                            eid,
-                            opt_file,
-                            e,
-                        );
-                    }
-                };
-                save_stream_to_file(extent_shm, repair_stream.into_inner())
-                    .await?;
-            }
-        }
 
         // After we have all files: move the repair dir.
         info!(
@@ -2384,66 +2155,6 @@ pub fn move_replacement_extent<P: AsRef<Path>>(
         );
     }
     sync_path(&original_file, log)?;
-
-    new_file.set_extension("db");
-    original_file.set_extension("db");
-    if let Err(e) = std::fs::copy(new_file.clone(), original_file.clone()) {
-        crucible_bail!(
-            IoError,
-            "copy {:?} to {:?} got: {:?}",
-            new_file,
-            original_file,
-            e
-        );
-    }
-    sync_path(&original_file, log)?;
-
-    // The .db-shm and .db-wal files may or may not exist.  If they don't
-    // exist on the source side, then be sure to remove them locally to
-    // avoid database corruption from a mismatch between old and new.
-    new_file.set_extension("db-shm");
-    original_file.set_extension("db-shm");
-    if new_file.exists() {
-        if let Err(e) = std::fs::copy(new_file.clone(), original_file.clone()) {
-            crucible_bail!(
-                IoError,
-                "copy {:?} to {:?} got: {:?}",
-                new_file,
-                original_file,
-                e
-            );
-        }
-        sync_path(&original_file, log)?;
-    } else if original_file.exists() {
-        info!(
-            log,
-            "Remove old file {:?} as there is no replacement",
-            original_file.clone()
-        );
-        std::fs::remove_file(&original_file)?;
-    }
-
-    new_file.set_extension("db-wal");
-    original_file.set_extension("db-wal");
-    if new_file.exists() {
-        if let Err(e) = std::fs::copy(new_file.clone(), original_file.clone()) {
-            crucible_bail!(
-                IoError,
-                "copy {:?} to {:?} got: {:?}",
-                new_file,
-                original_file,
-                e
-            );
-        }
-        sync_path(&original_file, log)?;
-    } else if original_file.exists() {
-        info!(
-            log,
-            "Remove old file {:?} as there is no replacement",
-            original_file.clone()
-        );
-        std::fs::remove_file(&original_file)?;
-    }
     sync_path(&destination_dir, log)?;
 
     // After we have all files: move the copy dir.
@@ -2620,7 +2331,6 @@ mod test {
 
         let inn = Inner {
             file: ff,
-            metadb: Connection::open_in_memory().unwrap(),
             block_size: 512,
             extent_size: 100,
             dirty: false,
@@ -2941,21 +2651,9 @@ mod test {
         // extent by copying the files from extent zero into the copy
         // directory.
         let dest_name = extent_file_name(1, ExtentType::Data);
-        let mut source_path = extent_path(&dir, 0);
+        let source_path = extent_path(&dir, 0);
         let mut dest_path = cp.clone();
         dest_path.push(dest_name);
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
-
-        source_path.set_extension("db");
-        dest_path.set_extension("db");
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
-
-        source_path.set_extension("db-shm");
-        dest_path.set_extension("db-shm");
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
-
-        source_path.set_extension("db-wal");
-        dest_path.set_extension("db-wal");
         std::fs::copy(source_path.clone(), dest_path.clone())?;
 
         let rd = replace_dir(&dir, 1);
@@ -2984,10 +2682,9 @@ mod test {
     #[tokio::test]
     async fn reopen_extent_cleanup_replay_short() -> Result<()> {
         // test move_replacement_extent(), create a copy dir, populate it
-        // and let the reopen do the work.  This time we make sure our
-        // copy dir only has extent data and .db files, and not .db-shm
-        // nor .db-wal.  Verify these files are delete from the original
-        // extent after the reopen has cleaned them up.
+        // and let the reopen do the work.  This time we make sure our copy dir
+        // only has extent data.  Verify these files are delete from the
+        // original extent after the reopen has cleaned them up.
         // Create the region, make three extents
         let dir = tempdir()?;
         let mut region =
@@ -3008,33 +2705,14 @@ mod test {
         // extent by copying the files from extent zero into the copy
         // directory.
         let dest_name = extent_file_name(1, ExtentType::Data);
-        let mut source_path = extent_path(&dir, 0);
+        let source_path = extent_path(&dir, 0);
         let mut dest_path = cp.clone();
         dest_path.push(dest_name);
         println!("cp {:?} to {:?}", source_path, dest_path);
         std::fs::copy(source_path.clone(), dest_path.clone())?;
 
-        source_path.set_extension("db");
-        dest_path.set_extension("db");
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
-
         let rd = replace_dir(&dir, 1);
         rename(cp.clone(), rd.clone())?;
-
-        // The close may remove the db-shm and db-wal files, manually
-        // create them here, just to verify they are removed after the
-        // reopen as they are not included in the files to be recovered
-        // and this test exists to verify they will be deleted.
-        let mut invalid_db = extent_path(&dir, 1);
-        invalid_db.set_extension("db-shm");
-        println!("Recreate {:?}", invalid_db);
-        std::fs::copy(source_path.clone(), invalid_db.clone())?;
-        assert!(Path::new(&invalid_db).exists());
-
-        invalid_db.set_extension("db-wal");
-        println!("Recreate {:?}", invalid_db);
-        std::fs::copy(source_path.clone(), invalid_db.clone())?;
-        assert!(Path::new(&invalid_db).exists());
 
         // Now we have a replace directory populated and our files to
         // delete are ready.  We verify that special action is taken
@@ -3042,12 +2720,6 @@ mod test {
 
         // Reopen extent 1
         region.reopen_extent(1).await?;
-
-        // Make sure there is no longer a db-shm and db-wal
-        dest_path.set_extension("db-shm");
-        assert!(!Path::new(&dest_path).exists());
-        dest_path.set_extension("db-wal");
-        assert!(!Path::new(&dest_path).exists());
 
         let _ext_one = region.get_opened_extent(1).await;
 
@@ -3084,13 +2756,9 @@ mod test {
         // extent by copying the files from extent zero into the copy
         // directory.
         let dest_name = extent_file_name(1, ExtentType::Data);
-        let mut source_path = extent_path(&dir, 0);
+        let source_path = extent_path(&dir, 0);
         let mut dest_path = cp.clone();
         dest_path.push(dest_name);
-        std::fs::copy(source_path.clone(), dest_path.clone())?;
-
-        source_path.set_extension("db");
-        dest_path.set_extension("db");
         std::fs::copy(source_path.clone(), dest_path.clone())?;
 
         let rd = replace_dir(&dir, 1);
@@ -3121,12 +2789,7 @@ mod test {
     #[test]
     fn validate_repair_files_good() {
         // This is an expected list of files for an extent
-        let good_files: Vec<String> = vec![
-            "001".to_string(),
-            "001.db".to_string(),
-            "001.db-shm".to_string(),
-            "001.db-wal".to_string(),
-        ];
+        let good_files: Vec<String> = vec!["001".to_string()];
 
         assert!(validate_repair_files(1, &good_files));
     }
@@ -3134,8 +2797,7 @@ mod test {
     #[test]
     fn validate_repair_files_also_good() {
         // This is also an expected list of files for an extent
-        let good_files: Vec<String> =
-            vec!["001".to_string(), "001.db".to_string()];
+        let good_files: Vec<String> = vec!["001".to_string()];
         assert!(validate_repair_files(1, &good_files));
     }
 
@@ -3148,38 +2810,9 @@ mod test {
     }
 
     #[test]
-    fn validate_repair_files_duplicate_pair() {
-        // duplicate file names for extent 2
-        let good_files: Vec<String> = vec![
-            "002".to_string(),
-            "002".to_string(),
-            "002.db".to_string(),
-            "002.db".to_string(),
-        ];
-        assert!(!validate_repair_files(2, &good_files));
-    }
-
-    #[test]
-    fn validate_repair_files_quad_duplicate() {
-        // This is an expected list of files for an extent
-        let good_files: Vec<String> = vec![
-            "001".to_string(),
-            "001.db".to_string(),
-            "001.db-shm".to_string(),
-            "001.db-shm".to_string(),
-        ];
-        assert!(!validate_repair_files(1, &good_files));
-    }
-
-    #[test]
     fn validate_repair_files_offbyon() {
         // Incorrect file names for extent 2
-        let good_files: Vec<String> = vec![
-            "001".to_string(),
-            "001.db".to_string(),
-            "001.db-shm".to_string(),
-            "001.db-wal".to_string(),
-        ];
+        let good_files: Vec<String> = vec!["001".to_string()];
 
         assert!(!validate_repair_files(2, &good_files));
     }
@@ -3187,24 +2820,8 @@ mod test {
     #[test]
     fn validate_repair_files_too_good() {
         // Duplicate file in list
-        let good_files: Vec<String> = vec![
-            "001".to_string(),
-            "001".to_string(),
-            "001.db".to_string(),
-            "001.db-shm".to_string(),
-            "001.db-wal".to_string(),
-        ];
-        assert!(!validate_repair_files(1, &good_files));
-    }
-
-    #[test]
-    fn validate_repair_files_not_good_enough() {
-        // We require 2 or 4 files, not 3
-        let good_files: Vec<String> = vec![
-            "001".to_string(),
-            "001.db".to_string(),
-            "001.db-wal".to_string(),
-        ];
+        let good_files: Vec<String> =
+            vec!["001".to_string(), "001".to_string()];
         assert!(!validate_repair_files(1, &good_files));
     }
 
@@ -3341,21 +2958,6 @@ mod test {
     #[test]
     fn extent_name_basic() {
         assert_eq!(extent_file_name(4, ExtentType::Data), "004");
-    }
-
-    #[test]
-    fn extent_name_basic_ext() {
-        assert_eq!(extent_file_name(4, ExtentType::Db), "004.db");
-    }
-
-    #[test]
-    fn extent_name_basic_ext_shm() {
-        assert_eq!(extent_file_name(4, ExtentType::DbShm), "004.db-shm");
-    }
-
-    #[test]
-    fn extent_name_basic_ext_wal() {
-        assert_eq!(extent_file_name(4, ExtentType::DbWal), "004.db-wal");
     }
 
     #[test]
@@ -3912,7 +3514,8 @@ mod test {
 
             let data_len = ddef.extent_size().value * ddef.block_size();
             let metadata_len =
-                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2
+                    + BLOCK_META_SIZE_BYTES;
 
             assert_eq!(data.len() as u64, data_len + metadata_len);
 
@@ -4522,7 +4125,8 @@ mod test {
 
             let data_len = ddef.extent_size().value * ddef.block_size();
             let metadata_len =
-                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2
+                    + BLOCK_META_SIZE_BYTES;
 
             assert_eq!(data.len() as u64, data_len + metadata_len);
 
@@ -4646,7 +4250,8 @@ mod test {
 
             let data_len = ddef.extent_size().value * ddef.block_size();
             let metadata_len =
-                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2
+                    + BLOCK_META_SIZE_BYTES;
 
             assert_eq!(data.len() as u64, data_len + metadata_len);
 
@@ -4771,7 +4376,8 @@ mod test {
 
             let data_len = ddef.extent_size().value * ddef.block_size();
             let metadata_len =
-                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2;
+                BLOCK_CONTEXT_SLOT_SIZE_BYTES * ddef.extent_size().value * 2
+                    + BLOCK_META_SIZE_BYTES;
 
             assert_eq!(data.len() as u64, data_len + metadata_len);
 
