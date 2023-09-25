@@ -261,8 +261,7 @@ impl Inner {
         let Some(slot) = self.active_context[block as usize] else {
             return Ok(None);
         };
-        let offset = self.block_size * self.extent_size
-            + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES;
+        let offset = self.context_slot_offset(block, slot);
         let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         nix::sys::uio::pread(self.file.as_raw_fd(), &mut buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
@@ -308,6 +307,11 @@ impl Inner {
         Ok(out)
     }
 
+    pub fn context_slot_offset(&mut self, block: u64, slot: bool) -> u64 {
+        self.block_size * self.extent_size
+            + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
+    }
+
     /*
      * Append a block context row.
      *
@@ -320,9 +324,9 @@ impl Inner {
         // Select the inactive slot
         let slot =
             !self.active_context[block_context.block as usize].unwrap_or(true);
-        let offset = self.block_size * self.extent_size
-            + (block_context.block * 2 + slot as u64)
-                * BLOCK_CONTEXT_SLOT_SIZE_BYTES;
+        let offset = self.context_slot_offset(block_context.block, slot);
+
+        // Serialize into a local buffer, then write into the inactive slot
         let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         let d = OnDiskDownstairsBlockContext {
             block_context: block_context.block_context,
@@ -331,6 +335,9 @@ impl Inner {
         bincode::serialize_into(buf.as_mut_slice(), &Some(d))?;
         nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+
+        // Return the just-written slot; it's the caller's responsibility to
+        // select it as active once data is written.
         Ok(slot)
     }
 
