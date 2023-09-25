@@ -307,7 +307,7 @@ impl Inner {
         Ok(out)
     }
 
-    pub fn context_slot_offset(&mut self, block: u64, slot: bool) -> u64 {
+    pub fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
         self.block_size * self.extent_size
             + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
     }
