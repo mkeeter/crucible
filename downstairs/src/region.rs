@@ -615,7 +615,7 @@ impl Extent {
      * Open an existing extent file at the location requested.
      * Read in the metadata from the first block of the file.
      */
-    async fn open<P: AsRef<Path>>(
+    fn open<P: AsRef<Path>>(
         dir: P,
         def: &RegionDefinition,
         number: u32,
@@ -1608,8 +1608,7 @@ impl Region {
                     eid,
                     self.read_only,
                     &self.log,
-                )
-                .await?;
+                )?;
 
                 if extent.dirty().await {
                     self.dirty_extents.insert(eid as usize);
@@ -1677,8 +1676,7 @@ impl Region {
             eid as u32,
             self.read_only,
             &self.log,
-        )
-        .await?;
+        )?;
 
         if new_extent.dirty().await {
             self.dirty_extents.insert(eid);
