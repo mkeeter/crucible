@@ -1145,10 +1145,12 @@ impl Extent {
             crucible_bail!(ModifyingReadOnlyRegion);
         }
 
-        /*
-         * We must first fsync to get any outstanding data written to disk.
-         * This must be done before we update the flush number.
-         */
+        // We put all of our metadata updates into a single write to make this
+        // operation atomic.
+        inner.set_flush_number(new_flush, new_gen)?;
+
+        // Now, we fsync to ensure data is flushed to disk.  It's okay to crash
+        // before this point, because setting the flush number is atomic.
         cdt::extent__flush__file__start!(|| { (job_id.get(), self.number) });
         if let Err(e) = inner.file.sync_all() {
             /*
@@ -1162,12 +1164,6 @@ impl Extent {
             );
         }
         cdt::extent__flush__file__done!(|| { (job_id.get(), self.number) });
-
-        // We put all of our metadata updates into a single write to
-        // ensure that it lands on disk together.  However, we don't actually
-        // need to flush here; we must already be robust to failures before this
-        // point, so having the dirty update be non-persistent is fine.
-        inner.set_flush_number(new_flush, new_gen)?;
 
         // Finally, reset the file's seek offset to 0
         inner.file.seek(SeekFrom::Start(0))?;
