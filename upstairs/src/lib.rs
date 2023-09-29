@@ -2621,9 +2621,7 @@ enum WrappedStream {
  * instance.  This task will run forever.
  */
 async fn looper(
-    tls_context: Arc<
-        tokio::sync::Mutex<Option<crucible_common::x509::TLSContext>>,
-    >,
+    tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
     up: &Arc<Upstairs>,
     mut up_coms: UpComs,
 ) {
@@ -8487,33 +8485,33 @@ pub enum BlockOp {
         id: Uuid,
         old: SocketAddr,
         new: SocketAddr,
-        result: Arc<Mutex<ReplaceResult>>,
+        result: Arc<std::sync::Mutex<ReplaceResult>>,
     },
     // Query ops
     QueryBlockSize {
-        data: Arc<Mutex<u64>>,
+        data: Arc<std::sync::Mutex<u64>>,
     },
     QueryTotalSize {
-        data: Arc<Mutex<u64>>,
+        data: Arc<std::sync::Mutex<u64>>,
     },
     QueryGuestIOReady {
-        data: Arc<Mutex<bool>>,
+        data: Arc<std::sync::Mutex<bool>>,
     },
     QueryUpstairsUuid {
-        data: Arc<Mutex<Uuid>>,
+        data: Arc<std::sync::Mutex<Uuid>>,
     },
     // Begin testing options.
     QueryExtentSize {
-        data: Arc<Mutex<Block>>,
+        data: Arc<std::sync::Mutex<Block>>,
     },
     QueryWorkQueue {
-        data: Arc<Mutex<WQCounts>>,
+        data: Arc<std::sync::Mutex<WQCounts>>,
     },
     // Send an update to all tasks that there is work on the queue.
     Commit,
     // Show internal work queue, return outstanding IO requests.
     ShowWork {
-        data: Arc<Mutex<WQCounts>>,
+        data: Arc<std::sync::Mutex<WQCounts>>,
     },
 }
 
@@ -9175,11 +9173,11 @@ impl Guest {
     }
 
     pub async fn query_extent_size(&self) -> Result<Block, CrucibleError> {
-        let data = Arc::new(Mutex::new(Block::new(0, 9)));
+        let data = Arc::new(std::sync::Mutex::new(Block::new(0, 9)));
         let extent_query = BlockOp::QueryExtentSize { data: data.clone() };
         self.send(extent_query).await.wait().await?;
 
-        let result = *data.lock().await;
+        let result = *data.lock().unwrap();
         Ok(result)
     }
 
@@ -9190,11 +9188,11 @@ impl Guest {
             active_count: 0,
         };
 
-        let data = Arc::new(Mutex::new(wc));
+        let data = Arc::new(std::sync::Mutex::new(wc));
         let qwq = BlockOp::QueryWorkQueue { data: data.clone() };
         self.send(qwq).await.wait().await.unwrap();
 
-        let wc = data.lock().await;
+        let wc = data.lock().unwrap();
         Ok(*wc)
     }
 
@@ -9233,31 +9231,31 @@ impl BlockIO for Guest {
     }
 
     async fn query_is_active(&self) -> Result<bool, CrucibleError> {
-        let data = Arc::new(Mutex::new(false));
+        let data = Arc::new(std::sync::Mutex::new(false));
         let active_query = BlockOp::QueryGuestIOReady { data: data.clone() };
         self.send(active_query).await.wait().await?;
 
-        let result = *data.lock().await;
+        let result = *data.lock().unwrap();
         Ok(result)
     }
 
     async fn total_size(&self) -> Result<u64, CrucibleError> {
-        let data = Arc::new(Mutex::new(0));
+        let data = Arc::new(std::sync::Mutex::new(0));
         let size_query = BlockOp::QueryTotalSize { data: data.clone() };
         self.send(size_query).await.wait().await?;
 
-        let result = *data.lock().await;
+        let result = *data.lock().unwrap();
         Ok(result)
     }
 
     async fn get_block_size(&self) -> Result<u64, CrucibleError> {
         let bs = self.block_size.load(std::sync::atomic::Ordering::Relaxed);
         if bs == 0 {
-            let data = Arc::new(Mutex::new(0));
+            let data = Arc::new(std::sync::Mutex::new(0));
             let size_query = BlockOp::QueryBlockSize { data: data.clone() };
             self.send(size_query).await.wait().await?;
 
-            let result = *data.lock().await;
+            let result = *data.lock().unwrap();
             self.block_size
                 .store(result, std::sync::atomic::Ordering::Relaxed);
             Ok(result)
@@ -9267,11 +9265,11 @@ impl BlockIO for Guest {
     }
 
     async fn get_uuid(&self) -> Result<Uuid, CrucibleError> {
-        let data = Arc::new(Mutex::new(Uuid::default()));
+        let data = Arc::new(std::sync::Mutex::new(Uuid::default()));
         let uuid_query = BlockOp::QueryUpstairsUuid { data: data.clone() };
         self.send(uuid_query).await.wait().await?;
 
-        let result = *data.lock().await;
+        let result = *data.lock().unwrap();
         Ok(result)
     }
 
@@ -9361,11 +9359,11 @@ impl BlockIO for Guest {
             active_count: 0,
         };
 
-        let data = Arc::new(Mutex::new(wc));
+        let data = Arc::new(std::sync::Mutex::new(wc));
         let sw = BlockOp::ShowWork { data: data.clone() };
         self.send(sw).await.wait().await.unwrap();
 
-        let wc = data.lock().await;
+        let wc = data.lock().unwrap();
         Ok(*wc)
     }
 
@@ -9375,7 +9373,7 @@ impl BlockIO for Guest {
         old: SocketAddr,
         new: SocketAddr,
     ) -> Result<ReplaceResult, CrucibleError> {
-        let data = Arc::new(Mutex::new(ReplaceResult::Missing));
+        let data = Arc::new(std::sync::Mutex::new(ReplaceResult::Missing));
         let sw = BlockOp::ReplaceDownstairs {
             id,
             old,
@@ -9384,7 +9382,7 @@ impl BlockIO for Guest {
         };
 
         self.send(sw).await.wait().await?;
-        let result = data.lock().await;
+        let result = data.lock().unwrap();
         Ok(*result)
     }
 }
@@ -9687,11 +9685,11 @@ async fn process_new_io(
             send_active(dst, gen);
         }
         BlockOp::QueryGuestIOReady { data } => {
-            *data.lock().await = up.guest_io_ready().await;
+            *data.lock().unwrap() = up.guest_io_ready().await;
             req.send_ok();
         }
         BlockOp::QueryUpstairsUuid { data } => {
-            *data.lock().await = up.uuid;
+            *data.lock().unwrap() = up.uuid;
             req.send_ok();
         }
         /*
@@ -9781,7 +9779,7 @@ async fn process_new_io(
             result,
         } => match up.replace_downstairs(id, old, new, &ds_done_tx).await {
             Ok(v) => {
-                *result.lock().await = v;
+                *result.lock().unwrap() = v;
                 req.send_ok();
             }
 
@@ -9806,7 +9804,7 @@ async fn process_new_io(
                     return;
                 }
             };
-            *data.lock().await = size;
+            *data.lock().unwrap() = size;
             req.send_ok();
         }
         BlockOp::QueryTotalSize { data } => {
@@ -9825,7 +9823,7 @@ async fn process_new_io(
                     return;
                 }
             };
-            *data.lock().await = size;
+            *data.lock().unwrap() = size;
             req.send_ok();
         }
         // Testing options
@@ -9846,7 +9844,7 @@ async fn process_new_io(
                     return;
                 }
             };
-            *data.lock().await = size;
+            *data.lock().unwrap() = size;
             req.send_ok();
         }
         BlockOp::QueryWorkQueue { data } => {
@@ -9858,7 +9856,7 @@ async fn process_new_io(
                 .filter(|state| **state == DsState::Active)
                 .count();
             drop(ds);
-            *data.lock().await = WQCounts {
+            *data.lock().unwrap() = WQCounts {
                 up_count: up.guest.guest_work.lock().await.active.len(),
                 ds_count: up.downstairs.lock().await.ds_active.len(),
                 active_count,
@@ -9867,7 +9865,7 @@ async fn process_new_io(
         }
         BlockOp::ShowWork { data } => {
             // TODO should this first check if the Upstairs is active?
-            *data.lock().await = show_all_work(up).await;
+            *data.lock().unwrap() = show_all_work(up).await;
             req.send_ok();
         }
         BlockOp::Commit => {
