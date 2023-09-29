@@ -1320,7 +1320,8 @@ pub mod repair_test {
 
     // Test function to create a downstairs.
     fn create_test_downstairs() -> Downstairs {
-        let mut ds = Downstairs::new(csl(), ClientMap::new());
+        let mut ds =
+            Downstairs::new(csl(), ClientMap::new(), DownstairsClients::new());
         for cid in ClientId::iter() {
             ds.ds_repair.insert(cid, "127.0.0.1:1234".parse().unwrap());
         }
