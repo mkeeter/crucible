@@ -4972,6 +4972,18 @@ impl DownstairsClient {
             io_state_count: IOStateCount::new(),
         }
     }
+
+    /// Return a count of downstairs request IDs of work we have sent
+    /// for this client, but don't yet have a response.
+    fn submitted_work(&self) -> usize {
+        self.io_state_count.in_progress as usize
+    }
+
+    /// Return a count of downstairs request IDs of total new and submitted
+    /// work we have for a downstairs.
+    fn total_live_work(&self) -> usize {
+        (self.io_state_count.new + self.io_state_count.in_progress) as usize
+    }
 }
 
 /// Container for three instances of per-downstairs data
@@ -4990,14 +5002,13 @@ impl DownstairsClients {
     /// Return a count of downstairs request IDs of work we have sent
     /// for this client, but don't yet have a response.
     fn submitted_work(&self, client_id: ClientId) -> usize {
-        self[client_id].lock().unwrap().io_state_count.in_progress as usize
+        self[client_id].lock().unwrap().submitted_work()
     }
 
     /// Return a count of downstairs request IDs of total new and submitted
     /// work we have for a downstairs.
     fn total_live_work(&self, client_id: ClientId) -> usize {
-        let c = self[client_id].lock().unwrap();
-        (c.io_state_count.new + c.io_state_count.in_progress) as usize
+        self[client_id].lock().unwrap().total_live_work()
     }
 
     /// Collect state counts from all clients and combine them
