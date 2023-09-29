@@ -277,10 +277,12 @@ impl Inner {
     }
 
     fn set_dirty(&mut self) -> Result<()> {
-        let offset = self.meta_offset();
-        nix::sys::uio::pwrite(self.file.as_raw_fd(), &[1u8], offset as i64)
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-        self.dirty = true;
+        if !self.dirty {
+            let offset = self.meta_offset();
+            nix::sys::uio::pwrite(self.file.as_raw_fd(), &[1u8], offset as i64)
+                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+            self.dirty = true;
+        }
         Ok(())
     }
 
