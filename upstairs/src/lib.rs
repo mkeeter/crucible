@@ -5207,7 +5207,7 @@ pub struct Upstairs {
      * This allows us to verify each downstairs is the same, as well as
      * enables us to translate an LBA to an extent and block offset.
      */
-    ddef: Mutex<RegionDefinitionStatus>,
+    ddef: Arc<std::sync::Mutex<RegionDefinitionStatus>>,
 
     /*
      * Optional encryption context - Some if a key was supplied in
@@ -5327,7 +5327,7 @@ impl Upstairs {
             guest,
             downstairs: Mutex::new(Downstairs::new(log.clone(), ds_target)),
             flush_info: Arc::new(FlushInfo::new()),
-            ddef: Mutex::new(rd_status),
+            ddef: Arc::new(std::sync::Mutex::new(rd_status)),
             encryption_context,
             need_flush: AtomicBool::new(false),
             stats,
@@ -5886,7 +5886,7 @@ impl Upstairs {
          */
         let mut gw = self.guest.guest_work.lock().await;
         let mut downstairs = self.downstairs.lock().await;
-        let ddef = self.ddef.lock().await.get_def().unwrap();
+        let ddef = self.ddef.lock().unwrap().get_def().unwrap();
 
         /*
          * Verify IO is in range for our region.  If not give up now and
@@ -6050,7 +6050,7 @@ impl Upstairs {
          */
         let mut gw = self.guest.guest_work.lock().await;
         let mut downstairs = self.downstairs.lock().await;
-        let ddef = self.ddef.lock().await.get_def().unwrap();
+        let ddef = self.ddef.lock().unwrap().get_def().unwrap();
 
         /*
          * Verify IO is in range for our region
@@ -7130,7 +7130,7 @@ impl Upstairs {
          */
         ds.ds_uuid.insert(client_id, client_ddef.uuid());
 
-        let mut ddef = self.ddef.lock().await;
+        let mut ddef = self.ddef.lock().unwrap();
 
         /*
          * If there is an expected region definition of any kind (either from
@@ -9791,7 +9791,8 @@ async fn process_new_io(
         },
         // Query ops
         BlockOp::QueryBlockSize { data } => {
-            let size = match up.ddef.lock().await.get_def() {
+            let ddef = up.ddef.lock().unwrap().get_def();
+            let size = match ddef {
                 Some(rd) => rd.block_size(),
                 None => {
                     warn!(
@@ -9809,7 +9810,8 @@ async fn process_new_io(
             req.send_ok();
         }
         BlockOp::QueryTotalSize { data } => {
-            let size = match up.ddef.lock().await.get_def() {
+            let ddef = up.ddef.lock().unwrap().get_def();
+            let size = match ddef {
                 Some(rd) => rd.total_size(),
                 None => {
                     warn!(
@@ -9829,7 +9831,8 @@ async fn process_new_io(
         // Testing options
         BlockOp::QueryExtentSize { data } => {
             // Yes, test only
-            let size = match up.ddef.lock().await.get_def() {
+            let ddef = up.ddef.lock().unwrap().get_def();
+            let size = match ddef {
                 Some(rd) => rd.extent_size(),
                 None => {
                     warn!(

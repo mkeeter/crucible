@@ -275,7 +275,7 @@ async fn live_repair_main(
     // At this point, the actual repair loop for a downstairs starts.
     let source_downstairs = source_downstairs.unwrap();
 
-    let extent_count = match up.ddef.lock().await.get_def() {
+    let extent_count = match up.ddef.lock().unwrap().get_def() {
         Some(ddef) => ddef.extent_count(),
         None => {
             panic!("Can't get ddef and we need it to repair");

@@ -162,12 +162,12 @@ pub(crate) mod up_test {
      * Terrible wrapper, but it allows us to call extent_from_offset()
      * just like the program does.
      */
-    async fn up_efo(
+    fn up_efo(
         up: &Arc<Upstairs>,
         offset: Block,
         num_blocks: u64,
     ) -> Vec<(u64, Block)> {
-        let ddef = &up.ddef.lock().await.get_def().unwrap();
+        let ddef = &up.ddef.lock().unwrap().get_def().unwrap();
         let num_blocks = Block::new_with_ddef(num_blocks, ddef);
         extent_from_offset(ddef, offset, num_blocks)
             .blocks(ddef)
@@ -180,19 +180,19 @@ pub(crate) mod up_test {
 
         for i in 0..100 {
             let exv = vec![extent_tuple(0, i)];
-            assert_eq!(up_efo(&up, Block::new_512(i), 1).await, exv);
+            assert_eq!(up_efo(&up, Block::new_512(i), 1), exv);
         }
 
         for i in 0..100 {
             let exv = vec![extent_tuple(1, i)];
-            assert_eq!(up_efo(&up, Block::new_512(100 + i), 1).await, exv);
+            assert_eq!(up_efo(&up, Block::new_512(100 + i), 1), exv);
         }
 
         let exv = vec![extent_tuple(2, 0)];
-        assert_eq!(up_efo(&up, Block::new_512(200), 1).await, exv);
+        assert_eq!(up_efo(&up, Block::new_512(200), 1), exv);
 
         let exv = vec![extent_tuple(9, 99)];
-        assert_eq!(up_efo(&up, Block::new_512(999), 1).await, exv);
+        assert_eq!(up_efo(&up, Block::new_512(999), 1), exv);
     }
 
     #[tokio::test]
@@ -201,25 +201,25 @@ pub(crate) mod up_test {
 
         for i in 0..99 {
             let exv = vec![extent_tuple(0, i), extent_tuple(0, i + 1)];
-            assert_eq!(up_efo(&up, Block::new_512(i), 2).await, exv);
+            assert_eq!(up_efo(&up, Block::new_512(i), 2), exv);
         }
 
         let exv = vec![extent_tuple(0, 99), extent_tuple(1, 0)];
-        assert_eq!(up_efo(&up, Block::new_512(99), 2).await, exv);
+        assert_eq!(up_efo(&up, Block::new_512(99), 2), exv);
 
         for i in 0..99 {
             let exv = vec![extent_tuple(1, i)];
-            assert_eq!(up_efo(&up, Block::new_512(100 + i), 1).await, exv);
+            assert_eq!(up_efo(&up, Block::new_512(100 + i), 1), exv);
         }
 
         let exv = vec![extent_tuple(1, 99), extent_tuple(2, 0)];
-        assert_eq!(up_efo(&up, Block::new_512(199), 2).await, exv);
+        assert_eq!(up_efo(&up, Block::new_512(199), 2), exv);
 
         let exv = vec![extent_tuple(2, 0), extent_tuple(2, 1)];
-        assert_eq!(up_efo(&up, Block::new_512(200), 2).await, exv);
+        assert_eq!(up_efo(&up, Block::new_512(200), 2), exv);
 
         let exv = vec![extent_tuple(9, 98), extent_tuple(9, 99)];
-        assert_eq!(up_efo(&up, Block::new_512(998), 2).await, exv);
+        assert_eq!(up_efo(&up, Block::new_512(998), 2), exv);
     }
 
     #[tokio::test]
@@ -233,11 +233,11 @@ pub(crate) mod up_test {
          * 1024 buffer
          */
         assert_eq!(
-            up_efo(&up, Block::new_512(99), 2).await,
+            up_efo(&up, Block::new_512(99), 2),
             vec![extent_tuple(0, 99), extent_tuple(1, 0)],
         );
         assert_eq!(
-            up_efo(&up, Block::new_512(98), 4).await,
+            up_efo(&up, Block::new_512(98), 4),
             vec![
                 extent_tuple(0, 98),
                 extent_tuple(0, 99),
@@ -253,10 +253,7 @@ pub(crate) mod up_test {
             let expected: Vec<(u64, Block)> = (0..100)
                 .map(|i| extent_tuple((offset + i) / 100, (offset + i) % 100))
                 .collect();
-            assert_eq!(
-                up_efo(&up, Block::new_512(offset), 100).await,
-                expected
-            );
+            assert_eq!(up_efo(&up, Block::new_512(offset), 100), expected);
         }
     }
 
@@ -266,40 +263,40 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn off_to_extent_length_zero() {
         let up = make_upstairs();
-        assert_eq!(up_efo(&up, Block::new_512(0), 0).await, vec![]);
+        assert_eq!(up_efo(&up, Block::new_512(0), 0), vec![]);
     }
 
     #[tokio::test]
     async fn off_to_extent_length_almost_too_big() {
         let up = make_upstairs();
-        up_efo(&up, Block::new_512(0), 1000).await;
+        up_efo(&up, Block::new_512(0), 1000);
     }
 
     #[tokio::test]
     #[should_panic]
     async fn off_to_extent_length_too_big() {
         let up = make_upstairs();
-        up_efo(&up, Block::new_512(0), 1001).await;
+        up_efo(&up, Block::new_512(0), 1001);
     }
 
     #[tokio::test]
     async fn off_to_extent_length_and_offset_almost_too_big() {
         let up = make_upstairs();
-        up_efo(&up, Block::new_512(900), 100).await;
+        up_efo(&up, Block::new_512(900), 100);
     }
 
     #[tokio::test]
     #[should_panic]
     async fn off_to_extent_length_and_offset_too_big() {
         let up = make_upstairs();
-        up_efo(&up, Block::new_512(1000), 1).await;
+        up_efo(&up, Block::new_512(1000), 1);
     }
 
     #[tokio::test]
     #[should_panic]
     async fn not_right_block_size() {
         let up = make_upstairs();
-        up_efo(&up, Block::new_4096(900), 1).await;
+        up_efo(&up, Block::new_4096(900), 1);
     }
 
     // key material made with `openssl rand -base64 32`
