@@ -4999,13 +4999,21 @@ impl DownstairsClients {
         out
     }
 
-    /// Collect state counts from all clients and combine them
-    pub fn flow_control(&self) -> ClientData<usize> {
-        let mut out = ClientData::new(0);
+    fn collect<T, F>(&self, f: F, d: T) -> ClientData<T>
+    where
+        F: Fn(&DownstairsClient) -> T,
+        T: Clone,
+    {
+        let mut out = ClientData::new(d);
         for c in ClientId::iter() {
-            out[c] = self[c].lock().unwrap().flow_control;
+            out[c] = f(&self[c].lock().unwrap())
         }
         out
+    }
+
+    /// Collect state counts from all clients and combine them
+    pub fn flow_control(&self) -> ClientData<usize> {
+        self.collect(|c| c.flow_control, 0)
     }
 }
 
