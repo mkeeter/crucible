@@ -2637,9 +2637,7 @@ async fn looper(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         // Get the specific information for the downstairs we will operate on.
-        let ds = up.downstairs.lock().await;
-        let target: SocketAddr = ds.ds_target[up_coms.client_id];
-        drop(ds);
+        let target = up.downstairs.lock().await.ds_target[up_coms.client_id];
 
         /*
          * Make connection to this downstairs.
