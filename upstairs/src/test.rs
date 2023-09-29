@@ -942,9 +942,9 @@ pub(crate) mod up_test {
 
         assert_eq!(ds.completed.len(), 1);
         // No skipped jobs here.
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
     }
 
     #[tokio::test]
@@ -5859,9 +5859,9 @@ pub(crate) mod up_test {
             assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
 
             // We should have one job on the skipped job list for failed DS
-            assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-            assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-            assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+            assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+            assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+            assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
 
             next_id
         };
@@ -5937,10 +5937,10 @@ pub(crate) mod up_test {
         assert_eq!(ds.completed.len(), 3);
 
         // The last skipped flush should still be on the skipped list
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert!(ds.ds_skipped_jobs[ClientId::new(0)].contains(&JobId(1002)));
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
     }
 
     #[tokio::test]
@@ -6044,9 +6044,9 @@ pub(crate) mod up_test {
             assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
 
             // Two downstairs should have a skipped job on their lists.
-            assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-            assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-            assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+            assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+            assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+            assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
 
             next_id
         };
@@ -6306,9 +6306,9 @@ pub(crate) mod up_test {
 
         // A faulted write won't change skipped job count.
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
 
         // Verify we can ack this work
@@ -6348,10 +6348,10 @@ pub(crate) mod up_test {
 
         // One downstairs should have a skipped job on its list.
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert!(ds.ds_skipped_jobs[ClientId::new(1)].contains(&JobId(1001)));
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.contains(&JobId(1001)));
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
 
         // Enqueue the flush.
@@ -6403,10 +6403,10 @@ pub(crate) mod up_test {
         assert_eq!(ds.completed.len(), 3);
 
         // Only the skipped flush should remain.
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert!(ds.ds_skipped_jobs[ClientId::new(1)].contains(&JobId(1002)));
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
     }
 
     #[tokio::test]
@@ -6491,9 +6491,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(2)], IOState::New);
 
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
 
         drop(ds);
     }
@@ -6567,9 +6567,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(2)], IOState::InProgress);
 
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
     }
 
@@ -6622,9 +6622,9 @@ pub(crate) mod up_test {
             let job = ds.ds_active.get(&write_one).unwrap();
             assert_eq!(job.state[cid], IOState::Done);
         }
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
 
         // New write, this one will have a failure
@@ -6674,9 +6674,9 @@ pub(crate) mod up_test {
         );
 
         // A failed job does not change the skipped count.
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
     }
 
@@ -6800,9 +6800,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(1)], IOState::InProgress);
         assert_eq!(job.state[ClientId::new(2)], IOState::Skipped);
 
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 1);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 1);
         drop(ds);
     }
 
@@ -6854,9 +6854,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(2)], IOState::New);
 
         // Three skipped jobs for downstairs zero
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 3);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 3);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
     }
 
@@ -6909,9 +6909,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(2)], IOState::InProgress);
 
         // Three skipped jobs on downstairs client 0
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 3);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 0);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 3);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 0);
         drop(ds);
 
         // Do the write
@@ -6962,8 +6962,8 @@ pub(crate) mod up_test {
         ds.retire_check(flush_one);
 
         // Skipped jobs just has the flush
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert!(ds.ds_skipped_jobs[ClientId::new(0)].contains(&JobId(1002)));
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
         assert_eq!(ds.ackable_work().len(), 0);
 
         // The writes, the read, and the flush should be completed.
@@ -7025,9 +7025,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(2)], IOState::Skipped);
 
         // Skipped jobs added on downstairs client 0
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 3);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 0);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 3);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 3);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 0);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 3);
         drop(ds);
 
         // Do the write
@@ -7066,10 +7066,10 @@ pub(crate) mod up_test {
         ds.retire_check(flush_one);
 
         // Skipped jobs now just have the flush.
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert!(ds.ds_skipped_jobs[ClientId::new(0)].contains(&JobId(1002)));
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 1);
-        assert!(ds.ds_skipped_jobs[ClientId::new(2)].contains(&JobId(1002)));
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
         assert_eq!(ds.ackable_work().len(), 0);
 
         // The writes, the read, and the flush should be completed.
@@ -7115,9 +7115,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(2)], IOState::Skipped);
 
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 1);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 1);
         drop(ds);
 
         // Verify jobs can be acked.
@@ -7132,9 +7132,9 @@ pub(crate) mod up_test {
         ds.retire_check(read_one);
 
         // Our skipped jobs have not yet been cleared.
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 1);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 1);
         assert_eq!(ds.ackable_work().len(), 0);
     }
 
@@ -7164,9 +7164,9 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(2)], IOState::Skipped);
 
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 1);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 1);
         drop(ds);
 
         // Verify jobs can be acked.
@@ -7180,9 +7180,9 @@ pub(crate) mod up_test {
 
         ds.retire_check(write_one);
         // No flush, no change in skipped jobs.
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(0)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(1)].len(), 1);
-        assert_eq!(ds.ds_skipped_jobs[ClientId::new(2)].len(), 1);
+        assert_eq!(ds.clients[ClientId::new(0)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(1)].lock().unwrap().ds_skipped_jobs.len(), 1);
+        assert_eq!(ds.clients[ClientId::new(2)].lock().unwrap().ds_skipped_jobs.len(), 1);
 
         assert_eq!(ds.ackable_work().len(), 0);
     }
@@ -7213,8 +7213,8 @@ pub(crate) mod up_test {
         assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
         assert_eq!(job.state[ClientId::new(2)], IOState::Skipped);
         for cid in ClientId::iter() {
-            assert_eq!(ds.ds_skipped_jobs[cid].len(), 1);
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1000)));
+            assert_eq!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.len(), 1);
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1000)));
         }
         drop(ds);
 
@@ -7237,8 +7237,8 @@ pub(crate) mod up_test {
 
         // Skipped jobs still has the flush.
         for cid in ClientId::iter() {
-            assert_eq!(ds.ds_skipped_jobs[cid].len(), 1);
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1000)));
+            assert_eq!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.len(), 1);
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1000)));
         }
         drop(ds);
     }
@@ -7283,10 +7283,10 @@ pub(crate) mod up_test {
 
         // Skipped jobs are not yet cleared.
         for cid in ClientId::iter() {
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1000)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1001)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1002)));
-            assert_eq!(ds.ds_skipped_jobs[cid].len(), 3);
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1000)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1001)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+            assert_eq!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.len(), 3);
         }
 
         // Verify all IOs are done
@@ -7310,8 +7310,8 @@ pub(crate) mod up_test {
 
         // Skipped jobs now just has the flush
         for cid in ClientId::iter() {
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1002)));
-            assert_eq!(ds.ds_skipped_jobs[cid].len(), 1);
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+            assert_eq!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.len(), 1);
         }
     }
 
@@ -7367,13 +7367,13 @@ pub(crate) mod up_test {
 
         // Six jobs have been skipped.
         for cid in ClientId::iter() {
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1000)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1001)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1002)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1003)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1004)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1005)));
-            assert_eq!(ds.ds_skipped_jobs[cid].len(), 6);
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1000)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1001)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1003)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1004)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1005)));
+            assert_eq!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.len(), 6);
         }
 
         // Ack the first 3 jobs
@@ -7388,11 +7388,11 @@ pub(crate) mod up_test {
         // The first two skipped jobs are now cleared and the non-acked
         // jobs remain on the list, as well as the last flush.
         for cid in ClientId::iter() {
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1002)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1003)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1004)));
-            assert!(ds.ds_skipped_jobs[cid].contains(&JobId(1005)));
-            assert_eq!(ds.ds_skipped_jobs[cid].len(), 4);
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1002)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1003)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1004)));
+            assert!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.contains(&JobId(1005)));
+            assert_eq!(ds.clients[cid].lock().unwrap().ds_skipped_jobs.len(), 4);
         }
     }
 
