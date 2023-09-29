@@ -2624,7 +2624,7 @@ async fn looper(
     tls_context: Arc<
         tokio::sync::Mutex<Option<crucible_common::x509::TLSContext>>,
     >,
-    up: &Arc<Upstairs>,
+    up: Arc<Upstairs>,
     mut up_coms: UpComs,
 ) {
     let mut firstgo = true;
@@ -2723,7 +2723,7 @@ async fn looper(
          * Once we have a connected downstairs, the proc task takes over and
          * handles negotiation and work processing.
          */
-        match proc_stream(&target, up, tcp, &mut connected, &mut up_coms).await
+        match proc_stream(&target, &up, tcp, &mut connected, &mut up_coms).await
         {
             Ok(()) => {
                 // XXX figure out what to do here
@@ -10034,6 +10034,7 @@ async fn up_listen(
                      * breadcrumb behind.
                      */
                     warn!(up.log, "up_listen reports status_rx -> None ");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
             req = up.guest.recv() => {
@@ -10197,6 +10198,7 @@ pub async fn up_main(
      * tasks.
      */
     let mut dst = Vec::new();
+    let mut loopers = futures::stream::FuturesUnordered::new();
     for client_id in ClientId::iter() {
         /*
          * Create the channel that we will use to request that the loop
@@ -10223,9 +10225,7 @@ pub async fn up_main(
             ds_reconcile_done_tx: ds_reconcile_done_tx.clone(),
         };
         let tls_context = tls_context.clone();
-        tokio::spawn(async move {
-            looper(tls_context, &up, up_coms).await;
-        });
+        loopers.push(looper(tls_context, up, up_coms));
 
         dst.push(Target {
             ds_work_tx,
@@ -10234,6 +10234,7 @@ pub async fn up_main(
             ds_reconcile_work_tx,
         });
     }
+    tokio::spawn(async move { while let Some(_) = loopers.next().await {} });
 
     // If requested, start the control http server on the given address:port
     if let Some(control) = opt.control {
