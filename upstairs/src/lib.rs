@@ -71,6 +71,7 @@ pub use live_repair::{check_for_repair, ExtentInfo, RepairCheck};
 
 mod active_jobs;
 use active_jobs::ActiveJobs;
+mod mpsc_notify;
 
 use async_trait::async_trait;
 
@@ -451,7 +452,7 @@ async fn process_message(
     u: &Arc<Upstairs>,
     m: &Message,
     client_id: ClientId,
-    ds_done_tx: &mpsc::Sender<()>,
+    ds_done_tx: &mpsc_notify::Sender,
 ) -> Result<()> {
     let (upstairs_id, session_id, ds_id, result, extent_info) = match m {
         Message::Imok => return Ok(()),
@@ -673,17 +674,7 @@ async fn process_message(
     {
         Ok(notify_guest) => {
             if notify_guest {
-                match ds_done_tx.send(()).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!(
-                            u.log,
-                            "[{}] pm_task: {:?}, sending message to ds_done_tx",
-                            client_id,
-                            e
-                        );
-                    }
-                }
+                ds_done_tx.send();
             }
         }
         Err(e) => {
@@ -2582,7 +2573,7 @@ struct UpComs {
      * upstairs to all required downstairs has completed. The receiver is
      * the up_ds_listen() task.
      */
-    ds_done_tx: mpsc::Sender<()>,
+    ds_done_tx: mpsc_notify::Sender,
     /**
      * This channel is used to notify the proc task that it's time to
      * promote this downstairs to active.
@@ -3637,10 +3628,10 @@ impl Downstairs {
     /**
      * Enqueue a new downstairs request.
      */
-    async fn enqueue(
+    fn enqueue(
         &mut self,
         mut io: DownstairsIO,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) {
         let mut skipped = 0;
         let is_write = matches!(io.work, IOop::Write { .. });
@@ -3714,14 +3705,14 @@ impl Downstairs {
             job.ack_status = AckStatus::AckReady;
             info!(self.log, "Enqueue job {} goes straight to AckReady", ds_id);
 
-            ds_done_tx.send(()).await.unwrap();
+            ds_done_tx.send();
         } else if is_write {
             let mut handle = self.ds_active.get_mut(&ds_id).unwrap();
             let job = handle.job();
             assert_eq!(job.ack_status, AckStatus::NotAcked);
             job.ack_status = AckStatus::AckReady;
 
-            ds_done_tx.send(()).await.unwrap();
+            ds_done_tx.send();
         }
     }
 
@@ -5468,7 +5459,7 @@ impl Upstairs {
     async fn set_deactivate(
         &self,
         req: Option<BlockReq>,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> Result<(), ()> {
         /*
          * We are changing (maybe) the upstairs state, to make
@@ -5536,7 +5527,6 @@ impl Upstairs {
          * downstairs queues.
          */
         self.submit_flush_internal(&mut gw, &mut ds, req, None, ds_done_tx)
-            .await
     }
 
     #[cfg(test)]
@@ -5764,7 +5754,7 @@ impl Upstairs {
         &self,
         req: Option<BlockReq>,
         snapshot_details: Option<SnapshotDetails>,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> Result<(), ()> {
         /*
          * Lock first the guest_work struct where this new job will go,
@@ -5781,16 +5771,15 @@ impl Upstairs {
             snapshot_details,
             ds_done_tx,
         )
-        .await
     }
 
-    async fn submit_flush_internal(
+    fn submit_flush_internal(
         &self,
         gw: &mut GuestWork,
         downstairs: &mut Downstairs,
         req: Option<BlockReq>,
         snapshot_details: Option<SnapshotDetails>,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> Result<(), ()> {
         self.set_flush_clear();
 
@@ -5841,7 +5830,7 @@ impl Upstairs {
         gw.active.insert(gw_id, new_gtos);
 
         cdt::up__to__ds__flush__start!(|| (gw_id));
-        downstairs.enqueue(fl, ds_done_tx).await;
+        downstairs.enqueue(fl, ds_done_tx);
 
         Ok(())
     }
@@ -5863,7 +5852,7 @@ impl Upstairs {
         data: Bytes,
         req: Option<BlockReq>,
         is_write_unwritten: bool,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> Result<(), ()> {
         if !self.guest_io_ready().await {
             if let Some(req) = req {
@@ -6017,7 +6006,7 @@ impl Upstairs {
         } else {
             cdt::up__to__ds__write__start!(|| (gw_id));
         }
-        downstairs.enqueue(wr, ds_done_tx).await;
+        downstairs.enqueue(wr, ds_done_tx);
 
         Ok(())
     }
@@ -6034,7 +6023,7 @@ impl Upstairs {
         offset: Block,
         data: Buffer,
         req: Option<BlockReq>,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> Result<(), ()> {
         if !self.guest_io_ready().await {
             if let Some(req) = req {
@@ -6130,7 +6119,7 @@ impl Upstairs {
         }
 
         cdt::up__to__ds__read__start!(|| (gw_id));
-        downstairs.enqueue(wr, ds_done_tx).await;
+        downstairs.enqueue(wr, ds_done_tx);
 
         Ok(())
     }
@@ -7362,7 +7351,7 @@ impl Upstairs {
         id: Uuid,
         old: SocketAddr,
         new: SocketAddr,
-        ds_done_tx: &mpsc::Sender<()>,
+        ds_done_tx: &mpsc_notify::Sender,
     ) -> Result<ReplaceResult, CrucibleError> {
         warn!(
             self.log,
@@ -7456,7 +7445,7 @@ impl Upstairs {
         ds.ds_target.insert(old_client_id, new);
 
         if ds.ds_set_faulted(old_client_id) {
-            let _ = ds_done_tx.send(()).await;
+            ds_done_tx.send();
         }
         ds.region_metadata.remove(&old_client_id);
         self.ds_transition_with_lock(
@@ -9426,7 +9415,7 @@ pub struct Target {
     ds_work_tx: mpsc::Sender<u64>,
 
     /// Indicates that we can send a reply to a guest
-    ds_done_tx: mpsc::Sender<()>,
+    ds_done_tx: mpsc_notify::Sender,
 
     /// Receives an activation request
     ///
@@ -9501,12 +9490,12 @@ fn send_active(t: &[Target], gen: u64) {
  * complete any buffer transfers (reads) and then notify the guest that
  * their work has been completed.
  */
-async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
+async fn up_ds_listen(up: &Arc<Upstairs>, ds_done_rx: mpsc_notify::Receiver) {
     /*
      * Accept _any_ ds_done message, but work on the whole list of ackable
      * work.
      */
-    while ds_done_rx.recv().await.is_some() {
+    while ds_done_rx.recv().await {
         debug!(up.log, "up_ds_listen was notified");
         /*
          * XXX Do we need to hold the lock while we process all the
@@ -9572,7 +9561,7 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
 /// the IOP limit; 1.0 means the worst downstairs is at the limit.
 async fn gone_too_long(
     up: &Arc<Upstairs>,
-    ds_done_tx: mpsc::Sender<()>,
+    ds_done_tx: mpsc_notify::Sender,
 ) -> f32 {
     let active = up.active.lock().await;
     let up_state = active.up_state;
@@ -9621,15 +9610,7 @@ async fn gone_too_long(
         }
     }
     if notify_guest {
-        match ds_done_tx.send(()).await {
-            Ok(()) => {}
-            Err(e) => {
-                error!(
-                    up.log,
-                    "[up] gone_too_long {:?}, sending message to ds_done_tx", e
-                );
-            }
-        }
+        ds_done_tx.send();
     }
     dsw_max as f32 / IO_OUTSTANDING_MAX as f32
 }
@@ -10157,7 +10138,7 @@ pub async fn up_main(
      * Use this channel to indicate in the upstairs that all downstairs
      * operations for a specific request have completed.
      */
-    let (ds_done_tx, ds_done_rx) = mpsc::channel(MAX_ACTIVE_COUNT + 50);
+    let (ds_done_tx, ds_done_rx) = mpsc_notify::channel();
 
     /*
      * spawn a task to listen for ds completed work which will then

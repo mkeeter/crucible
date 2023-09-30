@@ -204,7 +204,7 @@ fn notify_ds_new_work(
 async fn live_repair_main(
     up: &Arc<Upstairs>,
     ds_work_vec: Vec<mpsc::Sender<u64>>,
-    ds_done_tx: mpsc::Sender<()>,
+    ds_done_tx: mpsc_notify::Sender,
 ) -> Result<()> {
     let log = up.log.new(o!("task" => "repair".to_string()));
     warn!(log, "Live Repair main task begins.");
@@ -738,7 +738,7 @@ impl Upstairs {
         &self,
         ds: &mut Downstairs,
         up_state: UpState,
-        ds_done_tx: &mpsc::Sender<()>,
+        ds_done_tx: &mpsc_notify::Sender,
     ) {
         let mut notify_guest = false;
         for cid in ClientId::iter() {
@@ -755,18 +755,8 @@ impl Upstairs {
             }
         }
 
-        // If we get an error, it's possible the other end has already
-        // given up on us, so just forge ahead.
         if notify_guest {
-            match ds_done_tx.try_send(()) {
-                Ok(()) => {}
-                Err(e) => {
-                    error!(
-                        self.log,
-                        "abort_repair error sending to ds_done_tx: {:?}", e
-                    );
-                }
-            }
+            ds_done_tx.send();
         }
     }
 
@@ -849,7 +839,7 @@ impl Upstairs {
         ds_id: JobId,
         eid: u64,
         mut abort_repair: bool,
-        ds_done_tx: &mpsc::Sender<()>,
+        ds_done_tx: &mpsc_notify::Sender,
     ) -> bool {
         // Independent of the current abort_repair state, we wait for
         // the ACK from a job we have submitted to the work queue.
@@ -941,7 +931,7 @@ impl Upstairs {
         eid: u64,
         source: ClientId,
         repair: Vec<ClientId>,
-        ds_done_tx: &mpsc::Sender<()>,
+        ds_done_tx: &mpsc_notify::Sender,
     ) -> Result<()> {
         debug!(self.log, "RE:{} Repair extent begins", eid);
 
@@ -1334,7 +1324,7 @@ pub mod repair_test {
         let mut dst = Vec::new();
         let mut ds_work_rx_vec = Vec::new();
 
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for _cid in ClientId::iter() {
             let (ds_work_tx, ds_work_rx) = mpsc::channel(500);
@@ -1428,7 +1418,7 @@ pub mod repair_test {
             ds_work_vec.push(this_target.ds_work_tx.clone());
         }
         let upc = Arc::clone(&up);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let repair_handle = tokio::spawn(async move {
             upc.repair_extent(
@@ -2637,7 +2627,7 @@ pub mod repair_test {
         // in LiveRepair and extent_limit is still None will be skipped
         // only by the downstairs that is in LiveRepair..
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         up.submit_write(
             Block::new_512(0),
@@ -2687,7 +2677,7 @@ pub mod repair_test {
         // in LiveRepair and the IO is below the extent_limit
         // will be sent to all downstairs for processing.
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 1);
@@ -2743,7 +2733,7 @@ pub mod repair_test {
         // of the Upstairs to correctly add the dependencies for the
         // in flight or soon to be in flight repair jobs.
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 0);
@@ -2795,7 +2785,7 @@ pub mod repair_test {
         // in LiveRepair and the IO is above the extent_limit will
         // be skipped by the downstairs that is in LiveRepair..
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 1);
@@ -2887,7 +2877,7 @@ pub mod repair_test {
         //   5 | R R R | R R R | R R R | 4
         //   6 | WuWuWu| WuWuWu| WuWuWu| 5
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 1);
@@ -2975,7 +2965,7 @@ pub mod repair_test {
         //   4 | R R R | R R R | R R R | 3
         //
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 1);
@@ -3041,7 +3031,7 @@ pub mod repair_test {
         //   4 | W W W | W W W | W W W | 3
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 1);
@@ -3113,7 +3103,7 @@ pub mod repair_test {
         //   8 | W W W | W W W | W W W | 3,7
         //
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 0);
@@ -4111,7 +4101,7 @@ pub mod repair_test {
         //   6 | RpRpRp| 5
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Write operations 0 to 2
         for i in 0..3 {
@@ -4168,7 +4158,7 @@ pub mod repair_test {
         //   6 | RpRpRp| 5
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Create read operations 0 to 2
         for i in 0..3 {
@@ -4224,7 +4214,7 @@ pub mod repair_test {
         //   6 |RpRpRp |
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         up.submit_read(
             Block::new_512(0),
@@ -4319,7 +4309,7 @@ pub mod repair_test {
         //   4 |     W | 3
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Repair IO functions assume you have the locks
         let mut ds = up.downstairs.lock().await;
@@ -4365,7 +4355,7 @@ pub mod repair_test {
         //   3 | RpRpRp|
         //   4 | R     | 3
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Repair IO functions assume you have the locks already
         let mut ds = up.downstairs.lock().await;
@@ -4410,7 +4400,7 @@ pub mod repair_test {
         //   3 | RpRpRp|
         //   4 | F F F | 3
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Repair IO functions assume you have the locks already
         let mut ds = up.downstairs.lock().await;
@@ -4451,7 +4441,7 @@ pub mod repair_test {
         //   4 |       | RpRpRp|       |
         //   5 |       | RpRpRp|       |
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         up.submit_write(
             Block::new_512(2),
@@ -4498,7 +4488,7 @@ pub mod repair_test {
         //   4 |       |       |   R   |
         //   5 |  W    |       |       |
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         create_and_enqueue_repair_ops(&up, 1).await;
 
@@ -4545,7 +4535,7 @@ pub mod repair_test {
         //   4 |       | RpRpRp|
         //   5 | F F F | F F F | 0,4
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         up.submit_flush(None, None, ds_done_tx.clone())
             .await
@@ -4588,7 +4578,7 @@ pub mod repair_test {
         //   7 |       | RpRpRp|
         //   8 |       | RpRpRp|
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         create_and_enqueue_repair_ops(&up, 0).await;
 
@@ -4624,7 +4614,7 @@ pub mod repair_test {
         //   4 |       | RpRpRp| 0
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A write of blocks 1,2 and 3 which spans the extent.
         up.submit_write(
@@ -4661,7 +4651,7 @@ pub mod repair_test {
         //   4 | RpRpRp|       |
         //
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A write of blocks 2,3 and 4 which spans the extent.
         up.submit_write(
@@ -4700,7 +4690,7 @@ pub mod repair_test {
         //   4 |       | RpRpRp|
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A read of blocks 1,2 and 3 which spans the extent.
         up.submit_read(
@@ -4736,7 +4726,7 @@ pub mod repair_test {
         //   4 | RpRpRp|       |
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A read of blocks 2,3 and 4 which spans the extent.
         up.submit_read(
@@ -4779,7 +4769,7 @@ pub mod repair_test {
         //   8 |       | RpRpRp| 6
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A write of blocks 2 and 3 which spans the extent.
         up.submit_write(
@@ -4818,7 +4808,7 @@ pub mod repair_test {
         //   4 |       | RpRpRp|       |
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A read of blocks 0-8, spans three extents.
         up.submit_read(
@@ -4886,7 +4876,7 @@ pub mod repair_test {
         // reservation that happens when we need to insert a job like this.
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         create_and_enqueue_repair_ops(&up, 0).await;
 
@@ -4930,7 +4920,7 @@ pub mod repair_test {
         //   4 |   R R | R     | 3
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         create_and_enqueue_repair_ops(&up, 1).await;
 
@@ -4968,7 +4958,7 @@ pub mod repair_test {
         //   5 |       | RpRpRp|       |
         //
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         up.submit_read(
             Block::new_512(0),
@@ -5029,7 +5019,7 @@ pub mod repair_test {
         //  14 |       |       | RpRpRp| 13
         //  15 |       |       | RpRpRp| 14
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         up.submit_write(
             Block::new_512(7),
@@ -5122,7 +5112,7 @@ pub mod repair_test {
         //   0 | F F F | F F F | 0,1
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // A write of blocks 2,3,4 which spans the extent.
         up.submit_write(
@@ -5192,7 +5182,7 @@ pub mod repair_test {
         //   4 |     W | W W   | 3
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 0);
@@ -5247,7 +5237,7 @@ pub mod repair_test {
         //  *4 |     R | R R   | 3
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 0);
@@ -5299,7 +5289,7 @@ pub mod repair_test {
         //   0 | F F F | F F F |
 
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 0);
@@ -5321,7 +5311,7 @@ pub mod repair_test {
         // Verify that we will send a write during LiveRepair when
         // the IO is an extent that is already repaired.
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
         ds.extent_limit.insert(ClientId::new(1), 1);
@@ -5352,7 +5342,7 @@ pub mod repair_test {
     // Test function to put some work on the work queues.
     async fn submit_three_ios(
         up: &Arc<Upstairs>,
-        ds_done_tx: &mpsc::Sender<()>,
+        ds_done_tx: &mpsc_notify::Sender,
     ) {
         up.submit_write(
             Block::new_512(0),
@@ -5394,7 +5384,7 @@ pub mod repair_test {
         // Move all IO for that downstairs to skipped.
         // Clear the extent_limit setting for that downstairs.
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let eid = 0u64;
         let mut ds = up.downstairs.lock().await;
@@ -5431,7 +5421,7 @@ pub mod repair_test {
         // repair job IDs reserved (but not created yet). The functions
         // will verify that four noop repair jobs will be queued.
         let up = create_test_upstairs(ClientId::new(1)).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let eid = 0u64;
         let mut ds = up.downstairs.lock().await;
@@ -5479,7 +5469,7 @@ pub mod repair_test {
         let up = create_test_upstairs(ClientId::new(1)).await;
         up.ds_transition(ClientId::new(0), DsState::Faulted).await;
         up.ds_transition(ClientId::new(2), DsState::Faulted).await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let eid = 0u64;
         let mut ds = up.downstairs.lock().await;
@@ -5547,7 +5537,7 @@ pub mod repair_test {
 
         let up = test_upstairs_okay().await;
         // Channels we want to appear to be working
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         // Now, send some IOs.
         submit_three_ios(&up, &ds_done_tx).await;
 
@@ -5643,7 +5633,7 @@ pub mod repair_test {
         let up = test_upstairs_okay().await;
 
         // Channels we want to appear to be working
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         // Now, send some IOs.
         submit_three_ios(&up, &ds_done_tx).await;
 
@@ -5757,7 +5747,7 @@ pub mod repair_test {
         //  13 |   W W | W     |
 
         let up = test_upstairs_okay().await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Now, put three IOs on the queue
         for block in 1..4 {
@@ -5924,7 +5914,7 @@ pub mod repair_test {
         //   5 |   W   |       |
 
         let up = test_upstairs_okay().await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         // Put the first write on the queue
         up.submit_write(
@@ -6122,7 +6112,7 @@ pub mod repair_test {
             .await;
         up.ds_transition(ClientId::new(1), DsState::LiveRepair)
             .await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
 
@@ -6217,7 +6207,7 @@ pub mod repair_test {
             .await;
         up.ds_transition(ClientId::new(1), DsState::LiveRepair)
             .await;
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let mut ds = up.downstairs.lock().await;
 

@@ -744,7 +744,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_flush_three_ok() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -753,7 +753,7 @@ pub(crate) mod up_test {
 
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -807,7 +807,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_flush_snapshot_needs_three() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -825,7 +825,7 @@ pub(crate) mod up_test {
             None,
         );
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -884,7 +884,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_flush_one_error_then_ok() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -893,7 +893,7 @@ pub(crate) mod up_test {
 
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -950,7 +950,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_flush_two_errors_equals_fail() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -959,7 +959,7 @@ pub(crate) mod up_test {
 
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1012,7 +1012,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_read_one_ok() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1020,7 +1020,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1083,7 +1083,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_read_one_bad_two_ok() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1091,7 +1091,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1152,7 +1152,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_read_two_bad_one_ok() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1160,7 +1160,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1218,7 +1218,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_read_three_bad() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1226,7 +1226,7 @@ pub(crate) mod up_test {
 
         let (_request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -1280,7 +1280,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_read_two_ok_one_bad() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         let (request, iblocks) = generic_read_request();
@@ -1297,7 +1297,7 @@ pub(crate) mod up_test {
                 vec![request.clone()],
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             ds.in_progress(next_id, ClientId::new(0));
             ds.in_progress(next_id, ClientId::new(1));
@@ -1357,7 +1357,7 @@ pub(crate) mod up_test {
     async fn work_read_hash_mismatch() {
         // Test that a hash mismatch will trigger a panic.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1365,7 +1365,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1411,7 +1411,7 @@ pub(crate) mod up_test {
         // Test that a hash mismatch will trigger a panic.
         // We check here after a ACK, because that is a different location.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1419,7 +1419,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1464,13 +1464,13 @@ pub(crate) mod up_test {
     async fn work_read_hash_mismatch_third() {
         // Test that a hash mismatch on the third response will trigger a panic.
         let mut ds = Downstairs::new(csl(), ClientMap::new());
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         let id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx);
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1524,7 +1524,7 @@ pub(crate) mod up_test {
         // Test that a hash mismatch on the third response will trigger a panic.
         // This one checks after an ACK.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1532,7 +1532,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1586,7 +1586,7 @@ pub(crate) mod up_test {
     async fn work_read_hash_mismatch_inside() {
         // Test that a hash length mismatch will panic
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1594,7 +1594,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1641,7 +1641,7 @@ pub(crate) mod up_test {
         // Test that empty data first, then data later will trigger
         // hash mismatch panic.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1649,7 +1649,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1689,7 +1689,7 @@ pub(crate) mod up_test {
     async fn work_read_hash_mismatch_no_data_next() {
         // Test that missing data on the 2nd read response will panic
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1697,7 +1697,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(id, ClientId::new(0));
         ds.in_progress(id, ClientId::new(1));
@@ -1749,7 +1749,7 @@ pub(crate) mod up_test {
     // that takes write_unwritten as an arg.
     async fn work_errors_are_counted(is_write_unwritten: bool) {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -1767,7 +1767,7 @@ pub(crate) mod up_test {
             is_write_unwritten,
         );
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -1838,7 +1838,7 @@ pub(crate) mod up_test {
         // up_ds_listen test, a single downstairs skip won't prevent us
         // from acking back OK to the guest.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -1873,7 +1873,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
@@ -1932,7 +1932,7 @@ pub(crate) mod up_test {
         // up_ds_listen test, a double skip on a write or write_unwritten
         // will result in an error back to the guest.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -1968,7 +1968,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
 
         ds.process_ds_completion(
@@ -2015,7 +2015,7 @@ pub(crate) mod up_test {
         // up_ds_listen test, a fail plus a skip on a write or write_unwritten
         // will result in an error back to the guest.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -2050,7 +2050,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
 
@@ -2105,7 +2105,7 @@ pub(crate) mod up_test {
         // up_ds_listen test, a single downstairs skip won't prevent us
         // from acking back OK for a flush to the guest.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -2137,7 +2137,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
@@ -2185,7 +2185,7 @@ pub(crate) mod up_test {
         // up_ds_listen test, a double skip on a flush will result in an error
         // back to the guest.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -2218,7 +2218,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
 
         ds.process_ds_completion(
@@ -2253,7 +2253,7 @@ pub(crate) mod up_test {
         // up_ds_listen test, a fail plus a skip on a flush will result in an
         // error back to the guest.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -2286,7 +2286,7 @@ pub(crate) mod up_test {
         }
         drop(gw);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(2)).is_some());
 
@@ -2337,7 +2337,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn work_assert_reads_do_not_cause_failure_state_transition() {
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -2347,7 +2347,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -2413,7 +2413,7 @@ pub(crate) mod up_test {
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
         assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -2475,7 +2475,7 @@ pub(crate) mod up_test {
         // Verify that a read remains on the active queue until a flush
         // comes through and clears it.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -2484,7 +2484,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Move the work to submitted like we sent it to each downstairs
         ds.in_progress(next_id, ClientId::new(0));
@@ -2555,7 +2555,7 @@ pub(crate) mod up_test {
         let deps = ds.ds_active.deps_for_flush(next_id);
         let op = create_flush(next_id, deps, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
         ds.in_progress(next_id, ClientId::new(1));
@@ -2612,7 +2612,7 @@ pub(crate) mod up_test {
         // Verify that a read not ACKED remains on the active queue even
         // if a flush comes through after it.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -2621,7 +2621,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Move the work to submitted like we sent it to each downstairs
         ds.in_progress(next_id, ClientId::new(0));
@@ -2656,7 +2656,7 @@ pub(crate) mod up_test {
         let deps = ds.ds_active.deps_for_flush(next_id);
         let op = create_flush(next_id, deps, 10, 0, 0, None, None);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Send and complete the Flush at each downstairs.
         for cid in ClientId::iter() {
@@ -2705,7 +2705,7 @@ pub(crate) mod up_test {
         // completed.
         let upstairs = Upstairs::test_default(None);
         upstairs.set_active().await.unwrap();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         let mut ds = upstairs.downstairs.lock().await;
 
         // Create two writes, put them on the work queue
@@ -2721,7 +2721,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         let (request, iblocks) = generic_write_request();
         let op = create_write_eob(
@@ -2732,7 +2732,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Simulate sending both writes to downstairs 0 and 1
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -2794,7 +2794,7 @@ pub(crate) mod up_test {
         let flush_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(flush_id);
         let op = create_flush(flush_id, dep, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Simulate sending the flush to downstairs 0 and 1
         ds.in_progress(flush_id, ClientId::new(0));
@@ -2899,7 +2899,7 @@ pub(crate) mod up_test {
         // Verify that a write or write_unwritten remains on the active
         // queue until a flush comes through and clears it.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -2916,7 +2916,7 @@ pub(crate) mod up_test {
             is_write_unwritten,
         );
         // Put the write on the queue.
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the write to all three downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -2966,7 +2966,7 @@ pub(crate) mod up_test {
         let next_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(next_id);
         let op = create_flush(next_id, dep, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the flush to all three downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3032,7 +3032,7 @@ pub(crate) mod up_test {
         // 3rd IO and the flush, which then allows the work to be completed.
         // Also, we mix up which client finishes which job first.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -3049,7 +3049,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         let (request, iblocks) = generic_write_request();
         let op = create_write_eob(
@@ -3060,7 +3060,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the two writes, to 2/3 of the downstairs.
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3122,7 +3122,7 @@ pub(crate) mod up_test {
         let flush_id = ds.next_id();
         let dep = ds.ds_active.deps_for_flush(flush_id);
         let op = create_flush(flush_id, dep, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Send the flush to two downstairs.
         ds.in_progress(flush_id, ClientId::new(0));
@@ -3216,14 +3216,14 @@ pub(crate) mod up_test {
     async fn work_completed_read_replay() {
         // Verify that a single read will replay and move back from AckReady
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
         // Build our read IO and submit it to the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to all three downstairs
         ds.in_progress(next_id, ClientId::new(0));
@@ -3266,14 +3266,14 @@ pub(crate) mod up_test {
         // Verify that a read will replay and move not back from AckReady if
         // there is more than one done read.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
         // Build a read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3352,14 +3352,14 @@ pub(crate) mod up_test {
         // Verify that a read we Acked will still replay if that downstairs
         // goes away. Make sure everything still finishes ok.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
         // Create the read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3446,14 +3446,14 @@ pub(crate) mod up_test {
         // can just change the "data" we fill the response with like we
         // received different data than the original read.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
         // Create the read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3539,14 +3539,14 @@ pub(crate) mod up_test {
         // can just change the "data" we fill the response with like we
         // received different data than the original read.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
         // Create the read and put it on the work queue.
         let next_id = ds.next_id();
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to each downstairs.
         ds.in_progress(next_id, ClientId::new(0));
@@ -3642,7 +3642,7 @@ pub(crate) mod up_test {
         // write_unwritten will change state from AckReady back to NotAcked.
         // If we then redo the work, it should go back to AckReady.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -3657,7 +3657,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the read to two downstairs.
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3737,7 +3737,7 @@ pub(crate) mod up_test {
         // Verify that a replay when we have acked a write or write_unwritten
         // will not undo that ack.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -3752,7 +3752,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the write to two downstairs.
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -3953,7 +3953,7 @@ pub(crate) mod up_test {
         // Verify that deactivate done returns the upstairs to init.
 
         let up = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
         ds.ds_state[ClientId::new(0)] = DsState::Active;
@@ -3972,7 +3972,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the writes
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -4109,7 +4109,7 @@ pub(crate) mod up_test {
         // transition the upstairs back to init.
 
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
         ds.ds_state[ClientId::new(0)] = DsState::Active;
@@ -4156,7 +4156,7 @@ pub(crate) mod up_test {
         // last job on the list
 
         let up = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
         ds.ds_state[ClientId::new(0)] = DsState::Active;
@@ -4175,7 +4175,7 @@ pub(crate) mod up_test {
             vec![request],
             is_write_unwritten,
         );
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         // Submit the writes
         assert!(ds.in_progress(id1, ClientId::new(0)).is_some());
@@ -4244,7 +4244,7 @@ pub(crate) mod up_test {
         // TODO: This test should change when we support this behavior.
 
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         assert!(up.set_deactivate(None, ds_done_tx.clone()).await.is_err());
         up.set_active().await.unwrap();
         up.set_deactivate(None, ds_done_tx.clone()).await.unwrap();
@@ -4437,7 +4437,7 @@ pub(crate) mod up_test {
             .await;
 
         let (ds_work_tx, _) = mpsc::channel(500);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         let (ds_reconcile_work_tx, _) = watch::channel(1);
         let (ds_active_tx, _) = watch::channel(1);
         let (_, mut ds_reconcile_done_rx) = mpsc::channel::<Repair>(32);
@@ -5109,7 +5109,7 @@ pub(crate) mod up_test {
         // Failure to decrypt means panic.
         // This result has a valid hash, but won't decrypt.
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -5126,7 +5126,7 @@ pub(crate) mod up_test {
             512,
         ));
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         ds.in_progress(next_id, ClientId::new(0));
 
@@ -5181,7 +5181,7 @@ pub(crate) mod up_test {
     async fn bad_read_hash_means_panic() {
         // Verify that a bad hash on a read will panic
         let upstairs = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
         let mut ds = upstairs.downstairs.lock().await;
 
@@ -5189,7 +5189,7 @@ pub(crate) mod up_test {
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
         ds.in_progress(next_id, ClientId::new(0));
 
         // fake read response from downstairs that will fail integrity hash
@@ -5226,7 +5226,7 @@ pub(crate) mod up_test {
     async fn bad_hash_on_encrypted_read_panic() {
         // Verify that a decryption failure on a read will panic.
         let mut ds = Downstairs::new(csl(), ClientMap::new());
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         let next_id = ds.next_id();
 
         let (request, op) = create_generic_read_eob(&mut ds, next_id);
@@ -5240,7 +5240,7 @@ pub(crate) mod up_test {
             512,
         ));
 
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx);
 
         ds.in_progress(next_id, ClientId::new(0));
 
@@ -5676,7 +5676,7 @@ pub(crate) mod up_test {
         // This test also makes sure proper mutex behavior is used in
         // process_ds_operation.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -5699,7 +5699,7 @@ pub(crate) mod up_test {
                 false,
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
             assert!(ds.in_progress(next_id, ClientId::new(1)).is_some());
@@ -5764,7 +5764,7 @@ pub(crate) mod up_test {
         // Verify after acking IOs, we can then send a flush and
         // clear the jobs (some now failed/skipped) from the work queue.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -5788,7 +5788,7 @@ pub(crate) mod up_test {
                 false,
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             ds.in_progress(next_id, ClientId::new(0));
             ds.in_progress(next_id, ClientId::new(1));
@@ -5848,7 +5848,7 @@ pub(crate) mod up_test {
                 vec![request.clone()],
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             // As this DS is failed, it should return none
             assert_eq!(ds.in_progress(next_id, ClientId::new(0)), None);
@@ -5895,7 +5895,7 @@ pub(crate) mod up_test {
             let next_id = ds.next_id();
             let dep = ds.ds_active.deps_for_flush(next_id);
             let op = create_flush(next_id, dep, 10, 0, 0, None, None);
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             // As this DS is failed, it should return none
             assert_eq!(ds.in_progress(next_id, ClientId::new(0)), None);
@@ -5945,7 +5945,7 @@ pub(crate) mod up_test {
     async fn read_after_two_write_fail_is_alright() {
         // Verify that if two writes fail, a read can still be acked.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -5969,7 +5969,7 @@ pub(crate) mod up_test {
                 false,
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             ds.in_progress(next_id, ClientId::new(0));
             ds.in_progress(next_id, ClientId::new(1));
@@ -6034,7 +6034,7 @@ pub(crate) mod up_test {
                 vec![request.clone()],
             );
 
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             // As this DS is failed, it should return none
             assert_eq!(ds.in_progress(next_id, ClientId::new(0)), None);
@@ -6065,7 +6065,7 @@ pub(crate) mod up_test {
     async fn enqueue_write(
         up: &Arc<Upstairs>,
         make_in_progress: bool,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> JobId {
         let mut ds = up.downstairs.lock().await;
 
@@ -6074,7 +6074,7 @@ pub(crate) mod up_test {
         let (request, iblocks) = generic_write_request();
         let op =
             create_write_eob(&mut ds, id, iblocks, 10, vec![request], false);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         if make_in_progress {
             ds.in_progress(id, ClientId::new(0));
@@ -6091,7 +6091,7 @@ pub(crate) mod up_test {
     async fn enqueue_flush(
         up: &Arc<Upstairs>,
         make_in_progress: bool,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> JobId {
         let mut ds = up.downstairs.lock().await;
 
@@ -6099,7 +6099,7 @@ pub(crate) mod up_test {
 
         let deps = ds.ds_active.deps_for_flush(id);
         let op = create_flush(id, deps, 10, 0, 0, None, None);
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         if make_in_progress {
             ds.in_progress(id, ClientId::new(0));
@@ -6117,7 +6117,7 @@ pub(crate) mod up_test {
         request: ReadRequest,
         iblocks: ImpactedBlocks,
         make_in_progress: bool,
-        ds_done_tx: mpsc::Sender<()>,
+        ds_done_tx: mpsc_notify::Sender,
     ) -> JobId {
         let mut ds = up.downstairs.lock().await;
 
@@ -6126,7 +6126,7 @@ pub(crate) mod up_test {
         let op = create_read_eob(&mut ds, read_id, iblocks, 10, vec![request]);
 
         // Add the reads
-        ds.enqueue(op, ds_done_tx.clone()).await;
+        ds.enqueue(op, ds_done_tx.clone());
 
         if make_in_progress {
             ds.in_progress(read_id, ClientId::new(0));
@@ -6254,7 +6254,7 @@ pub(crate) mod up_test {
         // write can still be acked.
         // Then, send a flush and verify the work queue is cleared.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6359,7 +6359,7 @@ pub(crate) mod up_test {
             let next_id = ds.next_id();
             let dep = ds.ds_active.deps_for_flush(next_id);
             let op = create_flush(next_id, dep, 10, 0, 0, None, None);
-            ds.enqueue(op, ds_done_tx.clone()).await;
+            ds.enqueue(op, ds_done_tx.clone());
 
             assert!(ds.in_progress(next_id, ClientId::new(0)).is_some());
             // As this DS is failed, it should return none
@@ -6415,7 +6415,7 @@ pub(crate) mod up_test {
         // skipped jobs for each downstairs has the inflight job added
         // to it.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6502,7 +6502,7 @@ pub(crate) mod up_test {
         // work that was IOState::InProgress for that downstairs will change
         // to IOState::Skipped.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6577,7 +6577,7 @@ pub(crate) mod up_test {
         // Make sure that older jobs are still okay, and failed job was
         // skipped.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6685,7 +6685,7 @@ pub(crate) mod up_test {
         // and jobs not yet started on the faulted downstairs have
         // transitioned to skipped.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6809,7 +6809,7 @@ pub(crate) mod up_test {
         // Verify that any job submitted with a faulted downstairs is
         // automatically moved to skipped.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6863,7 +6863,7 @@ pub(crate) mod up_test {
         // Verify work can progress through the work queue even when one
         // downstairs has failed. One write, one read, and one flush.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
             up.ds_transition(cid, DsState::WaitQuorum).await;
@@ -6977,7 +6977,7 @@ pub(crate) mod up_test {
         // Verify we can still read (and clear the work queue) with only
         // one downstairs.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -7083,7 +7083,7 @@ pub(crate) mod up_test {
         // When three downstairs are faulted, verify that enqueue will move
         // work through the queue for us.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -7141,7 +7141,7 @@ pub(crate) mod up_test {
         // When three downstairs are faulted, verify that enqueue will move
         // work through the queue for us.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -7190,7 +7190,7 @@ pub(crate) mod up_test {
         // When three downstairs are faulted, verify that enqueue will move
         // work through the queue for us.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -7247,7 +7247,7 @@ pub(crate) mod up_test {
         // work through the queue for us. Several jobs are submitted and
         // a final flush should clean them out.
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -7321,7 +7321,7 @@ pub(crate) mod up_test {
         // stay on the ds_skipped_jobs list.
 
         let up = Upstairs::test_default(None);
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
 
         for cid in ClientId::iter() {
             up.ds_transition(cid, DsState::WaitActive).await;
@@ -7442,7 +7442,7 @@ pub(crate) mod up_test {
         //   1 | W     | 0
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -7491,7 +7491,7 @@ pub(crate) mod up_test {
         //   2 | W     | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -7553,7 +7553,7 @@ pub(crate) mod up_test {
         //   2 | W     | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -7613,7 +7613,7 @@ pub(crate) mod up_test {
         //   6 |           W | 3
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // ops 0 to 2
@@ -7683,7 +7683,7 @@ pub(crate) mod up_test {
         //   3 |     W | 0
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -7741,7 +7741,7 @@ pub(crate) mod up_test {
         //   6 |     W | 3
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -7823,7 +7823,7 @@ pub(crate) mod up_test {
         //   3 | W W W | 0,1,2
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // ops 0 to 2
@@ -7879,7 +7879,7 @@ pub(crate) mod up_test {
         //   1 | R     | 0
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -7928,7 +7928,7 @@ pub(crate) mod up_test {
         //   3 | R R   | 0,1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // ops 0 to 2
@@ -7985,7 +7985,7 @@ pub(crate) mod up_test {
         // (aka two reads don't depend on each other)
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8032,7 +8032,7 @@ pub(crate) mod up_test {
         //   2 | R     | 0
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8092,7 +8092,7 @@ pub(crate) mod up_test {
         //   2 | R     | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8147,7 +8147,7 @@ pub(crate) mod up_test {
         //   2 | FFFFF | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         upstairs
@@ -8193,7 +8193,7 @@ pub(crate) mod up_test {
         //   7 | FFFFF | 3,4,5,6
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8279,7 +8279,7 @@ pub(crate) mod up_test {
         //   1 | W     | 0
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8327,7 +8327,7 @@ pub(crate) mod up_test {
         //   2 | R     | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8390,7 +8390,7 @@ pub(crate) mod up_test {
         //   5 |       WuWu  | 4
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8492,7 +8492,7 @@ pub(crate) mod up_test {
         //   4 |         WuWu| 3
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // ops 0 to 4
@@ -8536,7 +8536,7 @@ pub(crate) mod up_test {
         //   4 | W W         | 3
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // ops 0 to 4
@@ -8580,7 +8580,7 @@ pub(crate) mod up_test {
         //   4 |             |
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8642,7 +8642,7 @@ pub(crate) mod up_test {
         //   2 |                |        W  W     | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8713,7 +8713,7 @@ pub(crate) mod up_test {
         //   4 |              R |                 | 3
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8810,7 +8810,7 @@ pub(crate) mod up_test {
         //   2 |     Wu Wu Wu Wu|  Wu Wu Wu       | 0,1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
@@ -8874,7 +8874,7 @@ pub(crate) mod up_test {
         // downstairs leaves and comes back)
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // submit a write, complete, then ack it
@@ -8954,7 +8954,7 @@ pub(crate) mod up_test {
         //   2 |     W  W       | 1
 
         let upstairs = make_upstairs();
-        let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
+        let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
         upstairs.set_active().await.unwrap();
 
         // op 0
