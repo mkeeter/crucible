@@ -1901,74 +1901,7 @@ where
     let mut timeout_deadline = deadline_secs(50.0);
     let mut ping_count = 0;
 
-    /*
-     * We create a task that handles messages from the downstairs (usually
-     * a result of a message we sent).  This channel is how this task
-     * communicates that there is a message to handle.
-     */
-    let (pm_task_tx, mut pm_task_rx) =
-        mpsc::channel::<Message>(MAX_ACTIVE_COUNT + 50);
-
     info!(up.log, "[{}] Starts cmd_loop", up_coms.client_id);
-    let pm_task = {
-        let up_c = up.clone();
-        let ds_done_tx = up_coms.ds_done_tx.clone();
-        let client_id = up_coms.client_id;
-
-        tokio::spawn(async move {
-            while let Some(m) = pm_task_rx.recv().await {
-                /*
-                 * TODO: Add a check here to make sure we are
-                 * connected and in the proper state before we
-                 * accept any commands.
-                 *
-                 * XXX Check the return code here and do something
-                 * about it.  If we fail in process_message, we should
-                 * handle it.
-                 */
-                if let Err(e) =
-                    process_message(&up_c, &m, client_id, &ds_done_tx).await
-                {
-                    warn!(
-                        up_c.log,
-                        "[{}] Error processing message: {}", client_id, e
-                    );
-                }
-
-                /*
-                 * We may have faulted this downstairs (after processing
-                 * this IO) or we may have received a request to replace this
-                 * downstairs.  If we have, then we exit this task which will
-                 * tear down this connection and require the downstairs to
-                 * reconnect and eventually go into LiveRepair mode.
-                 */
-                let my_state = up_c.downstairs.lock().await.ds_state[client_id];
-                if my_state == DsState::Faulted
-                    || my_state == DsState::Replacing
-                {
-                    warn!(
-                        up_c.log,
-                        "[{}] will exit pm_task, this downstairs {}",
-                        client_id,
-                        my_state
-                    );
-                    bail!(
-                        "[{}] This downstairs now in {}",
-                        client_id,
-                        my_state
-                    );
-                }
-
-                if up_c.ds_deactivate(client_id).await {
-                    bail!("[{}] exits after deactivation", client_id);
-                }
-            }
-            warn!(up_c.log, "[{}] pm_task rx.recv() is None", client_id);
-            Ok(())
-        })
-    };
-
-    tokio::pin!(pm_task);
     loop {
         tokio::select! {
             /*
@@ -1997,10 +1930,6 @@ where
              * new work would result in pings not being sent.
              */
             biased;
-            e = &mut pm_task => {
-                bail!("[{}] client work task ended, {:?}, so we end too",
-                    up_coms.client_id, e);
-            }
             f = fr.next() => {
                 // When the downstairs responds, push the deadlines
                 timeout_deadline = deadline_secs(50.0);
@@ -2111,7 +2040,60 @@ where
                         );
                     }
                     Some(m) => {
-                        pm_task_tx.send(m).await?;
+                        /*
+                         * TODO: Add a check here to make sure we are
+                         * connected and in the proper state before we
+                         * accept any commands.
+                         *
+                         * XXX Check the return code here and do something
+                         * about it.  If we fail in process_message, we should
+                         * handle it.
+                         */
+                        if let Err(e) =
+                            process_message(up, &m, up_coms.client_id,
+                                            &up_coms.ds_done_tx).await
+                        {
+                            warn!(
+                                up.log,
+                                "[{}] Error processing message: {}",
+                                up_coms.client_id, e
+                            );
+                        }
+
+                        /*
+                         * We may have faulted this downstairs (after processing
+                         * this IO) or we may have received a request to replace this
+                         * downstairs.  If we have, then we exit this task which will
+                         * tear down this connection and require the downstairs to
+                         * reconnect and eventually go into LiveRepair mode.
+                         */
+                        let my_state = up
+                            .downstairs
+                            .lock()
+                            .await
+                            .ds_state[up_coms.client_id];
+                        if my_state == DsState::Faulted
+                            || my_state == DsState::Replacing
+                        {
+                            warn!(
+                                up.log,
+                                "[{}] will exit pm_task, this downstairs {}",
+                                up_coms.client_id,
+                                my_state
+                            );
+                            bail!(
+                                "[{}] This downstairs now in {}",
+                                up_coms.client_id,
+                                my_state
+                            );
+                        }
+
+                        if up.ds_deactivate(up_coms.client_id).await {
+                            bail!(
+                                "[{}] exits after deactivation",
+                                up_coms.client_id
+                            );
+                        }
                     }
                 }
             }
