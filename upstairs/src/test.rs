@@ -1325,7 +1325,7 @@ pub(crate) mod up_test {
             .unwrap());
 
         {
-            // emulated run in up_ds_listen
+            // emulated run in check_ackable_work
 
             let mut ds = upstairs.downstairs.lock().await;
             let state = ds.ds_active.get(&next_id).unwrap().ack_status;
@@ -1835,7 +1835,7 @@ pub(crate) mod up_test {
     }
 
     async fn w_io_single_skip(is_write_unwritten: bool) {
-        // up_ds_listen test, a single downstairs skip won't prevent us
+        // check_ackable_work test, a single downstairs skip won't prevent us
         // from acking back OK to the guest.
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
@@ -1902,7 +1902,7 @@ pub(crate) mod up_test {
         let ack_list = ds.ackable_work();
         assert_eq!(ack_list.len(), 1);
 
-        // Simulation of what happens in up_ds_listen
+        // Simulation of what happens in check_ackable_work
         for ds_id_done in ack_list.iter() {
             assert_eq!(*ds_id_done, next_id);
 
@@ -1929,7 +1929,7 @@ pub(crate) mod up_test {
     }
 
     async fn w_io_double_skip(is_write_unwritten: bool) {
-        // up_ds_listen test, a double skip on a write or write_unwritten
+        // check_ackable_work test, a double skip on a write or write_unwritten
         // will result in an error back to the guest.
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
@@ -1984,7 +1984,7 @@ pub(crate) mod up_test {
         let ack_list = ds.ackable_work();
         assert_eq!(ack_list.len(), 1);
 
-        // Simulation of what happens in up_ds_listen
+        // Simulation of what happens in check_ackable_work
         for ds_id_done in ack_list.iter() {
             assert_eq!(*ds_id_done, next_id);
 
@@ -2012,7 +2012,7 @@ pub(crate) mod up_test {
     }
 
     async fn w_io_fail_and_skip(is_write_unwritten: bool) {
-        // up_ds_listen test, a fail plus a skip on a write or write_unwritten
+        // check_ackable_work test, a fail plus a skip on a write or write_unwritten
         // will result in an error back to the guest.
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
@@ -2084,7 +2084,7 @@ pub(crate) mod up_test {
         let ack_list = ds.ackable_work();
         assert_eq!(ack_list.len(), 1);
 
-        // Simulation of what happens in up_ds_listen
+        // Simulation of what happens in check_ackable_work
         for ds_id_done in ack_list.iter() {
             assert_eq!(*ds_id_done, next_id);
 
@@ -2102,7 +2102,7 @@ pub(crate) mod up_test {
 
     #[tokio::test]
     async fn flush_io_single_skip() {
-        // up_ds_listen test, a single downstairs skip won't prevent us
+        // check_ackable_work test, a single downstairs skip won't prevent us
         // from acking back OK for a flush to the guest.
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
@@ -2166,7 +2166,7 @@ pub(crate) mod up_test {
         let ack_list = ds.ackable_work();
         assert_eq!(ack_list.len(), 1);
 
-        // Simulation of what happens in up_ds_listen
+        // Simulation of what happens in check_ackable_work
         for ds_id_done in ack_list.iter() {
             assert_eq!(*ds_id_done, next_id);
 
@@ -2182,7 +2182,7 @@ pub(crate) mod up_test {
 
     #[tokio::test]
     async fn flush_io_double_skip() {
-        // up_ds_listen test, a double skip on a flush will result in an error
+        // check_ackable_work test, a double skip on a flush will result in an error
         // back to the guest.
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
@@ -2234,7 +2234,7 @@ pub(crate) mod up_test {
         let ack_list = ds.ackable_work();
         assert_eq!(ack_list.len(), 1);
 
-        // Simulation of what happens in up_ds_listen
+        // Simulation of what happens in check_ackable_work
         for ds_id_done in ack_list.iter() {
             assert_eq!(*ds_id_done, next_id);
 
@@ -2250,7 +2250,7 @@ pub(crate) mod up_test {
 
     #[tokio::test]
     async fn flush_io_fail_and_skip() {
-        // up_ds_listen test, a fail plus a skip on a flush will result in an
+        // check_ackable_work test, a fail plus a skip on a flush will result in an
         // error back to the guest.
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc_notify::channel();
@@ -2319,7 +2319,7 @@ pub(crate) mod up_test {
         let ack_list = ds.ackable_work();
         assert_eq!(ack_list.len(), 1);
 
-        // Simulation of what happens in up_ds_listen
+        // Simulation of what happens in check_ackable_work
         for ds_id_done in ack_list.iter() {
             assert_eq!(*ds_id_done, next_id);
 
@@ -7122,8 +7122,8 @@ pub(crate) mod up_test {
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
 
         // Verify all IOs are done
-        // We are simulating what would happen here by the up_ds_listen
-        // task, after it receives a notification from the ds_done_tx.
+        // We are simulating what would happen here by the check_ackable_work
+        // function, after it receives a notification from the ds_done_tx.
         let mut ds = up.downstairs.lock().await;
         ds.ack(read_one);
 
@@ -7171,8 +7171,8 @@ pub(crate) mod up_test {
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
 
         // Verify all IOs are done
-        // We are simulating what would happen here by the up_ds_listen
-        // task, after it receives a notification from the ds_done_tx.
+        // We are simulating what would happen here by the check_ackable_work
+        // function, after it receives a notification from the ds_done_tx.
         let mut ds = up.downstairs.lock().await;
         ds.ack(write_one);
 
@@ -7288,8 +7288,8 @@ pub(crate) mod up_test {
         }
 
         // Verify all IOs are done
-        // We are simulating what would happen here by the up_ds_listen
-        // task, after it receives a notification from the ds_done_tx.
+        // We are simulating what would happen here by the check_ackable_work
+        // call, after it receives a notification from the ds_done_tx.
         ds.ack(read_one);
         ds.ack(write_one);
         ds.ack(flush_one);
