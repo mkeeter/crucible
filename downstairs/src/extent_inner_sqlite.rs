@@ -512,6 +512,8 @@ impl SqliteInner {
     pub fn export_meta_and_context(
         &mut self,
     ) -> Result<Vec<u8>, CrucibleError> {
+        panic!()
+        /*
         // Check whether we need to rehash.  This is theoretically represented
         // by the `dirty` bit, but we're being _somewhat_ paranoid and manually
         // forcing a rehash if any blocks have multiple contexts stored.
@@ -577,6 +579,7 @@ impl SqliteInner {
         // Reset the file read position, just in case
         self.file.seek(SeekFrom::Start(0))?;
         Ok(buf)
+        */
     }
 
     fn get_block_contexts(

@@ -1106,8 +1106,18 @@ impl<'a> BatchedPwritev<'a> {
         &mut self,
         write: &'a crucible_protocol::Write,
     ) -> Result<(), CrucibleError> {
-        let block = write.offset.value;
+        self.add_write_block(write, write.offset.value)
+    }
 
+    /// Add a write to the batch, where the write block may not match the value
+    /// in the `write` argument.
+    ///
+    /// This happens if blocks are not contiguous in the data file.
+    pub fn add_write_block(
+        &mut self,
+        write: &'a crucible_protocol::Write,
+        block: u64,
+    ) -> Result<(), CrucibleError> {
         let should_perform_writes = if let Some(state) = &self.state {
             // Is this write contiguous with the last?
             if block == state.next_block_in_run {
@@ -1140,7 +1150,7 @@ impl<'a> BatchedPwritev<'a> {
         } else {
             // start fresh
             self.state = Some(BatchedPwritevState {
-                byte_offset: write.offset.value * self.block_size,
+                byte_offset: block * self.block_size,
                 iovecs: {
                     let mut iovecs = Vec::with_capacity(self.capacity);
                     iovecs.push(IoSlice::new(&write.data));
@@ -1192,6 +1202,7 @@ pub(crate) mod test {
         completed_dir, copy_dir, extent_path, remove_copy_cleanup_dir,
         DownstairsBlockContext,
     };
+    use crate::extent_inner_raw::SuperblockLayout;
 
     use super::*;
 
@@ -2170,13 +2181,20 @@ pub(crate) mod test {
 
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
+        let sb = SuperblockLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            let mut data = data.as_slice();
+            for _ in 0..sb.superblock_count {
+                let (chunk, next) = data.split_at(
+                    (ddef.block_size() * (sb.blocks_per_superblock + 1))
+                        as usize,
+                );
+                read_from_files.extend(&chunk[ddef.block_size() as usize..]);
+                data = next;
+            }
         }
 
         assert_eq!(buffer.len(), read_from_files.len());
@@ -2715,13 +2733,20 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
+        let sb = SuperblockLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            let mut data = data.as_slice();
+            for _ in 0..sb.superblock_count {
+                let (chunk, next) = data.split_at(
+                    (ddef.block_size() * (sb.blocks_per_superblock + 1))
+                        as usize,
+                );
+                read_from_files.extend(&chunk[ddef.block_size() as usize..]);
+                data = next;
+            }
         }
 
         assert_eq!(buffer, read_from_files);
@@ -2835,13 +2860,20 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
+        let sb = SuperblockLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            let mut data = data.as_slice();
+            for _ in 0..sb.superblock_count {
+                let (chunk, next) = data.split_at(
+                    (ddef.block_size() * (sb.blocks_per_superblock + 1))
+                        as usize,
+                );
+                read_from_files.extend(&chunk[ddef.block_size() as usize..]);
+                data = next;
+            }
         }
 
         assert_eq!(buffer, read_from_files);
@@ -2956,13 +2988,20 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
+        let sb = SuperblockLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            let mut data = data.as_slice();
+            for _ in 0..sb.superblock_count {
+                let (chunk, next) = data.split_at(
+                    (ddef.block_size() * (sb.blocks_per_superblock + 1))
+                        as usize,
+                );
+                read_from_files.extend(&chunk[ddef.block_size() as usize..]);
+                data = next;
+            }
         }
 
         assert_eq!(buffer, read_from_files);

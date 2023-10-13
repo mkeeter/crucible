@@ -14,9 +14,10 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{IoSliceMut, Read, Seek, SeekFrom};
+use std::io::{IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -31,25 +32,33 @@ pub struct OnDiskDownstairsBlockContext {
 ///
 /// In particular, the `dirty` byte is first, so it's easy to read at a known
 /// offset within the file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct OnDiskMeta {
     pub dirty: bool,
     pub gen_number: u64,
     pub flush_number: u64,
     pub ext_version: u32,
+
+    /// Generation for metadata itself
+    ///
+    /// Metadata is encoded at the beginning of every superblock, so that we can
+    /// write it to a portion of the file that has already changed (instead of
+    /// having to dirty an unrelated portion of the file).  When loading the
+    /// file, we pick the `OnDiskMeta` with the highest `meta_gen`
+    meta_gen: u64,
 }
 
 /// Size of backup data
 ///
 /// This must be large enough to contain an `Option<DownstairsBlockContext>`
 /// serialized using `bincode`.
-pub const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 64;
+pub const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 48;
 
 /// Size of metadata region
 ///
 /// This must be large enough to contain an `OnDiskMeta` serialized using
 /// `bincode`.
-pub const BLOCK_META_SIZE_BYTES: u64 = 64;
+pub const BLOCK_META_SIZE_BYTES: u64 = 32;
 
 /// `RawInner` is a wrapper around a [`std::fs::File`] representing an extent
 ///
@@ -76,12 +85,10 @@ pub struct RawInner {
     extent_size: Block,
 
     /// Is the `ping` or `pong` context slot active?
-    active_context: Vec<ActiveContext>,
-
-    /// Local cache for the `dirty` value
     ///
-    /// This allows us to only write the flag when the value changes
-    dirty: bool,
+    /// This is `None` if the state is unknown, e.g. upon initial startup or
+    /// when a write to a context slot may have failed.
+    active_context: Vec<Option<ActiveContext>>,
 
     /// Monotonically increasing sync index
     ///
@@ -95,18 +102,28 @@ pub struct RawInner {
     /// this array is set to `self.sync_index + 1` indicates that the slot has
     /// not yet been synched.
     context_slot_synched_at: Vec<[u64; 2]>,
+
+    /// Current metadata, cached here to avoid reading / writing unnecessarily
+    ///
+    /// When this is `None`, the metadata is in an unknown state and we need to
+    /// retrieve it from disk.
+    meta: Cell<Option<OnDiskMeta>>,
+
+    /// Index of the last modified superblock
+    ///
+    /// Storing this means that when we want to send a flush, we can edit the
+    /// [`OnDiskMeta`] in a superblock that already has edits, which improves
+    /// write locality.
+    last_superblock_modified: Option<u64>,
+
+    /// Superblock configuration and layout
+    superblock_layout: SuperblockLayout,
 }
 
 #[derive(Copy, Clone, Debug)]
 enum ActiveContext {
     /// There is no active context for the given block
     Empty,
-
-    /// The active context for the given block is unknown
-    ///
-    /// We set the context to this state before a write, so that if the write
-    /// fails, we rehash the file contents to get back to a known state.
-    Unknown,
 
     /// The active context is stored in the given slot
     Slot(bool),
@@ -122,7 +139,7 @@ impl ExtentInner for RawInner {
     }
 
     fn dirty(&self) -> Result<bool, CrucibleError> {
-        Ok(self.dirty)
+        self.get_metadata().map(|v| v.dirty)
     }
 
     fn write(
@@ -181,37 +198,11 @@ impl ExtentInner for RawInner {
             cdt::extent__write__get__hashes__start!(|| {
                 (job_id.0, self.extent_number, writes.len() as u64)
             });
-            let mut write_run_start = 0;
-            while write_run_start < writes.len() {
-                let first_write = writes[write_run_start];
-
-                // Starting from the first write in the potential run, we scan
-                // forward until we find a write with a block that isn't
-                // contiguous with the request before it. Since we're counting
-                // pairs, and the number of pairs is one less than the number of
-                // writes, we need to add 1 to get our actual run length.
-                let n_contiguous_writes = writes[write_run_start..]
-                    .windows(2)
-                    .take_while(|wr_pair| {
-                        wr_pair[0].offset.value + 1 == wr_pair[1].offset.value
-                    })
-                    .count()
-                    + 1;
-
-                // Query hashes for the write range.
-                let block_contexts = self.get_block_contexts(
-                    first_write.offset.value,
-                    n_contiguous_writes as u64,
-                )?;
-
-                for (i, block_contexts) in block_contexts.iter().enumerate() {
-                    if block_contexts.is_some() {
-                        let _ = writes_to_skip
-                            .insert(i as u64 + first_write.offset.value);
-                    }
+            for w in writes {
+                let ctx = self.get_block_context(w.offset.value)?;
+                if ctx.is_some() {
+                    writes_to_skip.insert(w.offset.value);
                 }
-
-                write_run_start += n_contiguous_writes;
             }
             cdt::extent__write__get__hashes__done!(|| {
                 (job_id.0, self.extent_number, writes.len() as u64)
@@ -221,6 +212,14 @@ impl ExtentInner for RawInner {
                 // Nothing to do
                 return Ok(());
             }
+        }
+
+        // Set up `last_superblock_modified` so that when we modify metadata (by
+        // calling `set_dirty` below), we edit the same superblock.
+        if let Some(w) = writes.get(0) {
+            self.last_superblock_modified = Some(
+                w.offset.value / self.superblock_layout.blocks_per_superblock,
+            );
         }
 
         self.set_dirty()?;
@@ -255,8 +254,7 @@ impl ExtentInner for RawInner {
             // Until the write lands, we can't trust the context slot and must
             // rehash it if requested.  This assignment is overwritten after the
             // write finishes.
-            self.active_context[write.offset.value as usize] =
-                ActiveContext::Unknown;
+            self.active_context[write.offset.value as usize] = None;
         }
 
         cdt::extent__write__raw__context__insert__done!(|| {
@@ -299,11 +297,13 @@ impl ExtentInner for RawInner {
             // write_to_skip.contains()`?
             if writes_to_skip.contains(&block) {
                 debug_assert!(only_write_unwritten);
-                batched_pwritev.perform_writes()?;
                 continue;
             }
 
-            batched_pwritev.add_write(write)?;
+            batched_pwritev.add_write_block(
+                write,
+                self.superblock_layout.block_pos(write.offset.value),
+            )?;
         }
 
         // Write any remaining data
@@ -313,7 +313,7 @@ impl ExtentInner for RawInner {
         for (write, new_slot) in writes.iter().zip(pending_slots) {
             if let Some(slot) = new_slot {
                 self.active_context[write.offset.value as usize] =
-                    ActiveContext::Slot(slot);
+                    Some(ActiveContext::Slot(slot));
             }
         }
 
@@ -351,8 +351,14 @@ impl ExtentInner for RawInner {
             let mut n_contiguous_requests = 1;
 
             for request_window in requests[req_run_start..].windows(2) {
-                if (request_window[0].offset.value + 1
-                    == request_window[1].offset.value)
+                let block0 = self
+                    .superblock_layout
+                    .block_pos(request_window[0].offset.value);
+                let block1 = self
+                    .superblock_layout
+                    .block_pos(request_window[1].offset.value);
+
+                if (block0 + 1 == block1)
                     && ((n_contiguous_requests + 1) < iov_max)
                 {
                     n_contiguous_requests += 1;
@@ -387,7 +393,8 @@ impl ExtentInner for RawInner {
             nix::sys::uio::preadv(
                 self.file.as_raw_fd(),
                 &mut iovecs,
-                first_req.offset.value as i64 * block_size as i64,
+                self.superblock_layout.block_pos(first_req.offset.value) as i64
+                    * block_size as i64,
             )
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
 
@@ -482,7 +489,7 @@ impl ExtentInner for RawInner {
         self.set_dirty()?;
         let new_slot = self.set_block_context(block_context)?;
         self.active_context[block_context.block as usize] =
-            ActiveContext::Slot(new_slot);
+            Some(ActiveContext::Slot(new_slot));
         Ok(())
     }
 
@@ -497,6 +504,89 @@ impl ExtentInner for RawInner {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct SuperblockLayout {
+    /// Number of data blocks in each superblock
+    ///
+    /// Each superblock also includes a leading metadata block, so the
+    /// superblock is of size `(blocks_per_superblock + 1) * block_size_bytes`
+    pub blocks_per_superblock: u64,
+
+    /// Extent file size, in bytes
+    extent_file_size: u64,
+
+    /// Number of superblocks in the file
+    ///
+    /// The final superblock may have fewer than `blocks_per_superblock` blocks
+    /// following it (but should have > 0).
+    pub superblock_count: u64,
+
+    /// Size of a block, in bytes
+    pub block_size_bytes: u64,
+}
+
+impl SuperblockLayout {
+    pub fn new(def: &RegionDefinition) -> Self {
+        const RECORD_SIZE: u64 = 128 * 1024;
+        let block_count = def.extent_size().value;
+        let block_size = def.block_size();
+        let max_blocks_per_superblock = (block_size - BLOCK_META_SIZE_BYTES)
+            / (BLOCK_CONTEXT_SLOT_SIZE_BYTES * 2);
+        assert!(max_blocks_per_superblock > 0);
+
+        let max_superblock_size_bytes =
+            (max_blocks_per_superblock + 1) * block_size;
+        let records_per_superblock = max_superblock_size_bytes / RECORD_SIZE;
+
+        let blocks_per_superblock = if records_per_superblock == 0 {
+            max_blocks_per_superblock
+        } else {
+            ((records_per_superblock * RECORD_SIZE) / block_size) - 1
+        };
+
+        let whole_superblocks = block_count / blocks_per_superblock;
+        let trailing_blocks = block_count % blocks_per_superblock;
+
+        let superblock_count = whole_superblocks + (trailing_blocks > 0) as u64;
+        let extent_file_size = (superblock_count + block_count) * block_size;
+
+        Self {
+            blocks_per_superblock,
+            extent_file_size,
+            superblock_count,
+            block_size_bytes: block_size,
+        }
+    }
+
+    /// Calculates the offset block position, taking metadata into account
+    ///
+    /// The position is as a block number (not a byte offset), and is guaranteed
+    /// to point to a data block within a superblock (i.e. *not* point to the
+    /// metadata block).
+    fn block_pos(&self, block: u64) -> u64 {
+        println!("blocks per sb: {}", self.blocks_per_superblock);
+        let pos = block / self.blocks_per_superblock;
+        let offset = block % self.blocks_per_superblock;
+
+        pos * (self.blocks_per_superblock + 1) + offset + 1
+    }
+
+    /// Returns the byte offset of the given context slot
+    ///
+    /// Contexts slots are located after block data in the extent file.  There
+    /// are two context slots per block.  We use a ping-pong strategy to ensure
+    /// that one of them is always valid (i.e. matching the data in the file).
+    fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
+        let pos = block / self.blocks_per_superblock;
+        let offset = block % self.blocks_per_superblock;
+        println!("pos: {pos}, offset: {offset}");
+
+        pos * (self.blocks_per_superblock + 1) * self.block_size_bytes
+            + BLOCK_META_SIZE_BYTES
+            + (offset * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
+    }
+}
+
 impl RawInner {
     pub fn create(
         dir: &Path,
@@ -504,10 +594,8 @@ impl RawInner {
         extent_number: u32,
     ) -> Result<Self> {
         let path = extent_path(dir, extent_number);
-        let bcount = def.extent_size().value;
-        let size = def.block_size().checked_mul(bcount).unwrap()
-            + BLOCK_META_SIZE_BYTES
-            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2;
+
+        let superblock_layout = SuperblockLayout::new(def);
 
         mkdir_for_file(&path)?;
         let mut file = OpenOptions::new()
@@ -517,15 +605,30 @@ impl RawInner {
             .open(&path)?;
 
         // All 0s are fine for everything except extent version in the metadata
-        file.set_len(size)?;
-        file.seek(SeekFrom::Start(0))?;
-        let mut out = Self {
-            file,
+        file.set_len(superblock_layout.extent_file_size)?;
+
+        // Write metadata to the first superblock.  This metadata has
+        // `meta_gen = 1`, so it will always be picked up.
+        let meta = OnDiskMeta {
             dirty: false,
+            gen_number: 0,
+            flush_number: 0,
+            ext_version: EXTENT_META_RAW,
+            meta_gen: 1,
+        };
+        {
+            let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
+            bincode::serialize_into(buf.as_mut_slice(), &meta)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&buf)?;
+        }
+
+        let out = Self {
+            file,
             extent_size: def.extent_size(),
             extent_number,
             active_context: vec![
-                ActiveContext::Empty;
+                Some(ActiveContext::Empty);
                 def.extent_size().value as usize
             ],
             context_slot_synched_at: vec![
@@ -533,10 +636,10 @@ impl RawInner {
                 def.extent_size().value as usize
             ],
             sync_index: 0,
+            meta: Some(meta).into(),
+            last_superblock_modified: None,
+            superblock_layout,
         };
-        // Setting the flush number also writes the extent version, since
-        // they're serialized together in the same block.
-        out.set_flush_number(0, 0)?;
 
         // Sync the file to disk, to avoid any questions
         if let Err(e) = out.file.sync_all() {
@@ -557,15 +660,10 @@ impl RawInner {
         read_only: bool,
         log: &Logger,
     ) -> Result<Self> {
-        let bcount = def.extent_size().value;
-        let size = def.block_size().checked_mul(bcount).unwrap()
-            + BLOCK_CONTEXT_SLOT_SIZE_BYTES * bcount * 2
-            + BLOCK_META_SIZE_BYTES;
+        let superblock_layout = SuperblockLayout::new(def);
 
-        /*
-         * Open the extent file and verify the size is as we expect.
-         */
-        let mut file =
+        // Open the extent file and verify the size is as we expect.
+        let file =
             match OpenOptions::new().read(true).write(!read_only).open(path) {
                 Err(e) => {
                     error!(
@@ -580,10 +678,11 @@ impl RawInner {
                 }
                 Ok(f) => {
                     let cur_size = f.metadata().unwrap().len();
-                    if size != cur_size {
+                    let expected_size = superblock_layout.extent_file_size;
+                    if expected_size != cur_size {
                         bail!(
-                            "File size {size:?} does not match \
-                             expected {cur_size:?}",
+                            "File size {cur_size:?} does not match \
+                             expected {expected_size:?}",
                         );
                     }
                     f
@@ -600,25 +699,13 @@ impl RawInner {
             .into());
         }
 
-        file.seek(SeekFrom::Start(Self::meta_offset_from_extent_size(
-            def.extent_size(),
-        )))?;
-        let mut dirty = [0u8];
-        file.read_exact(&mut dirty)?;
-        let dirty = match dirty[0] {
-            0 => false,
-            1 => true,
-            i => bail!("invalid dirty value: {i}"),
-        };
-
         Ok(Self {
             file,
             // Lazy initialization of which context slot is active
-            active_context: vec![
-                ActiveContext::Unknown;
-                def.extent_size().value as usize
-            ],
-            dirty,
+            active_context: vec![None; def.extent_size().value as usize],
+            // Lazy initialization of metadata
+            meta: None.into(),
+            last_superblock_modified: None,
             extent_number,
             extent_size: def.extent_size(),
             context_slot_synched_at: vec![
@@ -626,15 +713,15 @@ impl RawInner {
                 def.extent_size().value as usize
             ],
             sync_index: 0,
+            superblock_layout,
         })
     }
 
     fn set_dirty(&mut self) -> Result<(), CrucibleError> {
-        if !self.dirty {
-            let offset = self.meta_offset();
-            nix::sys::uio::pwrite(self.file.as_raw_fd(), &[1u8], offset as i64)
-                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-            self.dirty = true;
+        let mut meta = self.get_metadata()?;
+        if !meta.dirty {
+            meta.dirty = true;
+            self.set_metadata(meta)?;
         }
         Ok(())
     }
@@ -642,21 +729,28 @@ impl RawInner {
     /// Looks up the current context slot for the given block
     ///
     /// If the slot is currently unknown, rehashes the block and picks one of
-    /// the two slots, storing it locally.
+    /// the two slots (or `None`), storing it locally.
     fn get_block_context_slot(&mut self, block: usize) -> Result<Option<bool>> {
         match self.active_context[block] {
-            ActiveContext::Empty => Ok(None),
-            ActiveContext::Slot(b) => Ok(Some(b)),
-            ActiveContext::Unknown => {
+            Some(ActiveContext::Empty) => Ok(None),
+            Some(ActiveContext::Slot(b)) => Ok(Some(b)),
+            None => {
+                // Read the block data itself:
                 let block_size = self.extent_size.block_size_in_bytes();
                 let mut buf = vec![0; block_size as usize];
-                self.file
-                    .seek(SeekFrom::Start(block_size as u64 * block as u64))?;
+                self.file.seek(SeekFrom::Start(
+                    block_size as u64
+                        * self.superblock_layout.block_pos(block as u64),
+                ))?;
                 self.file.read_exact(&mut buf)?;
                 let hash = integrity_hash(&[&buf]);
 
+                // Then, read the slot data and decide if either slot
+                // (1) is present and
+                // (2) has a matching hash
                 self.file.seek(SeekFrom::Start(
-                    self.context_slot_offset(block as u64, false),
+                    self.superblock_layout
+                        .context_slot_offset(block as u64, false),
                 ))?;
                 let mut buf = vec![0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
                 let mut found = None;
@@ -667,13 +761,13 @@ impl RawInner {
                     if let Some(context) = context {
                         if context.on_disk_hash == hash {
                             self.active_context[block] =
-                                ActiveContext::Slot(slot != 0);
+                                Some(ActiveContext::Slot(slot != 0));
                             found = Some(slot != 0);
                         }
                     }
                 }
                 if found.is_none() {
-                    self.active_context[block] = ActiveContext::Empty;
+                    self.active_context[block] = Some(ActiveContext::Empty);
                 }
                 Ok(found)
             }
@@ -710,7 +804,9 @@ impl RawInner {
         // write to it below.
         *last_sync = self.sync_index + 1;
 
-        let offset = self.context_slot_offset(block_context.block, slot);
+        let offset = self
+            .superblock_layout
+            .context_slot_offset(block_context.block, slot);
 
         // Serialize into a local buffer, then write into the inactive slot
         let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
@@ -719,6 +815,7 @@ impl RawInner {
             on_disk_hash: block_context.on_disk_hash,
         };
         bincode::serialize_into(buf.as_mut_slice(), &Some(d))?;
+
         nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
 
@@ -728,48 +825,77 @@ impl RawInner {
     }
 
     fn get_metadata(&self) -> Result<OnDiskMeta, CrucibleError> {
+        if let Some(s) = self.meta.get() {
+            return Ok(s);
+        }
+        for i in 0..self.superblock_layout.superblock_count {
+            let offset = (self.superblock_layout.blocks_per_superblock + 1)
+                * self.extent_size.block_size_in_bytes() as u64
+                * i;
+            let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
+            nix::sys::uio::pread(
+                self.file.as_raw_fd(),
+                &mut buf,
+                offset as i64,
+            )
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+            let out: OnDiskMeta = bincode::deserialize(&buf)
+                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+
+            if self
+                .meta
+                .get()
+                .map(|n| n.meta_gen < out.meta_gen)
+                .unwrap_or(true)
+            {
+                self.meta.set(Some(out));
+            }
+        }
+        Ok(self.meta.get().unwrap())
+    }
+
+    fn set_metadata(
+        &mut self,
+        mut meta: OnDiskMeta,
+    ) -> Result<(), CrucibleError> {
+        let prev_meta = self.get_metadata()?;
+
+        let i = self.last_superblock_modified.unwrap_or(0);
+        let offset = (self.superblock_layout.blocks_per_superblock + 1)
+            * self.extent_size.block_size_in_bytes() as u64
+            * i;
+        meta.meta_gen = prev_meta.meta_gen.max(meta.meta_gen) + 1;
+
         let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
-        let offset = self.meta_offset();
-        nix::sys::uio::pread(self.file.as_raw_fd(), &mut buf, offset as i64)
+        bincode::serialize_into(buf.as_mut_slice(), &meta).unwrap();
+
+        // Clear the local metadata value until the write is complete
+        self.meta.set(None);
+        nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-        let out: OnDiskMeta = bincode::deserialize(&buf)
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-        Ok(out)
-    }
 
-    /// Returns the byte offset of the given context slot
-    ///
-    /// Contexts slots are located after block data in the extent file.  There
-    /// are two context slots per block.  We use a ping-pong strategy to ensure
-    /// that one of them is always valid (i.e. matching the data in the file).
-    fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
-        self.extent_size.block_size_in_bytes() as u64 * self.extent_size.value
-            + BLOCK_META_SIZE_BYTES
-            + (block * 2 + slot as u64) * BLOCK_CONTEXT_SLOT_SIZE_BYTES
-    }
+        // The write is complete; we can update our local cache
+        self.meta.set(Some(meta));
 
-    /// Returns the byte offset of the metadata region
-    ///
-    /// The resulting offset points to serialized [`OnDiskMeta`] data.
-    fn meta_offset(&self) -> u64 {
-        Self::meta_offset_from_extent_size(self.extent_size)
-    }
-
-    fn meta_offset_from_extent_size(extent_size: Block) -> u64 {
-        extent_size.block_size_in_bytes() as u64 * extent_size.value
+        Ok(())
     }
 
     fn get_block_context(
         &mut self,
         block: u64,
     ) -> Result<Option<DownstairsBlockContext>> {
+        // Figure out whether we have a valid context slot here
         let Some(slot) = self.get_block_context_slot(block as usize)? else {
             return Ok(None);
         };
-        let offset = self.context_slot_offset(block, slot);
+
+        // Read the context slot from the file on disk
+        let offset = self.superblock_layout.context_slot_offset(block, slot);
         let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         nix::sys::uio::pread(self.file.as_raw_fd(), &mut buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+
+        // Deserialize and convert the struct format
         let out: Option<OnDiskDownstairsBlockContext> =
             bincode::deserialize(&buf)?;
         let out = out.map(|c| DownstairsBlockContext {
@@ -783,21 +909,11 @@ impl RawInner {
 
     /// Update the flush number, generation number, and clear the dirty bit
     fn set_flush_number(&mut self, new_flush: u64, new_gen: u64) -> Result<()> {
-        let d = OnDiskMeta {
-            dirty: false,
-            flush_number: new_flush,
-            gen_number: new_gen,
-            ext_version: EXTENT_META_RAW,
-        };
-        // Byte 0 is the dirty byte
-        let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
-
-        bincode::serialize_into(buf.as_mut_slice(), &d)?;
-        let offset = self.meta_offset();
-        nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-        self.dirty = false;
-
+        let mut meta = self.get_metadata()?;
+        meta.flush_number = new_flush;
+        meta.gen_number = new_gen;
+        meta.dirty = false;
+        self.set_metadata(meta)?;
         Ok(())
     }
 
@@ -820,6 +936,7 @@ impl RawInner {
 mod test {
     use super::*;
     use bytes::{Bytes, BytesMut};
+    use crucible_common::RegionOptions;
     use crucible_protocol::EncryptionContext;
     use crucible_protocol::ReadRequest;
     use rand::Rng;
@@ -1321,5 +1438,54 @@ mod test {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_superblock_layout() {
+        let mut options = RegionOptions::default();
+        options.set_block_size(512); // bytes
+        options.set_extent_size(Block::new_512(128)); // blocks
+        let def = RegionDefinition::from_options(&options).unwrap();
+        let sb = SuperblockLayout::new(&def);
+
+        assert_eq!(sb.block_pos(0), 1);
+        assert_eq!(sb.block_pos(1), 2);
+        assert_eq!(sb.block_pos(2), 3);
+        assert_eq!(sb.block_pos(3), 4);
+        assert_eq!(sb.block_pos(4), 5);
+        assert_eq!(sb.block_pos(5), 7); // offset!
+        assert_eq!(sb.context_slot_offset(0, false), 32);
+        assert_eq!(sb.context_slot_offset(0, true), 32 + 48);
+        assert_eq!(sb.context_slot_offset(5, false), 6 * 512 + 32);
+        assert_eq!(sb.context_slot_offset(5, true), 6 * 512 + 32 + 48);
+
+        // Check that an image with 4K blocks snaps to 128 KiB
+        options.set_block_size(4096); // bytes
+        options.set_extent_size(Block::new_512(128)); // blocks
+        let def = RegionDefinition::from_options(&options).unwrap();
+        let sb = SuperblockLayout::new(&def);
+
+        assert_eq!(sb.blocks_per_superblock, 31);
+        assert_eq!(
+            sb.extent_file_size,
+            ((128 / 31) * 32 + (128 % 31) + 1) * 4096
+        );
+
+        // No trailing blocks, two superblocks
+        options.set_block_size(4096); // bytes
+        options.set_extent_size(Block::new_512(62));
+        let def = RegionDefinition::from_options(&options).unwrap();
+        let sb = SuperblockLayout::new(&def);
+
+        assert_eq!(sb.blocks_per_superblock, 31);
+        assert_eq!(sb.extent_file_size, ((63 / 31) * 32) * 4096);
+
+        // Even larger blocks!
+        options.set_block_size(8192); // bytes
+        options.set_extent_size(Block::new_512(128));
+        let def = RegionDefinition::from_options(&options).unwrap();
+        let sb = SuperblockLayout::new(&def);
+
+        assert_eq!(sb.blocks_per_superblock, 79);
     }
 }
