@@ -2,10 +2,10 @@
 use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use tokio::sync::Mutex;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use nix::unistd::{sysconf, SysconfVar};
 
 use serde::{Deserialize, Serialize};
@@ -351,37 +351,28 @@ impl Extent {
         let mut has_sqlite = path.with_extension("db").exists();
         if has_sqlite && !read_only {
             info!(log, "Migrating extent {number}");
-            // Truncate the file to the length of the extent data
+
             {
-                let f =
-                    OpenOptions::new().read(true).write(true).open(&path)?;
-                f.set_len(def.extent_size().value * def.block_size())?;
-            }
-            // Compute metadata and context slots
-            let meta_and_context = {
                 let mut inner = extent_inner_sqlite::SqliteInner::open(
                     &path, def, number, read_only, log,
                 )?;
-                inner.export_meta_and_context()?
-            };
-            // Append the new raw data, then sync the file to disk
-            {
-                let mut f = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .append(true)
-                    .open(&path)?;
-                f.write_all(&meta_and_context)?;
-                f.sync_all()
-                    .with_context(|| format!("{path:?}: fsync failure"))?;
+                let mut raw = extent_inner_raw::RawInner::create_ext(
+                    &path,
+                    def,
+                    number,
+                    Some("migrate"),
+                )?;
+                inner.export(&mut raw)?;
             }
+            sync_path(path.with_extension("migrate"), log)?;
 
-            // Remove the .db file, because our extent is now a raw extent and
-            // has been persisted to disk.
+            // Remove the .db file, because the .migrate file is now ready for
+            // use and should be copied over if the db file is missing.
             std::fs::remove_file(path.with_extension("db"))?;
 
-            // Make that removal persistent by synching the parent directory
-            sync_path(extent_dir(dir, number), log)?;
+            // Copy the .migrate file, overwriting the old file with the new raw
+            // extent file.
+            std::fs::rename(path.with_extension("migrate"), &path)?;
 
             // We have now migrated from SQLite to raw file extents!
             has_sqlite = false;
@@ -460,20 +451,18 @@ impl Extent {
          * Store extent data in files within a directory hierarchy so that
          * there are not too many files in any level of that hierarchy.
          */
-        {
-            let path = extent_path(dir, number);
+        let path = extent_path(dir, number);
 
-            /*
-             * Verify there are not existing extent files.
-             */
-            if Path::new(&path).exists() {
-                bail!("Extent file already exists {:?}", path);
-            }
+        /*
+         * Verify there are not existing extent files.
+         */
+        if Path::new(&path).exists() {
+            bail!("Extent file already exists {:?}", path);
         }
         remove_copy_cleanup_dir(dir, number)?;
 
         // All new extents are created using the raw backend
-        let inner = extent_inner_raw::RawInner::create(dir, def, number)?;
+        let inner = extent_inner_raw::RawInner::create(&path, def, number)?;
 
         /*
          * Complete the construction of our new extent

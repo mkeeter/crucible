@@ -509,11 +509,12 @@ impl SqliteInner {
     ///
     /// Returns the metadata and context slots, which should be positioned
     /// directly after the raw block data in memory.
-    pub fn export_meta_and_context(
+    pub fn export(
         &mut self,
-    ) -> Result<Vec<u8>, CrucibleError> {
-        panic!()
-        /*
+        out: &mut crate::extent_inner_raw::RawInner,
+    ) -> Result<()> {
+        use crate::{extent::EXTENT_META_RAW, extent_inner_raw::OnDiskMeta};
+
         // Check whether we need to rehash.  This is theoretically represented
         // by the `dirty` bit, but we're being _somewhat_ paranoid and manually
         // forcing a rehash if any blocks have multiple contexts stored.
@@ -528,15 +529,31 @@ impl SqliteInner {
 
         let ctxs = self.get_block_contexts(0, self.extent_size.value)?;
 
-        use crate::{
-            extent::EXTENT_META_RAW,
-            extent_inner_raw::{
-                OnDiskDownstairsBlockContext, OnDiskMeta,
-                BLOCK_CONTEXT_SLOT_SIZE_BYTES, BLOCK_META_SIZE_BYTES,
-            },
-        };
+        // Write out all of the block contexts
+        let mut buf =
+            vec![0u8; self.extent_size.block_size_in_bytes() as usize];
+        self.file.seek(SeekFrom::Start(0))?;
+        for (i, mut c) in ctxs.into_iter().enumerate() {
+            self.file.read_exact(&mut buf)?;
+            let ctx = match c.len() {
+                0 => continue,
+                1 => c.pop().unwrap(),
+                i => panic!("invalid context count: {i}"),
+            };
 
-        // Record the metadata section, which will be right after raw block data
+            let write = crucible_protocol::Write {
+                eid: 0,
+                offset: Block {
+                    value: i as u64,
+                    shift: self.extent_size.shift,
+                },
+                data: buf.clone().into(),
+                block_context: ctx.block_context,
+            };
+
+            out.write(JobId(0), &[&write], false, 1)?;
+        }
+
         let dirty = self.dirty()?;
         let flush_number = self.flush_number()?;
         let gen_number = self.gen_number()?;
@@ -545,41 +562,11 @@ impl SqliteInner {
             flush_number,
             gen_number,
             ext_version: EXTENT_META_RAW, // new extent version for raw files
+            meta_gen: 0,                  // this will be incremented
         };
-        let mut meta_buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
-        bincode::serialize_into(meta_buf.as_mut_slice(), &meta)
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+        out.set_metadata(meta)?;
 
-        let mut buf = Vec::with_capacity(
-            BLOCK_META_SIZE_BYTES as usize
-                + ctxs.len() * 2 * BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize,
-        );
-        buf.extend(meta_buf);
-
-        // Put the context data after the metadata
-        for c in ctxs {
-            let ctx = match c.len() {
-                0 => None,
-                1 => Some(OnDiskDownstairsBlockContext {
-                    block_context: c[0].block_context,
-                    on_disk_hash: c[0].on_disk_hash,
-                }),
-                i => panic!("invalid context count: {i}"),
-            };
-            // Put the context into the first slot, if present
-            let mut ctx_buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
-            bincode::serialize_into(ctx_buf.as_mut_slice(), &ctx)
-                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-            buf.extend(ctx_buf);
-
-            // The second slot is empty
-            buf.extend([0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]);
-        }
-
-        // Reset the file read position, just in case
-        self.file.seek(SeekFrom::Start(0))?;
-        Ok(buf)
-        */
+        Ok(())
     }
 
     fn get_block_contexts(

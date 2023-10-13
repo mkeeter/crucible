@@ -2,8 +2,7 @@
 use crate::{
     cdt, crucible_bail,
     extent::{
-        check_input, extent_path, DownstairsBlockContext, ExtentInner,
-        EXTENT_META_RAW,
+        check_input, DownstairsBlockContext, ExtentInner, EXTENT_META_RAW,
     },
     integrity_hash, mkdir_for_file,
     region::{BatchedPwritev, JobOrReconciliationId},
@@ -45,7 +44,7 @@ pub struct OnDiskMeta {
     /// write it to a portion of the file that has already changed (instead of
     /// having to dirty an unrelated portion of the file).  When loading the
     /// file, we pick the `OnDiskMeta` with the highest `meta_gen`
-    meta_gen: u64,
+    pub meta_gen: u64,
 }
 
 /// Size of backup data
@@ -513,7 +512,7 @@ pub struct SuperblockLayout {
     pub blocks_per_superblock: u64,
 
     /// Extent file size, in bytes
-    extent_file_size: u64,
+    pub extent_file_size: u64,
 
     /// Number of superblocks in the file
     ///
@@ -564,7 +563,6 @@ impl SuperblockLayout {
     /// to point to a data block within a superblock (i.e. *not* point to the
     /// metadata block).
     fn block_pos(&self, block: u64) -> u64 {
-        println!("blocks per sb: {}", self.blocks_per_superblock);
         let pos = block / self.blocks_per_superblock;
         let offset = block % self.blocks_per_superblock;
 
@@ -579,7 +577,6 @@ impl SuperblockLayout {
     fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
         let pos = block / self.blocks_per_superblock;
         let offset = block % self.blocks_per_superblock;
-        println!("pos: {pos}, offset: {offset}");
 
         pos * (self.blocks_per_superblock + 1) * self.block_size_bytes
             + BLOCK_META_SIZE_BYTES
@@ -589,11 +586,23 @@ impl SuperblockLayout {
 
 impl RawInner {
     pub fn create(
-        dir: &Path,
+        path: &Path,
         def: &RegionDefinition,
         extent_number: u32,
     ) -> Result<Self> {
-        let path = extent_path(dir, extent_number);
+        Self::create_ext(path, def, extent_number, None)
+    }
+
+    pub fn create_ext(
+        path: &Path,
+        def: &RegionDefinition,
+        extent_number: u32,
+        suffix: Option<&str>,
+    ) -> Result<Self> {
+        let path = match suffix {
+            Some(s) => path.with_extension(s),
+            None => path.to_path_buf(),
+        };
 
         let superblock_layout = SuperblockLayout::new(def);
 
@@ -854,7 +863,11 @@ impl RawInner {
         Ok(self.meta.get().unwrap())
     }
 
-    fn set_metadata(
+    /// Sets raw metadata
+    ///
+    /// This function should only be called directly during a migration;
+    /// otherwise, it's typical to call higher-level functions instead.
+    pub fn set_metadata(
         &mut self,
         mut meta: OnDiskMeta,
     ) -> Result<(), CrucibleError> {
@@ -935,6 +948,7 @@ impl RawInner {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::extent::extent_path;
     use bytes::{Bytes, BytesMut};
     use crucible_common::RegionOptions;
     use crucible_protocol::EncryptionContext;
@@ -953,7 +967,7 @@ mod test {
     async fn encryption_context() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInner::create(&extent_path(dir, 0), &new_region_definition(), 0)
                 .unwrap();
 
         // Encryption context for blocks 0 and 1 should start blank
@@ -1026,7 +1040,7 @@ mod test {
     async fn multiple_context() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInner::create(&extent_path(dir, 0), &new_region_definition(), 0)
                 .unwrap();
 
         // Encryption context for blocks 0 and 1 should start blank
@@ -1158,7 +1172,7 @@ mod test {
     fn test_write_unwritten_without_flush() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInner::create(&extent_path(dir, 0), &new_region_definition(), 0)
                 .unwrap();
 
         // Write a block, but don't flush.
@@ -1255,7 +1269,7 @@ mod test {
     fn test_auto_sync() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInner::create(&extent_path(dir, 0), &new_region_definition(), 0)
                 .unwrap();
 
         // Write a block, but don't flush.
@@ -1289,7 +1303,7 @@ mod test {
     fn test_auto_sync_flush() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInner::create(&extent_path(dir, 0), &new_region_definition(), 0)
                 .unwrap();
 
         // Write a block, but don't flush.
@@ -1330,7 +1344,7 @@ mod test {
     fn test_auto_sync_flush_2() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInner::create(&extent_path(dir, 0), &new_region_definition(), 0)
                 .unwrap();
 
         // Write a block, but don't flush.
@@ -1380,9 +1394,12 @@ mod test {
     fn test_reopen_marks_blocks_unwritten_if_data_never_hit_disk() -> Result<()>
     {
         let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
+        let mut inner = RawInner::create(
+            &extent_path(&dir, 0),
+            &new_region_definition(),
+            0,
+        )
+        .unwrap();
 
         // Partial write, the data never hits disk, but there's a context
         // in the DB and the dirty flag is set.
@@ -1398,9 +1415,12 @@ mod test {
 
         // Reopen, which should note that the hash doesn't match on-disk values
         // and decide that block 0 is unwritten.
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
+        let mut inner = RawInner::create(
+            &extent_path(&dir, 0),
+            &new_region_definition(),
+            0,
+        )
+        .unwrap();
 
         // Writing to block 0 should succeed with only_write_unwritten
         {
