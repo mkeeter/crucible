@@ -74,7 +74,7 @@ pub const BLOCK_META_SIZE_BYTES: u64 = 32;
 ///       contexts data
 /// - _N_ data blocks
 ///
-/// The number of blocks per superblock is calculated by [`SuperblockLayout`];
+/// The number of blocks per superblock is calculated by [`RawExtentLayout`];
 /// the final superblock may have fewer blocks, but is guaranteed to have > 0.
 #[derive(Debug)]
 pub struct RawInner {
@@ -114,7 +114,7 @@ pub struct RawInner {
     last_superblock_modified: Option<u64>,
 
     /// Superblock configuration and layout
-    superblock_layout: SuperblockLayout,
+    layout: RawExtentLayout,
 }
 
 impl ExtentInner for RawInner {
@@ -209,9 +209,8 @@ impl ExtentInner for RawInner {
         // Set up `last_superblock_modified` so that when we modify metadata (by
         // calling `set_dirty` below), we edit the same superblock.
         if let Some(w) = writes.get(0) {
-            self.last_superblock_modified = Some(
-                w.offset.value / self.superblock_layout.blocks_per_superblock,
-            );
+            self.last_superblock_modified =
+                Some(w.offset.value / self.layout.blocks_per_superblock);
         }
 
         self.set_dirty()?;
@@ -292,7 +291,7 @@ impl ExtentInner for RawInner {
 
             batched_pwritev.add_write_block(
                 write,
-                self.superblock_layout.block_pos(write.offset.value),
+                self.layout.block_pos(write.offset.value),
             )?;
         }
 
@@ -305,8 +304,7 @@ impl ExtentInner for RawInner {
         for write in writes.iter() {
             let block = write.offset.value;
             if !writes_to_skip.contains(&block) {
-                let superblock =
-                    block / self.superblock_layout.blocks_per_superblock;
+                let superblock = block / self.layout.blocks_per_superblock;
                 let slot = !self.superblock_slot[superblock as usize];
                 self.active_context[write.offset.value as usize] = Some(slot);
             }
@@ -346,12 +344,10 @@ impl ExtentInner for RawInner {
             let mut n_contiguous_requests = 1;
 
             for request_window in requests[req_run_start..].windows(2) {
-                let block0 = self
-                    .superblock_layout
-                    .block_pos(request_window[0].offset.value);
-                let block1 = self
-                    .superblock_layout
-                    .block_pos(request_window[1].offset.value);
+                let block0 =
+                    self.layout.block_pos(request_window[0].offset.value);
+                let block1 =
+                    self.layout.block_pos(request_window[1].offset.value);
 
                 if (block0 + 1 == block1)
                     && ((n_contiguous_requests + 1) < iov_max)
@@ -388,7 +384,7 @@ impl ExtentInner for RawInner {
             nix::sys::uio::preadv(
                 self.file.as_raw_fd(),
                 &mut iovecs,
-                self.superblock_layout.block_pos(first_req.offset.value) as i64
+                self.layout.block_pos(first_req.offset.value) as i64
                     * block_size as i64,
             )
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
@@ -446,7 +442,7 @@ impl ExtentInner for RawInner {
         // Make sure that block and superblock data is consistent
         self.ensure_block_slots_are_known()?;
         let mut new_superblock_slots = vec![];
-        for i in 0..self.superblock_layout.superblock_count {
+        for i in 0..self.layout.superblock_count {
             new_superblock_slots.push(self.ensure_superblock_is_consistent(i)?);
         }
 
@@ -507,7 +503,7 @@ impl ExtentInner for RawInner {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct SuperblockLayout {
+pub struct RawExtentLayout {
     /// Number of data blocks in each superblock
     ///
     /// Each superblock also includes a leading metadata block, so the
@@ -530,7 +526,7 @@ pub struct SuperblockLayout {
     pub block_size_bytes: u64,
 }
 
-impl SuperblockLayout {
+impl RawExtentLayout {
     pub fn new(def: &RegionDefinition) -> Self {
         const RECORD_SIZE: u64 = 128 * 1024;
         let block_count = def.extent_size().value;
@@ -613,7 +609,7 @@ impl RawInner {
             None => path.to_path_buf(),
         };
 
-        let superblock_layout = SuperblockLayout::new(def);
+        let layout = RawExtentLayout::new(def);
 
         mkdir_for_file(&path)?;
         let mut file = OpenOptions::new()
@@ -623,7 +619,7 @@ impl RawInner {
             .open(&path)?;
 
         // All 0s are fine for everything except extent version in the metadata
-        file.set_len(superblock_layout.extent_file_size)?;
+        file.set_len(layout.extent_file_size)?;
 
         // Write metadata to the first superblock.  This metadata has
         // `meta_gen = 1`, so it will always be picked up.
@@ -646,13 +642,10 @@ impl RawInner {
             extent_size: def.extent_size(),
             extent_number,
             active_context: vec![Some(false); def.extent_size().value as usize],
-            superblock_slot: vec![
-                false;
-                superblock_layout.superblock_count as usize
-            ],
+            superblock_slot: vec![false; layout.superblock_count as usize],
             meta: Some(meta).into(),
             last_superblock_modified: None,
-            superblock_layout,
+            layout,
         };
 
         // Sync the file to disk, to avoid any questions
@@ -674,7 +667,7 @@ impl RawInner {
         read_only: bool,
         log: &Logger,
     ) -> Result<Self> {
-        let superblock_layout = SuperblockLayout::new(def);
+        let layout = RawExtentLayout::new(def);
 
         // Open the extent file and verify the size is as we expect.
         let file =
@@ -692,7 +685,7 @@ impl RawInner {
                 }
                 Ok(f) => {
                     let cur_size = f.metadata().unwrap().len();
-                    let expected_size = superblock_layout.extent_file_size;
+                    let expected_size = layout.extent_file_size;
                     if expected_size != cur_size {
                         bail!(
                             "File size {cur_size:?} does not match \
@@ -727,11 +720,8 @@ impl RawInner {
             // it's easy!  The downside is that we could potentially do a little
             // more work on initial writes and flushes, until this accurately
             // reflects the real value.
-            superblock_slot: vec![
-                false;
-                superblock_layout.superblock_count as usize
-            ],
-            superblock_layout,
+            superblock_slot: vec![false; layout.superblock_count as usize],
+            layout,
         })
     }
 
@@ -761,7 +751,7 @@ impl RawInner {
                 let block_size = self.extent_size.block_size_in_bytes();
                 let mut buf = vec![0; block_size as usize];
                 self.file.seek(SeekFrom::Start(
-                    block_size as u64 * self.superblock_layout.block_pos(block),
+                    block_size as u64 * self.layout.block_pos(block),
                 ))?;
                 self.file.read_exact(&mut buf)?;
                 let hash = integrity_hash(&[&buf]);
@@ -775,7 +765,7 @@ impl RawInner {
                 for slot in [false, true] {
                     // TODO: is `pread` faster than seek + read_exact?
                     self.file.seek(SeekFrom::Start(
-                        self.superblock_layout.context_slot_offset(block, slot),
+                        self.layout.context_slot_offset(block, slot),
                     ))?;
                     self.file.read_exact(&mut buf)?;
                     let context: Option<OnDiskDownstairsBlockContext> =
@@ -843,8 +833,7 @@ impl RawInner {
             let active_slot = self.get_block_context_slot(b.block)?;
             let target_slot = !active_slot;
 
-            let superblock =
-                b.block / self.superblock_layout.blocks_per_superblock;
+            let superblock = b.block / self.layout.blocks_per_superblock;
             if target_slot == self.superblock_slot[superblock as usize] {
                 superblocks_need_sync.insert(superblock);
             }
@@ -876,9 +865,7 @@ impl RawInner {
         // `!self.superblock_slots[superblock_index]`.
         for (superblock_index, group) in block_contexts
             .iter()
-            .group_by(|b| {
-                b.block / self.superblock_layout.blocks_per_superblock
-            })
+            .group_by(|b| b.block / self.layout.blocks_per_superblock)
             .into_iter()
         {
             let mut buf = vec![];
@@ -899,7 +886,7 @@ impl RawInner {
                 )?;
             }
 
-            let offset = self.superblock_layout.context_slot_offset(
+            let offset = self.layout.context_slot_offset(
                 start_block,
                 !self.superblock_slot[superblock_index as usize],
             );
@@ -918,7 +905,7 @@ impl RawInner {
     ) -> Result<bool> {
         self.set_block_contexts(&[*block_context])?;
         let superblock =
-            block_context.block / self.superblock_layout.blocks_per_superblock;
+            block_context.block / self.layout.blocks_per_superblock;
         Ok(!self.superblock_slot[superblock as usize])
     }
 
@@ -929,8 +916,8 @@ impl RawInner {
         // Iterate over every superblock, reading metadata from the beginning of
         // the superblock.  The metadata with the largest `meta_gen` is the most
         // recent.
-        for i in 0..self.superblock_layout.superblock_count {
-            let offset = (self.superblock_layout.blocks_per_superblock + 1)
+        for i in 0..self.layout.superblock_count {
+            let offset = (self.layout.blocks_per_superblock + 1)
                 * self.extent_size.block_size_in_bytes() as u64
                 * i;
             let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
@@ -966,7 +953,7 @@ impl RawInner {
         let prev_meta = self.get_metadata()?;
 
         let i = self.last_superblock_modified.unwrap_or(0);
-        let offset = (self.superblock_layout.blocks_per_superblock + 1)
+        let offset = (self.layout.blocks_per_superblock + 1)
             * self.extent_size.block_size_in_bytes() as u64
             * i;
         meta.meta_gen = prev_meta.meta_gen.max(meta.meta_gen) + 1;
@@ -993,7 +980,7 @@ impl RawInner {
         let slot = self.get_block_context_slot(block)?;
 
         // Read the context slot from the file on disk
-        let offset = self.superblock_layout.context_slot_offset(block, slot);
+        let offset = self.layout.context_slot_offset(block, slot);
         let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         nix::sys::uio::pread(self.file.as_raw_fd(), &mut buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
@@ -1034,7 +1021,7 @@ impl RawInner {
         for (_, mut group) in (block..block + count)
             .zip(slots)
             .group_by(|(block, slot)| {
-                (block / self.superblock_layout.blocks_per_superblock, *slot)
+                (block / self.layout.blocks_per_superblock, *slot)
             })
             .into_iter()
         {
@@ -1042,9 +1029,7 @@ impl RawInner {
             let n = group.count() + 1;
 
             // Read the context slot from the file on disk
-            let offset = self
-                .superblock_layout
-                .context_slot_offset(start_block, slot);
+            let offset = self.layout.context_slot_offset(start_block, slot);
             let mut buf = vec![0u8; n * BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
             nix::sys::uio::pread(
                 self.file.as_raw_fd(),
@@ -1099,12 +1084,9 @@ impl RawInner {
         &mut self,
         superblock_index: u64,
     ) -> Result<bool> {
-        let n = self.superblock_layout.blocks_per_superblock;
+        let n = self.layout.blocks_per_superblock;
         let block_slots = ((superblock_index * n)
-            ..self
-                .superblock_layout
-                .block_count
-                .min((superblock_index + 1) * n))
+            ..self.layout.block_count.min((superblock_index + 1) * n))
             .map(|b| self.get_block_context_slot(b))
             .collect::<Result<Vec<_>>>()?;
 
@@ -1130,7 +1112,7 @@ impl RawInner {
         {
             let start_offset = d.next().unwrap().0;
             let start_block = superblock_index
-                * self.superblock_layout.blocks_per_superblock
+                * self.layout.blocks_per_superblock
                 + start_offset as u64;
             let block_count = d.count() + 1;
 
@@ -1140,7 +1122,7 @@ impl RawInner {
             nix::sys::uio::pread(
                 self.file.as_raw_fd(),
                 &mut buf,
-                self.superblock_layout
+                self.layout
                     .context_slot_offset(start_block, superblock_slot)
                     as i64,
             )
@@ -1148,7 +1130,7 @@ impl RawInner {
             nix::sys::uio::pwrite(
                 self.file.as_raw_fd(),
                 &buf,
-                self.superblock_layout
+                self.layout
                     .context_slot_offset(start_block, !superblock_slot)
                     as i64,
             )
@@ -1161,9 +1143,9 @@ impl RawInner {
     fn set_superblock_slot(&mut self, superblock_index: u64, slot: bool) {
         let i = superblock_index as usize;
         self.superblock_slot[i] = slot;
-        let n = self.superblock_layout.blocks_per_superblock as usize;
-        self.active_context[i * n
-            ..(self.superblock_layout.block_count as usize).min((i + 1) * n)]
+        let n = self.layout.blocks_per_superblock as usize;
+        self.active_context
+            [i * n..(self.layout.block_count as usize).min((i + 1) * n)]
             .fill(Some(slot))
     }
 }
@@ -1678,12 +1660,12 @@ mod test {
     }
 
     #[test]
-    fn test_superblock_layout() {
+    fn test_layout() {
         let mut options = RegionOptions::default();
         options.set_block_size(512); // bytes
         options.set_extent_size(Block::new_512(128)); // blocks
         let def = RegionDefinition::from_options(&options).unwrap();
-        let sb = SuperblockLayout::new(&def);
+        let sb = RawExtentLayout::new(&def);
 
         assert_eq!(sb.block_pos(0), 1);
         assert_eq!(sb.block_pos(1), 2);
@@ -1700,7 +1682,7 @@ mod test {
         options.set_block_size(4096); // bytes
         options.set_extent_size(Block::new_512(128)); // blocks
         let def = RegionDefinition::from_options(&options).unwrap();
-        let sb = SuperblockLayout::new(&def);
+        let sb = RawExtentLayout::new(&def);
 
         assert_eq!(sb.blocks_per_superblock, 31);
         assert_eq!(
@@ -1712,7 +1694,7 @@ mod test {
         options.set_block_size(4096); // bytes
         options.set_extent_size(Block::new_512(62));
         let def = RegionDefinition::from_options(&options).unwrap();
-        let sb = SuperblockLayout::new(&def);
+        let sb = RawExtentLayout::new(&def);
 
         assert_eq!(sb.blocks_per_superblock, 31);
         assert_eq!(sb.extent_file_size, ((63 / 31) * 32) * 4096);
@@ -1721,7 +1703,7 @@ mod test {
         options.set_block_size(8192); // bytes
         options.set_extent_size(Block::new_512(128));
         let def = RegionDefinition::from_options(&options).unwrap();
-        let sb = SuperblockLayout::new(&def);
+        let sb = RawExtentLayout::new(&def);
 
         assert_eq!(sb.blocks_per_superblock, 79);
     }
