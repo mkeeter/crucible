@@ -837,6 +837,9 @@ impl RawInner {
         if let Some(s) = self.meta.get() {
             return Ok(s);
         }
+        // Iterate over every superblock, reading metadata from the beginning of
+        // the superblock.  The metadata with the largest `meta_gen` is the most
+        // recent.
         for i in 0..self.superblock_layout.superblock_count {
             let offset = (self.superblock_layout.blocks_per_superblock + 1)
                 * self.extent_size.block_size_in_bytes() as u64

@@ -348,6 +348,8 @@ impl Extent {
         //  It's safe to fail at any point in this procedure; the next time
         //  `Extent::open` is called, we will restart the migration (if we
         //  haven't gotten to deleting the `.db` file).
+        //
+        //  TODO FIX THIS (rename `.migrate` file if `.db` is missing)
         let mut has_sqlite = path.with_extension("db").exists();
         if has_sqlite && !read_only {
             info!(log, "Migrating extent {number}");
