@@ -523,6 +523,9 @@ pub struct SuperblockLayout {
     /// following it (but should have > 0).
     pub superblock_count: u64,
 
+    /// Total number of data blocks
+    pub block_count: u64,
+
     /// Size of a block, in bytes
     pub block_size_bytes: u64,
 }
@@ -557,6 +560,7 @@ impl SuperblockLayout {
             extent_file_size,
             superblock_count,
             block_size_bytes: block_size,
+            block_count,
         }
     }
 
@@ -584,10 +588,8 @@ impl SuperblockLayout {
 
         pos * (self.blocks_per_superblock + 1) * self.block_size_bytes
             + BLOCK_META_SIZE_BYTES
-            + (slot as u64
-                * self.blocks_per_superblock
-                * BLOCK_CONTEXT_SLOT_SIZE_BYTES)
-            + offset
+            + (slot as u64 * self.blocks_per_superblock + offset)
+                * BLOCK_CONTEXT_SLOT_SIZE_BYTES
     }
 }
 
@@ -795,16 +797,32 @@ impl RawInner {
         }
     }
 
-    /// Efficiently sets block contexts in bulk
-    ///
-    /// # Panics
-    /// `block_contexts` must represent a contiguous set of blocks
     fn set_block_contexts(
         &mut self,
         block_contexts: &[DownstairsBlockContext],
     ) -> Result<()> {
+        let mut start = 0;
+        for i in 0..block_contexts.len() {
+            if i + 1 == block_contexts.len()
+                || block_contexts[i].block + 1 != block_contexts[i + 1].block
+            {
+                self.set_block_contexts_contiguous(&block_contexts[start..=i])?;
+                start = i + 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Efficiently sets block contexts in bulk
+    ///
+    /// # Panics
+    /// `block_contexts` must represent a contiguous set of blocks
+    fn set_block_contexts_contiguous(
+        &mut self,
+        block_contexts: &[DownstairsBlockContext],
+    ) -> Result<()> {
         for (a, b) in block_contexts.iter().zip(block_contexts.iter().skip(1)) {
-            assert_eq!(a.block + 1, b.block);
+            assert_eq!(a.block + 1, b.block, "blocks must be contiguous");
         }
         // Check whether _any_ of these writes would require a flush
         //
@@ -893,6 +911,7 @@ impl RawInner {
     /// Writes the inactive block context slot
     ///
     /// Returns the new slot which should be marked as active after the write
+    #[cfg(test)]
     fn set_block_context(
         &mut self,
         block_context: &DownstairsBlockContext,
@@ -1082,7 +1101,10 @@ impl RawInner {
     ) -> Result<bool> {
         let n = self.superblock_layout.blocks_per_superblock;
         let block_slots = ((superblock_index * n)
-            ..((superblock_index + 1) * n))
+            ..self
+                .superblock_layout
+                .block_count
+                .min((superblock_index + 1) * n))
             .map(|b| self.get_block_context_slot(b))
             .collect::<Result<Vec<_>>>()?;
 
@@ -1107,7 +1129,7 @@ impl RawInner {
             .filter(|(slot, _group)| **slot == superblock_slot)
         {
             let start_offset = d.next().unwrap().0;
-            let start_block = superblock_index as u64
+            let start_block = superblock_index
                 * self.superblock_layout.blocks_per_superblock
                 + start_offset as u64;
             let block_count = d.count() + 1;
@@ -1140,7 +1162,9 @@ impl RawInner {
         let i = superblock_index as usize;
         self.superblock_slot[i] = slot;
         let n = self.superblock_layout.blocks_per_superblock as usize;
-        self.active_context[i * n..][..n].fill(Some(slot))
+        self.active_context[i * n
+            ..(self.superblock_layout.block_count as usize).min((i + 1) * n)]
+            .fill(Some(slot))
     }
 }
 
