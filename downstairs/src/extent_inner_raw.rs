@@ -1533,8 +1533,8 @@ mod test {
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
         assert_eq!(inner.active_context[0], Some(ContextSlot::B));
 
-        // The context should be written to slot A, forcing a flush and changing
-        // every other context slot in this superblock
+        // The context should be written to slot A, forcing a flush and copying
+        // + changing every other context slot in this superblock
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::B);
         assert_eq!(inner.active_context[0], Some(ContextSlot::A));
@@ -1549,7 +1549,6 @@ mod test {
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.active_context[0], Some(ContextSlot::B));
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        // This shouldn't change other superblocks!
         assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
         Ok(())
@@ -1574,22 +1573,35 @@ mod test {
                 hash,
             },
         };
-        // The context should be written to slot 0
+        // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
 
-        // Flush, which should bump the sync number (marking slot 0 as synched)
+        // Flush, which should force a sync (marking slot B as synched
+        // in superblock 0, and leaving other superblocks unchanged)
         inner.flush(12, 12, JobId(11).into())?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::B);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[2], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[3], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[4], Some(ContextSlot::B));
+        assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
-        // The context should be written to slot 1
+        // The context should be written to slot A, without a sync
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::B);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
 
-        // The context should be written to slot 0
+        // The context should be written to slot B, forcing a sync
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-
-        // The context should be written to slot 1, forcing a sync
-        inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-
-        todo!("how do we test this now?");
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[2], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[3], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[4], Some(ContextSlot::A));
 
         Ok(())
     }
@@ -1615,23 +1627,40 @@ mod test {
         };
         // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
 
         // The context should be written to slot A, forcing a sync
-        inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::B);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
 
-        // Flush, which should bump the sync number (marking slot 0 as synched)
+        // Flush, which should bump the sync number (marking slot B as synched
+        // in superblock 0, and leaving other superblocks unchanged)
         inner.flush(12, 12, JobId(11).into())?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[2], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[3], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[4], Some(ContextSlot::A));
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
 
-        // The context should be written to slot 0
+        // The context should be written to slot B, without a sync
+        inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::A));
+
+        // The context should be written to slot A, forcing a sync
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-
-        // The context should be written to slot 1
-        inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-
-        // The context should be written to slot 0, forcing a sync
-        inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-
-        todo!("how do we test this now?");
+        assert_eq!(inner.superblock_slot[0], ContextSlot::B);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[2], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[3], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[4], Some(ContextSlot::B));
 
         Ok(())
     }
