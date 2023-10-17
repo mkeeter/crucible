@@ -16,7 +16,7 @@ use slog::{error, Logger};
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{IoSliceMut, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -718,10 +718,7 @@ impl RawInner {
             layout,
         };
 
-        for b in 0..out.layout.block_count {
-            out.recompute_slot_from_file(b)?;
-        }
-        out.recompute_meta()?;
+        out.reload_from_file()?;
         Ok(out)
     }
 
@@ -730,6 +727,81 @@ impl RawInner {
         if !meta.dirty {
             meta.dirty = true;
             self.set_metadata(meta)?;
+        }
+        Ok(())
+    }
+
+    fn reload_from_file(&mut self) -> Result<(), CrucibleError> {
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut file_buffered = BufReader::with_capacity(64 * 1024, &self.file);
+        let mut meta_buf = vec![0u8; self.layout.block_size_bytes as usize];
+        let mut block_buf = vec![0u8; self.layout.block_size_bytes as usize];
+        let mut current_meta: Option<OnDiskMeta> = None;
+        for superblock_index in 0..self.layout.superblock_count {
+            file_buffered.read_exact(&mut meta_buf)?;
+
+            // Update `self.meta` based on the metadata at the front of the
+            // superblock header.
+            let this_meta: OnDiskMeta = bincode::deserialize(
+                &meta_buf[..BLOCK_META_SIZE_BYTES as usize],
+            )
+            .map_err(|e| {
+                CrucibleError::IoError(format!(
+                    "failed to deserialize meta block for \
+                     superblock {superblock_index}: {e}",
+                ))
+            })?;
+            if current_meta
+                .map(|n| n.meta_gen < this_meta.meta_gen)
+                .unwrap_or(true)
+            {
+                self.meta = this_meta;
+                current_meta = Some(this_meta);
+            }
+
+            // Update `self.active_context` based on block data hashes
+            for block_offset in 0..self.layout.blocks_per_superblock {
+                let block_index = block_offset
+                    + superblock_index * self.layout.blocks_per_superblock;
+                if block_index >= self.layout.block_count {
+                    break;
+                }
+                file_buffered.read_exact(&mut block_buf)?;
+                let hash = integrity_hash(&[&block_buf]);
+
+                let mut matching_slot = None;
+                let mut empty_slot = None;
+
+                for slot in [ContextSlot::A, ContextSlot::B] {
+                    let offset = (BLOCK_META_SIZE_BYTES
+                        + (slot as u64 * self.layout.blocks_per_superblock
+                            + block_offset)
+                            * BLOCK_CONTEXT_SLOT_SIZE_BYTES)
+                        as usize;
+                    let slot_buf = &meta_buf[offset
+                        ..(offset + BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize)];
+
+                    let context: Option<OnDiskDownstairsBlockContext> =
+                        bincode::deserialize(slot_buf).map_err(|e| {
+                            CrucibleError::IoError(format!(
+                                "context deserialization failed: {e:?}"
+                            ))
+                        })?;
+
+                    if let Some(context) = context {
+                        if context.on_disk_hash == hash {
+                            matching_slot = Some(slot);
+                        }
+                    } else if empty_slot.is_none() {
+                        empty_slot = Some(slot);
+                    }
+                }
+
+                let value = matching_slot
+                    .or(empty_slot)
+                    .ok_or(anyhow!("no slot found for {block_index}"))?;
+                self.active_context[block_index as usize] = value;
+            }
         }
         Ok(())
     }
@@ -902,7 +974,11 @@ impl RawInner {
         Ok(!self.superblock_slot[superblock as usize])
     }
 
-    fn recompute_meta(&mut self) -> Result<(), CrucibleError> {
+    /// Set `self.meta` based on superblock data read from the file
+    ///
+    /// This is used to recover if a write to the metadata region may have
+    /// failed and the state of the file is unknown.
+    fn recompute_meta_from_file(&mut self) -> Result<(), CrucibleError> {
         // Iterate over every superblock, reading metadata from the beginning of
         // the superblock.  The metadata with the largest `meta_gen` is the most
         // recent.
@@ -953,7 +1029,7 @@ impl RawInner {
                 .map_err(|e| CrucibleError::IoError(e.to_string()));
         if r.is_err() {
             // The write failed, so reload the state of `meta` from the file
-            self.recompute_meta().unwrap();
+            self.recompute_meta_from_file().unwrap();
         } else {
             // The write is complete; we can update our local cache
             self.meta = meta;
