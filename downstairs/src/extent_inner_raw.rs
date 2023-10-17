@@ -1133,10 +1133,8 @@ impl RawInner {
         superblock_index: u64,
     ) -> Result<ContextSlot> {
         let n = self.layout.blocks_per_superblock;
-        let block_slots = ((superblock_index * n)
-            ..self.layout.block_count.min((superblock_index + 1) * n))
-            .map(|b| self.active_context[b as usize])
-            .collect::<Vec<_>>();
+        let block_range = (superblock_index * n)
+            ..self.layout.block_count.min((superblock_index + 1) * n);
 
         let superblock_slot = self.superblock_slot[superblock_index as usize];
 
@@ -1144,29 +1142,28 @@ impl RawInner {
         // need to do anything here.
         //
         // TODO: track a separate "superblock dirty" variable instead?
-        if block_slots.iter().all(|v| *v == superblock_slot) {
+        if block_range
+            .clone()
+            .all(|i| self.active_context[i as usize] == superblock_slot)
+        {
             return Ok(superblock_slot);
         }
 
         // Otherwise, we need to copy over any context slots that would
         // otherwise be left behind.  We'll do this by copying chunks that
         // are as large as possible, using `group_by`.
-        for (_slot, mut d) in block_slots
-            .iter()
-            .enumerate()
-            .group_by(|b| b.1)
+        let mut buf = vec![];
+        for (_slot, mut d) in block_range
             .into_iter()
-            .filter(|(slot, _group)| **slot == superblock_slot)
+            .group_by(|b| self.active_context[*b as usize])
+            .into_iter()
+            .filter(|(slot, _group)| *slot == superblock_slot)
         {
-            let start_offset = d.next().unwrap().0;
-            let start_block = superblock_index
-                * self.layout.blocks_per_superblock
-                + start_offset as u64;
+            let start_block = d.next().unwrap();
             let block_count = d.count() + 1;
 
             // Copy this chunk over into the soon-to-be-active slots
-            let mut buf =
-                vec![0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize * block_count];
+            buf.resize(BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize * block_count, 0);
             nix::sys::uio::pread(
                 self.file.as_raw_fd(),
                 &mut buf,
