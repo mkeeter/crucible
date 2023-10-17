@@ -254,13 +254,16 @@ impl ExtentInner for RawInner {
                 block: write.offset.value,
                 on_disk_hash,
             });
-
-            // Until the write lands, we can't trust the context slot and must
-            // rehash it if requested.  This assignment is overwritten after the
-            // write finishes.
-            self.active_context[write.offset.value as usize] = None;
         }
         self.set_block_contexts(&block_ctx)?;
+        for write in writes {
+            if !writes_to_skip.contains(&write.offset.value) {
+                // Until the write lands, we can't trust the context slot and must
+                // rehash it if requested.  This assignment is overwritten after the
+                // write finishes.
+                self.active_context[write.offset.value as usize] = None;
+            }
+        }
 
         cdt::extent__write__raw__context__insert__done!(|| {
             (job_id.0, self.extent_number, writes.len() as u64)
@@ -1518,16 +1521,36 @@ mod test {
                 hash,
             },
         };
-        // The context should be written to slot 0
+        assert_eq!(inner.layout.blocks_per_superblock, 5);
+
+        // Initial state: context and superblock slots are all A, because this
+        // is a new (empty) file
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+
+        // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
 
-        // The context should be written to slot 1
+        // The context should be written to slot A, forcing a flush and changing
+        // every other context slot in this superblock
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
+        assert_eq!(inner.superblock_slot[0], ContextSlot::B);
+        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[2], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[3], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[4], Some(ContextSlot::B));
+        // This shouldn't change other superblocks!
+        assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
-        // The context should be written to slot 0, forcing a sync
+        // The context should be written to slot B, forcing another sync
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-
-        todo!("how do we test this now?");
+        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.superblock_slot[0], ContextSlot::A);
+        // This shouldn't change other superblocks!
+        assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
         Ok(())
     }

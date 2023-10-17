@@ -77,7 +77,7 @@ pub(crate) trait ExtentInner: Send + Debug {
 }
 
 /// BlockContext, with the addition of block index and on_disk_hash
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct DownstairsBlockContext {
     pub block_context: BlockContext,
 
