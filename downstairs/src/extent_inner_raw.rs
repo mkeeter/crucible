@@ -680,64 +680,26 @@ impl RawInner {
 
         // Just in case, let's be very sure that the file on disk is what it
         // should be
-        if let Err(e) = file.sync_all() {
-            return Err(CrucibleError::IoError(format!(
-                "extent {extent_number}:
+        if !read_only {
+            if let Err(e) = file.sync_all() {
+                return Err(CrucibleError::IoError(format!(
+                    "extent {extent_number}:
                  fsync 1 failure during initial rehash: {e:?}",
-            ))
-            .into());
+                ))
+                .into());
+            }
         }
 
-        let mut out = Self {
-            file,
-            // This value is not necessarily correct; we'll recompute it below!
-            active_context: vec![
-                ContextSlot::A;
-                def.extent_size().value as usize
-            ],
-            // Bogus value for meta, initialized below
-            meta: OnDiskMeta {
-                dirty: false,
-                gen_number: u64::MAX,
-                flush_number: u64::MAX,
-                ext_version: u32::MAX,
-                meta_gen: u64::MAX,
-            },
-            last_superblock_modified: None,
-            extent_number,
-            extent_size: def.extent_size(),
-
-            // Initializing this with `ContextSlot::A` may not be entirely
-            // accurate, but it's easy!  The downside is that we could
-            // potentially do a little more work on initial writes and flushes,
-            // until this accurately reflects the real value.
-            superblock_slot: vec![
-                ContextSlot::A;
-                layout.superblock_count as usize
-            ],
-            layout,
-        };
-
-        out.reload_from_file()?;
-        Ok(out)
-    }
-
-    fn set_dirty(&mut self) -> Result<(), CrucibleError> {
-        let mut meta = self.meta;
-        if !meta.dirty {
-            meta.dirty = true;
-            self.set_metadata(meta)?;
-        }
-        Ok(())
-    }
-
-    fn reload_from_file(&mut self) -> Result<(), CrucibleError> {
-        self.file.seek(SeekFrom::Start(0))?;
-        let mut file_buffered = BufReader::with_capacity(64 * 1024, &self.file);
-        let mut meta_buf = vec![0u8; self.layout.block_size_bytes as usize];
-        let mut block_buf = vec![0u8; self.layout.block_size_bytes as usize];
+        // We're now going to read from the file to fill out our local (in-RAM)
+        // mirrors for various properties of the file.  This does the same logic
+        // as `recompute_slot_from_file` and `recompute_meta_from_file`, but
+        // using larger reads (since we're going to process the entire file).
+        let mut file_buffered = BufReader::with_capacity(64 * 1024, &file);
+        let mut meta_buf = vec![0u8; layout.block_size_bytes as usize];
+        let mut block_buf = vec![0u8; layout.block_size_bytes as usize];
         let mut current_meta: Option<OnDiskMeta> = None;
-        for superblock_index in 0..self.layout.superblock_count {
+        let mut active_context = vec![];
+        for superblock_index in 0..layout.superblock_count {
             file_buffered.read_exact(&mut meta_buf)?;
 
             // Update `self.meta` based on the metadata at the front of the
@@ -755,15 +717,14 @@ impl RawInner {
                 .map(|n| n.meta_gen < this_meta.meta_gen)
                 .unwrap_or(true)
             {
-                self.meta = this_meta;
                 current_meta = Some(this_meta);
             }
 
             // Update `self.active_context` based on block data hashes
-            for block_offset in 0..self.layout.blocks_per_superblock {
+            for block_offset in 0..layout.blocks_per_superblock {
                 let block_index = block_offset
-                    + superblock_index * self.layout.blocks_per_superblock;
-                if block_index >= self.layout.block_count {
+                    + superblock_index * layout.blocks_per_superblock;
+                if block_index >= layout.block_count {
                     break;
                 }
                 file_buffered.read_exact(&mut block_buf)?;
@@ -774,7 +735,7 @@ impl RawInner {
 
                 for slot in [ContextSlot::A, ContextSlot::B] {
                     let offset = (BLOCK_META_SIZE_BYTES
-                        + (slot as u64 * self.layout.blocks_per_superblock
+                        + (slot as u64 * layout.blocks_per_superblock
                             + block_offset)
                             * BLOCK_CONTEXT_SLOT_SIZE_BYTES)
                         as usize;
@@ -800,8 +761,43 @@ impl RawInner {
                 let value = matching_slot
                     .or(empty_slot)
                     .ok_or(anyhow!("no slot found for {block_index}"))?;
-                self.active_context[block_index as usize] = value;
+                active_context.push(value);
             }
+        }
+
+        let out = Self {
+            file,
+            // This value is not necessarily correct; we'll recompute it below!
+            active_context,
+            // Bogus value for meta, initialized below
+            meta: current_meta.ok_or_else(|| {
+                CrucibleError::IoError(
+                    "failed to read any metadata".to_string(),
+                )
+            })?,
+            last_superblock_modified: None,
+            extent_number,
+            extent_size: def.extent_size(),
+
+            // Initializing this with `ContextSlot::A` may not be entirely
+            // accurate, but it's easy!  The downside is that we could
+            // potentially do a little more work on initial writes and flushes,
+            // until this accurately reflects the real value.
+            superblock_slot: vec![
+                ContextSlot::A;
+                layout.superblock_count as usize
+            ],
+            layout,
+        };
+
+        Ok(out)
+    }
+
+    fn set_dirty(&mut self) -> Result<(), CrucibleError> {
+        let mut meta = self.meta;
+        if !meta.dirty {
+            meta.dirty = true;
+            self.set_metadata(meta)?;
         }
         Ok(())
     }
