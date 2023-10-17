@@ -95,16 +95,13 @@ pub struct RawInner {
     /// will point to a slot that deserializes to `None`.
     ///
     /// This `Vec` contains one item per block in the extent file.
-    active_context: Vec<Option<ContextSlot>>,
+    active_context: Vec<ContextSlot>,
 
     /// Active slot (`A` or `B`) for each superblock
     superblock_slot: Vec<ContextSlot>,
 
     /// Current metadata, cached here to avoid reading / writing unnecessarily
-    ///
-    /// When this is `None`, the metadata is in an unknown state and we need to
-    /// retrieve it from disk.
-    meta: Cell<Option<OnDiskMeta>>,
+    meta: Cell<OnDiskMeta>,
 
     /// Index of the last modified superblock
     ///
@@ -135,15 +132,15 @@ impl std::ops::Not for ContextSlot {
 
 impl ExtentInner for RawInner {
     fn flush_number(&self) -> Result<u64, CrucibleError> {
-        self.get_metadata().map(|v| v.flush_number)
+        Ok(self.meta.get().flush_number)
     }
 
     fn gen_number(&self) -> Result<u64, CrucibleError> {
-        self.get_metadata().map(|v| v.gen_number)
+        Ok(self.meta.get().gen_number)
     }
 
     fn dirty(&self) -> Result<bool, CrucibleError> {
-        self.get_metadata().map(|v| v.dirty)
+        Ok(self.meta.get().dirty)
     }
 
     fn write(
@@ -256,84 +253,46 @@ impl ExtentInner for RawInner {
             });
         }
         self.set_block_contexts(&block_ctx)?;
-        for write in writes {
-            if !writes_to_skip.contains(&write.offset.value) {
-                // Until the write lands, we can't trust the context slot and must
-                // rehash it if requested.  This assignment is overwritten after the
-                // write finishes.
-                self.active_context[write.offset.value as usize] = None;
-            }
-        }
 
         cdt::extent__write__raw__context__insert__done!(|| {
             (job_id.0, self.extent_number, writes.len() as u64)
         });
 
-        // PERFORMANCE TODO:
-        //
-        // Something worth considering for small writes is that, based on
-        // my memory of conversations we had with propolis folks about what
-        // OSes expect out of an NVMe driver, I believe our contract with the
-        // upstairs doesn't require us to have the writes inside the file
-        // until after a flush() returns. If that is indeed true, we could
-        // buffer a certain amount of writes, only actually writing that
-        // buffer when either a flush is issued or the buffer exceeds some
-        // set size (based on our memory constraints). This would have
-        // benefits on any workload that frequently writes to the same block
-        // between flushes, would have benefits for small contiguous writes
-        // issued over multiple write commands by letting us batch them into
-        // a larger write, and (speculation) may benefit non-contiguous writes
-        // by cutting down the number of metadata writes. But, it introduces
-        // complexity. The time spent implementing that would probably better be
-        // spent switching to aio or something like that.
         cdt::extent__write__file__start!(|| {
             (job_id.0, self.extent_number, writes.len() as u64)
         });
 
-        // Now, batch writes into iovecs and use pwritev to write them all out.
-        let mut batched_pwritev = BatchedPwritev::new(
-            self.file.as_raw_fd(),
-            writes.len(),
-            self.extent_size.block_size_in_bytes().into(),
-            iov_max,
-        );
-
-        for write in writes {
-            let block = write.offset.value;
-
-            // TODO, can this be `only_write_unwritten &&
-            // write_to_skip.contains()`?
-            if writes_to_skip.contains(&block) {
-                debug_assert!(only_write_unwritten);
-                continue;
-            }
-
-            batched_pwritev.add_write_block(
-                write,
-                self.layout.block_pos(write.offset.value),
-            )?;
-        }
-
-        // Write any remaining data
-        batched_pwritev.perform_writes()?;
-
-        // Now that writes have gone through, update our active context slots
-        //
-        // By definition, we have written to the inactive superblock slot
-        for write in writes.iter() {
-            let block = write.offset.value;
-            if !writes_to_skip.contains(&block) {
-                let superblock = block / self.layout.blocks_per_superblock;
-                let slot = !self.superblock_slot[superblock as usize];
-                self.active_context[write.offset.value as usize] = Some(slot);
-            }
-        }
-
+        // Until the write lands, we can't trust the context slot!  As such, we
+        // can't return with `?` here; we have to check whether the write failed
+        // and invalidate the slot in that case.
+        let r = self.write_inner(writes, &writes_to_skip, iov_max);
         cdt::extent__write__file__done!(|| {
             (job_id.0, self.extent_number, writes.len() as u64)
         });
 
-        Ok(())
+        // Now that writes have gone through, update our active context slots
+        //
+        // By definition, we have written to the inactive superblock slot
+        if r.is_err() {
+            for write in writes.iter() {
+                let block = write.offset.value;
+                if !writes_to_skip.contains(&block) {
+                    // We can't recover if the context slots in the file have
+                    // diverged from the file data, so unceremoniously bail out.
+                    self.recompute_slot_from_file(block).unwrap();
+                }
+            }
+        } else {
+            for write in writes.iter() {
+                let block = write.offset.value;
+                if !writes_to_skip.contains(&block) {
+                    let superblock = block / self.layout.blocks_per_superblock;
+                    let slot = !self.superblock_slot[superblock as usize];
+                    self.active_context[write.offset.value as usize] = slot;
+                }
+            }
+        }
+        r
     }
 
     fn read(
@@ -459,7 +418,6 @@ impl ExtentInner for RawInner {
         }
 
         // Make sure that block and superblock data is consistent
-        self.ensure_block_slots_are_known()?;
         let mut new_superblock_slots = vec![];
         for i in 0..self.layout.superblock_count {
             new_superblock_slots.push(self.ensure_superblock_is_consistent(i)?);
@@ -506,7 +464,7 @@ impl ExtentInner for RawInner {
     ) -> Result<(), CrucibleError> {
         self.set_dirty()?;
         let new_slot = self.set_block_context(block_context)?;
-        self.active_context[block_context.block as usize] = Some(new_slot);
+        self.active_context[block_context.block as usize] = new_slot;
         Ok(())
     }
 
@@ -661,14 +619,14 @@ impl RawInner {
             extent_size: def.extent_size(),
             extent_number,
             active_context: vec![
-                Some(ContextSlot::A);
+                ContextSlot::A;
                 def.extent_size().value as usize
             ],
             superblock_slot: vec![
                 ContextSlot::A;
                 layout.superblock_count as usize
             ],
-            meta: Some(meta).into(),
+            meta: meta.into(),
             last_superblock_modified: None,
             layout,
         };
@@ -731,12 +689,22 @@ impl RawInner {
             .into());
         }
 
-        Ok(Self {
+        let mut out = Self {
             file,
-            // Lazy initialization of which context slot is active
-            active_context: vec![None; def.extent_size().value as usize],
-            // Lazy initialization of metadata
-            meta: None.into(),
+            // This value is not necessarily correct; we'll recompute it below!
+            active_context: vec![
+                ContextSlot::A;
+                def.extent_size().value as usize
+            ],
+            // Bogus value for meta, initialized below
+            meta: OnDiskMeta {
+                dirty: false,
+                gen_number: u64::MAX,
+                flush_number: u64::MAX,
+                ext_version: u32::MAX,
+                meta_gen: u64::MAX,
+            }
+            .into(),
             last_superblock_modified: None,
             extent_number,
             extent_size: def.extent_size(),
@@ -750,11 +718,17 @@ impl RawInner {
                 layout.superblock_count as usize
             ],
             layout,
-        })
+        };
+
+        for b in 0..out.layout.block_count {
+            out.recompute_slot_from_file(b)?;
+        }
+        out.recompute_meta()?;
+        Ok(out)
     }
 
     fn set_dirty(&mut self) -> Result<(), CrucibleError> {
-        let mut meta = self.get_metadata()?;
+        let mut meta = self.meta.get();
         if !meta.dirty {
             meta.dirty = true;
             self.set_metadata(meta)?;
@@ -762,57 +736,50 @@ impl RawInner {
         Ok(())
     }
 
-    /// Looks up the current context slot for the given block
-    ///
-    /// If the slot is currently unknown, rehashes the block and picks one of
-    /// the two slots, storing it locally.  If the block is unwritten, then at
-    /// least one of the slots must deserialize to `None`, so that's the one
-    /// that we pick (biased to slot A).
-    fn get_block_context_slot(&mut self, block: u64) -> Result<ContextSlot> {
-        match self.active_context[block as usize] {
-            // The vast majority of the time, this should be `Some(v)`, because
-            // we cache it locally.  The only time it's not is on initial
-            // startup and if we failed mid-write.
-            Some(v) => Ok(v),
-            None => {
-                // Read the block data itself:
-                let block_size = self.extent_size.block_size_in_bytes();
-                let mut buf = vec![0; block_size as usize];
-                self.file.seek(SeekFrom::Start(
-                    block_size as u64 * self.layout.block_pos(block),
-                ))?;
-                self.file.read_exact(&mut buf)?;
-                let hash = integrity_hash(&[&buf]);
+    fn recompute_slot_from_file(
+        &mut self,
+        block: u64,
+    ) -> Result<(), CrucibleError> {
+        // Read the block data itself:
+        let block_size = self.extent_size.block_size_in_bytes();
+        let mut buf = vec![0; block_size as usize];
+        self.file.seek(SeekFrom::Start(
+            block_size as u64 * self.layout.block_pos(block),
+        ))?;
+        self.file.read_exact(&mut buf)?;
+        let hash = integrity_hash(&[&buf]);
 
-                // Then, read the slot data and decide if either slot
-                // (1) is present and
-                // (2) has a matching hash
-                let mut buf = [0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
-                let mut matching_slot = None;
-                let mut empty_slot = None;
-                for slot in [ContextSlot::A, ContextSlot::B] {
-                    // TODO: is `pread` faster than seek + read_exact?
-                    self.file.seek(SeekFrom::Start(
-                        self.layout.context_slot_offset(block, slot),
-                    ))?;
-                    self.file.read_exact(&mut buf)?;
-                    let context: Option<OnDiskDownstairsBlockContext> =
-                        bincode::deserialize(&buf)?;
-                    if let Some(context) = context {
-                        if context.on_disk_hash == hash {
-                            matching_slot = Some(slot);
-                        }
-                    } else if empty_slot.is_none() {
-                        empty_slot = Some(slot);
-                    }
+        // Then, read the slot data and decide if either slot
+        // (1) is present and
+        // (2) has a matching hash
+        let mut buf = [0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
+        let mut matching_slot = None;
+        let mut empty_slot = None;
+        for slot in [ContextSlot::A, ContextSlot::B] {
+            // TODO: is `pread` faster than seek + read_exact?
+            self.file.seek(SeekFrom::Start(
+                self.layout.context_slot_offset(block, slot),
+            ))?;
+            self.file.read_exact(&mut buf)?;
+            let context: Option<OnDiskDownstairsBlockContext> =
+                bincode::deserialize(&buf).map_err(|e| {
+                    CrucibleError::IoError(format!(
+                        "context deserialization failed: {e:?}"
+                    ))
+                })?;
+            if let Some(context) = context {
+                if context.on_disk_hash == hash {
+                    matching_slot = Some(slot);
                 }
-                let value = matching_slot
-                    .or(empty_slot)
-                    .ok_or(anyhow!("no slot found for {block}"))?;
-                self.active_context[block as usize] = Some(value);
-                Ok(value)
+            } else if empty_slot.is_none() {
+                empty_slot = Some(slot);
             }
         }
+        let value = matching_slot
+            .or(empty_slot)
+            .ok_or(anyhow!("no slot found for {block}"))?;
+        self.active_context[block as usize] = value;
+        Ok(())
     }
 
     fn set_block_contexts(
@@ -858,7 +825,7 @@ impl RawInner {
             // Get our currently-active slot; we'll be writing to the other one
             // for crash consistency (i.e. if we crash between writing the
             // context and writing out the block data)
-            let active_slot = self.get_block_context_slot(b.block)?;
+            let active_slot = self.active_context[b.block as usize];
             let target_slot = !active_slot;
 
             let superblock = b.block / self.layout.blocks_per_superblock;
@@ -937,13 +904,11 @@ impl RawInner {
         Ok(!self.superblock_slot[superblock as usize])
     }
 
-    fn get_metadata(&self) -> Result<OnDiskMeta, CrucibleError> {
-        if let Some(s) = self.meta.get() {
-            return Ok(s);
-        }
+    fn recompute_meta(&self) -> Result<(), CrucibleError> {
         // Iterate over every superblock, reading metadata from the beginning of
         // the superblock.  The metadata with the largest `meta_gen` is the most
         // recent.
+        let mut current: Option<OnDiskMeta> = None;
         for i in 0..self.layout.superblock_count {
             let offset = (self.layout.blocks_per_superblock + 1)
                 * self.extent_size.block_size_in_bytes() as u64
@@ -958,16 +923,12 @@ impl RawInner {
             let out: OnDiskMeta = bincode::deserialize(&buf)
                 .map_err(|e| CrucibleError::IoError(e.to_string()))?;
 
-            if self
-                .meta
-                .get()
-                .map(|n| n.meta_gen < out.meta_gen)
-                .unwrap_or(true)
-            {
-                self.meta.set(Some(out));
+            if current.map(|n| n.meta_gen < out.meta_gen).unwrap_or(true) {
+                self.meta.set(out);
+                current = Some(out);
             }
         }
-        Ok(self.meta.get().unwrap())
+        Ok(())
     }
 
     /// Sets raw metadata
@@ -978,7 +939,7 @@ impl RawInner {
         &mut self,
         mut meta: OnDiskMeta,
     ) -> Result<(), CrucibleError> {
-        let prev_meta = self.get_metadata()?;
+        let prev_meta = self.meta.get();
 
         let i = self.last_superblock_modified.unwrap_or(0);
         let offset = (self.layout.blocks_per_superblock + 1)
@@ -989,13 +950,16 @@ impl RawInner {
         let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
         bincode::serialize_into(buf.as_mut_slice(), &meta).unwrap();
 
-        // Clear the local metadata value until the write is complete
-        self.meta.set(None);
-        nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
-            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-
-        // The write is complete; we can update our local cache
-        self.meta.set(Some(meta));
+        //
+        let r =
+            nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
+                .map_err(|e| CrucibleError::IoError(e.to_string()));
+        if r.is_err() {
+            // The write failed, so reload the state of `meta` from the file
+        } else {
+            // The write is complete; we can update our local cache
+            self.meta.set(meta);
+        }
 
         Ok(())
     }
@@ -1005,7 +969,7 @@ impl RawInner {
         block: u64,
     ) -> Result<Option<DownstairsBlockContext>> {
         // Find the context slot for this block
-        let slot = self.get_block_context_slot(block)?;
+        let slot = self.active_context[block as usize];
 
         // Read the context slot from the file on disk
         let offset = self.layout.context_slot_offset(block, slot);
@@ -1027,7 +991,7 @@ impl RawInner {
 
     /// Update the flush number, generation number, and clear the dirty bit
     fn set_flush_number(&mut self, new_flush: u64, new_gen: u64) -> Result<()> {
-        let mut meta = self.get_metadata()?;
+        let mut meta = self.meta.get();
         meta.flush_number = new_flush;
         meta.gen_number = new_gen;
         meta.dirty = false;
@@ -1041,13 +1005,9 @@ impl RawInner {
         block: u64,
         count: u64,
     ) -> Result<Vec<Option<DownstairsBlockContext>>> {
-        let slots = (block..block + count)
-            .map(|block| self.get_block_context_slot(block))
-            .collect::<Result<Vec<_>>>()?;
-
         let mut out = vec![];
         for (_, mut group) in (block..block + count)
-            .zip(slots)
+            .map(|block| (block, self.active_context[block as usize]))
             .group_by(|(block, slot)| {
                 (block / self.layout.blocks_per_superblock, *slot)
             })
@@ -1083,18 +1043,6 @@ impl RawInner {
         Ok(out)
     }
 
-    /// Ensure that `self.active_context` contains all `Some(..)` values
-    ///
-    /// This is normally cheap, but requires reading from the file and rehashing
-    /// at startup and when a slot is temporarily unknown (i.e. because we
-    /// failed mid-write).
-    fn ensure_block_slots_are_known(&mut self) -> Result<()> {
-        for block in 0..self.active_context.len() {
-            self.get_block_context_slot(block as u64)?;
-        }
-        Ok(())
-    }
-
     /// Ensures that all context data in the superblock is in the same slot
     ///
     /// Returns the slot in which context data is consistently stored.  This
@@ -1115,8 +1063,8 @@ impl RawInner {
         let n = self.layout.blocks_per_superblock;
         let block_slots = ((superblock_index * n)
             ..self.layout.block_count.min((superblock_index + 1) * n))
-            .map(|b| self.get_block_context_slot(b))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|b| self.active_context[b as usize])
+            .collect::<Vec<_>>();
 
         let superblock_slot = self.superblock_slot[superblock_index as usize];
 
@@ -1178,7 +1126,58 @@ impl RawInner {
         let n = self.layout.blocks_per_superblock as usize;
         self.active_context
             [i * n..(self.layout.block_count as usize).min((i + 1) * n)]
-            .fill(Some(slot))
+            .fill(slot)
+    }
+
+    fn write_inner(
+        &self,
+        writes: &[&crucible_protocol::Write],
+        writes_to_skip: &HashSet<u64>,
+        iov_max: usize,
+    ) -> Result<(), CrucibleError> {
+        // PERFORMANCE TODO:
+        //
+        // Something worth considering for small writes is that, based on
+        // my memory of conversations we had with propolis folks about what
+        // OSes expect out of an NVMe driver, I believe our contract with the
+        // upstairs doesn't require us to have the writes inside the file
+        // until after a flush() returns. If that is indeed true, we could
+        // buffer a certain amount of writes, only actually writing that
+        // buffer when either a flush is issued or the buffer exceeds some
+        // set size (based on our memory constraints). This would have
+        // benefits on any workload that frequently writes to the same block
+        // between flushes, would have benefits for small contiguous writes
+        // issued over multiple write commands by letting us batch them into
+        // a larger write, and (speculation) may benefit non-contiguous writes
+        // by cutting down the number of metadata writes. But, it introduces
+        // complexity. The time spent implementing that would probably better be
+        // spent switching to aio or something like that.
+
+        // Now, batch writes into iovecs and use pwritev to write them all out.
+        let mut batched_pwritev = BatchedPwritev::new(
+            self.file.as_raw_fd(),
+            writes.len(),
+            self.extent_size.block_size_in_bytes().into(),
+            iov_max,
+        );
+
+        for write in writes {
+            let block = write.offset.value;
+
+            if writes_to_skip.contains(&block) {
+                continue;
+            }
+
+            batched_pwritev.add_write_block(
+                write,
+                self.layout.block_pos(write.offset.value),
+            )?;
+        }
+
+        // Write any remaining data
+        batched_pwritev.perform_writes()?;
+
+        Ok(())
     }
 }
 
@@ -1526,28 +1525,28 @@ mod test {
         // Initial state: context and superblock slots are all A, because this
         // is a new (empty) file
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[0], ContextSlot::A);
 
         // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
 
         // The context should be written to slot A, forcing a flush and copying
         // + changing every other context slot in this superblock
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::B);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[2], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[3], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[4], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::A);
+        assert_eq!(inner.active_context[1], ContextSlot::B);
+        assert_eq!(inner.active_context[2], ContextSlot::B);
+        assert_eq!(inner.active_context[3], ContextSlot::B);
+        assert_eq!(inner.active_context[4], ContextSlot::B);
         // This shouldn't change other superblocks!
         assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
         // The context should be written to slot B, forcing another sync
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
         assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
@@ -1576,32 +1575,32 @@ mod test {
         // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
 
         // Flush, which should force a sync (marking slot B as synched
         // in superblock 0, and leaving other superblocks unchanged)
         inner.flush(12, 12, JobId(11).into())?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::B);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[2], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[3], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[4], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
+        assert_eq!(inner.active_context[1], ContextSlot::B);
+        assert_eq!(inner.active_context[2], ContextSlot::B);
+        assert_eq!(inner.active_context[3], ContextSlot::B);
+        assert_eq!(inner.active_context[4], ContextSlot::B);
         assert_eq!(inner.superblock_slot[1], ContextSlot::A);
 
         // The context should be written to slot A, without a sync
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::B);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[0], ContextSlot::A);
 
         // The context should be written to slot B, forcing a sync
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[2], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[3], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[4], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
+        assert_eq!(inner.active_context[1], ContextSlot::A);
+        assert_eq!(inner.active_context[2], ContextSlot::A);
+        assert_eq!(inner.active_context[3], ContextSlot::A);
+        assert_eq!(inner.active_context[4], ContextSlot::A);
 
         Ok(())
     }
@@ -1628,39 +1627,39 @@ mod test {
         // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
 
         // The context should be written to slot A, forcing a sync
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::B);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::A);
+        assert_eq!(inner.active_context[1], ContextSlot::B);
 
         // Flush, which should bump the sync number (marking slot B as synched
         // in superblock 0, and leaving other superblocks unchanged)
         inner.flush(12, 12, JobId(11).into())?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[2], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[3], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[4], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[0], ContextSlot::A);
+        assert_eq!(inner.active_context[1], ContextSlot::A);
+        assert_eq!(inner.active_context[2], ContextSlot::A);
+        assert_eq!(inner.active_context[3], ContextSlot::A);
+        assert_eq!(inner.active_context[4], ContextSlot::A);
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
 
         // The context should be written to slot B, without a sync
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::A);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::A));
+        assert_eq!(inner.active_context[0], ContextSlot::B);
+        assert_eq!(inner.active_context[1], ContextSlot::A);
 
         // The context should be written to slot A, forcing a sync
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;
         assert_eq!(inner.superblock_slot[0], ContextSlot::B);
-        assert_eq!(inner.active_context[0], Some(ContextSlot::A));
-        assert_eq!(inner.active_context[1], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[2], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[3], Some(ContextSlot::B));
-        assert_eq!(inner.active_context[4], Some(ContextSlot::B));
+        assert_eq!(inner.active_context[0], ContextSlot::A);
+        assert_eq!(inner.active_context[1], ContextSlot::B);
+        assert_eq!(inner.active_context[2], ContextSlot::B);
+        assert_eq!(inner.active_context[3], ContextSlot::B);
+        assert_eq!(inner.active_context[4], ContextSlot::B);
 
         Ok(())
     }
