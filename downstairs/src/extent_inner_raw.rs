@@ -95,10 +95,10 @@ pub struct RawInner {
     /// will point to a slot that deserializes to `None`.
     ///
     /// This `Vec` contains one item per block in the extent file.
-    active_context: Vec<Option<bool>>,
+    active_context: Vec<Option<ContextSlot>>,
 
     /// Active slot (`A` or `B`) for each superblock
-    superblock_slot: Vec<bool>,
+    superblock_slot: Vec<ContextSlot>,
 
     /// Current metadata, cached here to avoid reading / writing unnecessarily
     ///
@@ -115,6 +115,22 @@ pub struct RawInner {
 
     /// Superblock configuration and layout
     layout: RawExtentLayout,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ContextSlot {
+    A,
+    B,
+}
+
+impl std::ops::Not for ContextSlot {
+    type Output = Self;
+    fn not(self) -> Self {
+        match self {
+            ContextSlot::A => ContextSlot::B,
+            ContextSlot::B => ContextSlot::A,
+        }
+    }
 }
 
 impl ExtentInner for RawInner {
@@ -578,7 +594,7 @@ impl RawExtentLayout {
     /// are packed as two arrays, each with `blocks_per_superblock` slots.
     /// We use a ping-pong strategy between arrays to ensure that one of the two
     /// context slots is always valid (i.e. matching the data in the file).
-    fn context_slot_offset(&self, block: u64, slot: bool) -> u64 {
+    fn context_slot_offset(&self, block: u64, slot: ContextSlot) -> u64 {
         let pos = block / self.blocks_per_superblock;
         let offset = block % self.blocks_per_superblock;
 
@@ -641,8 +657,14 @@ impl RawInner {
             file,
             extent_size: def.extent_size(),
             extent_number,
-            active_context: vec![Some(false); def.extent_size().value as usize],
-            superblock_slot: vec![false; layout.superblock_count as usize],
+            active_context: vec![
+                Some(ContextSlot::A);
+                def.extent_size().value as usize
+            ],
+            superblock_slot: vec![
+                ContextSlot::A;
+                layout.superblock_count as usize
+            ],
             meta: Some(meta).into(),
             last_superblock_modified: None,
             layout,
@@ -716,11 +738,14 @@ impl RawInner {
             extent_number,
             extent_size: def.extent_size(),
 
-            // Initializing this with `false` may not be entirely accurate, but
-            // it's easy!  The downside is that we could potentially do a little
-            // more work on initial writes and flushes, until this accurately
-            // reflects the real value.
-            superblock_slot: vec![false; layout.superblock_count as usize],
+            // Initializing this with `ContextSlot::A` may not be entirely
+            // accurate, but it's easy!  The downside is that we could
+            // potentially do a little more work on initial writes and flushes,
+            // until this accurately reflects the real value.
+            superblock_slot: vec![
+                ContextSlot::A;
+                layout.superblock_count as usize
+            ],
             layout,
         })
     }
@@ -740,7 +765,7 @@ impl RawInner {
     /// the two slots, storing it locally.  If the block is unwritten, then at
     /// least one of the slots must deserialize to `None`, so that's the one
     /// that we pick (biased to slot A).
-    fn get_block_context_slot(&mut self, block: u64) -> Result<bool> {
+    fn get_block_context_slot(&mut self, block: u64) -> Result<ContextSlot> {
         match self.active_context[block as usize] {
             // The vast majority of the time, this should be `Some(v)`, because
             // we cache it locally.  The only time it's not is on initial
@@ -762,7 +787,7 @@ impl RawInner {
                 let mut buf = [0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
                 let mut matching_slot = None;
                 let mut empty_slot = None;
-                for slot in [false, true] {
+                for slot in [ContextSlot::A, ContextSlot::B] {
                     // TODO: is `pread` faster than seek + read_exact?
                     self.file.seek(SeekFrom::Start(
                         self.layout.context_slot_offset(block, slot),
@@ -902,7 +927,7 @@ impl RawInner {
     fn set_block_context(
         &mut self,
         block_context: &DownstairsBlockContext,
-    ) -> Result<bool> {
+    ) -> Result<ContextSlot> {
         self.set_block_contexts(&[*block_context])?;
         let superblock =
             block_context.block / self.layout.blocks_per_superblock;
@@ -1083,7 +1108,7 @@ impl RawInner {
     fn ensure_superblock_is_consistent(
         &mut self,
         superblock_index: u64,
-    ) -> Result<bool> {
+    ) -> Result<ContextSlot> {
         let n = self.layout.blocks_per_superblock;
         let block_slots = ((superblock_index * n)
             ..self.layout.block_count.min((superblock_index + 1) * n))
@@ -1140,7 +1165,11 @@ impl RawInner {
         Ok(!superblock_slot)
     }
 
-    fn set_superblock_slot(&mut self, superblock_index: u64, slot: bool) {
+    fn set_superblock_slot(
+        &mut self,
+        superblock_index: u64,
+        slot: ContextSlot,
+    ) {
         let i = superblock_index as usize;
         self.superblock_slot[i] = slot;
         let n = self.layout.blocks_per_superblock as usize;
@@ -1561,10 +1590,10 @@ mod test {
                 hash,
             },
         };
-        // The context should be written to slot 0
+        // The context should be written to slot B
         inner.write(JobId(10), &[&write], false, IOV_MAX_TEST)?;
 
-        // The context should be written to slot 1
+        // The context should be written to slot A, forcing a sync
         inner.write(JobId(11), &[&write], false, IOV_MAX_TEST)?;
 
         // Flush, which should bump the sync number (marking slot 0 as synched)
@@ -1673,12 +1702,15 @@ mod test {
         assert_eq!(sb.block_pos(3), 4);
         assert_eq!(sb.block_pos(4), 5);
         assert_eq!(sb.block_pos(5), 7); // offset!
-        assert_eq!(sb.context_slot_offset(0, false), 32);
-        assert_eq!(sb.context_slot_offset(0, true), 32 + 5 * 48);
-        assert_eq!(sb.context_slot_offset(1, false), 32 + 48);
-        assert_eq!(sb.context_slot_offset(1, true), 32 + 5 * 48 + 48);
-        assert_eq!(sb.context_slot_offset(5, false), 6 * 512 + 32);
-        assert_eq!(sb.context_slot_offset(5, true), 6 * 512 + 32 + 5 * 48);
+        assert_eq!(sb.context_slot_offset(0, ContextSlot::A), 32);
+        assert_eq!(sb.context_slot_offset(0, ContextSlot::B), 32 + 5 * 48);
+        assert_eq!(sb.context_slot_offset(1, ContextSlot::A), 32 + 48);
+        assert_eq!(sb.context_slot_offset(1, ContextSlot::B), 32 + 5 * 48 + 48);
+        assert_eq!(sb.context_slot_offset(5, ContextSlot::A), 6 * 512 + 32);
+        assert_eq!(
+            sb.context_slot_offset(5, ContextSlot::B),
+            6 * 512 + 32 + 5 * 48
+        );
 
         // Check that an image with 4K blocks snaps to 128 KiB
         options.set_block_size(4096); // bytes
