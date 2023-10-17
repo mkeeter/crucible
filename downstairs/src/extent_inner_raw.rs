@@ -242,22 +242,22 @@ impl ExtentInner for RawInner {
             (job_id.0, self.extent_number, writes.len() as u64)
         });
 
-        let mut block_ctx = vec![];
-        for write in writes {
-            if writes_to_skip.contains(&write.offset.value) {
-                continue;
-            }
+        // Compute block contexts, then write them to disk
+        let block_ctx: Vec<_> = writes
+            .iter()
+            .filter(|write| !writes_to_skip.contains(&write.offset.value))
+            .map(|write| {
+                // TODO it would be nice if we could profile what % of time we're
+                // spending on hashes locally vs writing to disk
+                let on_disk_hash = integrity_hash(&[&write.data[..]]);
 
-            // TODO it would be nice if we could profile what % of time we're
-            // spending on hashes locally vs writing to disk
-            let on_disk_hash = integrity_hash(&[&write.data[..]]);
-
-            block_ctx.push(DownstairsBlockContext {
-                block_context: write.block_context,
-                block: write.offset.value,
-                on_disk_hash,
-            });
-        }
+                DownstairsBlockContext {
+                    block_context: write.block_context,
+                    block: write.offset.value,
+                    on_disk_hash,
+                }
+            })
+            .collect();
         self.set_block_contexts(&block_ctx)?;
 
         cdt::extent__write__raw__context__insert__done!(|| {
@@ -272,23 +272,25 @@ impl ExtentInner for RawInner {
         // can't return with `?` here; we have to check whether the write failed
         // and invalidate the slot in that case.
         let r = self.write_inner(writes, &writes_to_skip, iov_max);
+
         cdt::extent__write__file__done!(|| {
             (job_id.0, self.extent_number, writes.len() as u64)
         });
 
         // Now that writes have gone through, update our active context slots
-        //
-        // By definition, we have written to the inactive superblock slot
         if r.is_err() {
             for write in writes.iter() {
                 let block = write.offset.value;
                 if !writes_to_skip.contains(&block) {
-                    // We can't recover if the context slots in the file have
-                    // diverged from the file data, so unceremoniously bail out.
+                    // Try to recompute the context slot from the file.  If this
+                    // fails, then we _really_ can't recover, so bail out
+                    // unceremoniously.
                     self.recompute_slot_from_file(block).unwrap();
                 }
             }
         } else {
+            // By definition, on success we have written to the inactive
+            // superblock slot.
             for write in writes.iter() {
                 let block = write.offset.value;
                 if !writes_to_skip.contains(&block) {
@@ -1209,6 +1211,10 @@ impl RawInner {
         self.superblock_dirty[i] = false;
     }
 
+    /// Perform the actual block data writes using [`BatchedPwritev`]
+    ///
+    /// This is written as a separate function so that we can use `?` to bail
+    /// out on errors, then handle them in a single place in the caller.
     fn write_inner(
         &self,
         writes: &[&crucible_protocol::Write],
