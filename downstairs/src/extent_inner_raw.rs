@@ -14,7 +14,6 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
 
-use std::cell::Cell;
 use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{IoSliceMut, Read, Seek, SeekFrom, Write};
@@ -101,7 +100,7 @@ pub struct RawInner {
     superblock_slot: Vec<ContextSlot>,
 
     /// Current metadata, cached here to avoid reading / writing unnecessarily
-    meta: Cell<OnDiskMeta>,
+    meta: OnDiskMeta,
 
     /// Index of the last modified superblock
     ///
@@ -132,15 +131,15 @@ impl std::ops::Not for ContextSlot {
 
 impl ExtentInner for RawInner {
     fn flush_number(&self) -> Result<u64, CrucibleError> {
-        Ok(self.meta.get().flush_number)
+        Ok(self.meta.flush_number)
     }
 
     fn gen_number(&self) -> Result<u64, CrucibleError> {
-        Ok(self.meta.get().gen_number)
+        Ok(self.meta.gen_number)
     }
 
     fn dirty(&self) -> Result<bool, CrucibleError> {
-        Ok(self.meta.get().dirty)
+        Ok(self.meta.dirty)
     }
 
     fn write(
@@ -626,7 +625,7 @@ impl RawInner {
                 ContextSlot::A;
                 layout.superblock_count as usize
             ],
-            meta: meta.into(),
+            meta,
             last_superblock_modified: None,
             layout,
         };
@@ -703,8 +702,7 @@ impl RawInner {
                 flush_number: u64::MAX,
                 ext_version: u32::MAX,
                 meta_gen: u64::MAX,
-            }
-            .into(),
+            },
             last_superblock_modified: None,
             extent_number,
             extent_size: def.extent_size(),
@@ -728,7 +726,7 @@ impl RawInner {
     }
 
     fn set_dirty(&mut self) -> Result<(), CrucibleError> {
-        let mut meta = self.meta.get();
+        let mut meta = self.meta;
         if !meta.dirty {
             meta.dirty = true;
             self.set_metadata(meta)?;
@@ -904,7 +902,7 @@ impl RawInner {
         Ok(!self.superblock_slot[superblock as usize])
     }
 
-    fn recompute_meta(&self) -> Result<(), CrucibleError> {
+    fn recompute_meta(&mut self) -> Result<(), CrucibleError> {
         // Iterate over every superblock, reading metadata from the beginning of
         // the superblock.  The metadata with the largest `meta_gen` is the most
         // recent.
@@ -924,7 +922,7 @@ impl RawInner {
                 .map_err(|e| CrucibleError::IoError(e.to_string()))?;
 
             if current.map(|n| n.meta_gen < out.meta_gen).unwrap_or(true) {
-                self.meta.set(out);
+                self.meta = out;
                 current = Some(out);
             }
         }
@@ -939,7 +937,7 @@ impl RawInner {
         &mut self,
         mut meta: OnDiskMeta,
     ) -> Result<(), CrucibleError> {
-        let prev_meta = self.meta.get();
+        let prev_meta = self.meta;
 
         let i = self.last_superblock_modified.unwrap_or(0);
         let offset = (self.layout.blocks_per_superblock + 1)
@@ -950,18 +948,18 @@ impl RawInner {
         let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
         bincode::serialize_into(buf.as_mut_slice(), &meta).unwrap();
 
-        //
         let r =
             nix::sys::uio::pwrite(self.file.as_raw_fd(), &buf, offset as i64)
                 .map_err(|e| CrucibleError::IoError(e.to_string()));
         if r.is_err() {
             // The write failed, so reload the state of `meta` from the file
+            self.recompute_meta().unwrap();
         } else {
             // The write is complete; we can update our local cache
-            self.meta.set(meta);
+            self.meta = meta;
         }
 
-        Ok(())
+        r.map(|_| ())
     }
 
     fn get_block_context(
@@ -991,7 +989,7 @@ impl RawInner {
 
     /// Update the flush number, generation number, and clear the dirty bit
     fn set_flush_number(&mut self, new_flush: u64, new_gen: u64) -> Result<()> {
-        let mut meta = self.meta.get();
+        let mut meta = self.meta;
         meta.flush_number = new_flush;
         meta.gen_number = new_gen;
         meta.dirty = false;
@@ -1055,7 +1053,9 @@ impl RawInner {
     /// case, then the function will return that value.
     ///
     /// Otherwise, all context slots pointing to the **current** superblock slot
-    /// will be copied to the alternate slot.
+    /// will be copied to the alternate slot, and that alternate slot will be
+    /// returned.  Once the file is synched to disk,
+    /// `self.superblock_slot[index]` should be updated accordingly.
     fn ensure_superblock_is_consistent(
         &mut self,
         superblock_index: u64,
