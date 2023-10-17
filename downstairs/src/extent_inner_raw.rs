@@ -768,9 +768,11 @@ impl RawInner {
                     }
                 }
 
-                let value = matching_slot
-                    .or(empty_slot)
-                    .ok_or(anyhow!("no slot found for {block_index}"))?;
+                let value = matching_slot.or(empty_slot).ok_or_else(|| {
+                    CrucibleError::IoError(format!(
+                        "no slot found for {block_index}"
+                    ))
+                })?;
                 active_context.push(value);
             }
             let mut count_a = 0;
