@@ -777,6 +777,7 @@ impl RawInner {
                 })?;
                 active_context.push(value);
             }
+            // Pick a superblock context slot which matches the block contexts
             let mut count_a = 0;
             let mut count_b = 0;
             for slot in &active_context[pos..] {
@@ -795,9 +796,7 @@ impl RawInner {
 
         let out = Self {
             file,
-            // This value is not necessarily correct; we'll recompute it below!
             active_context,
-            // Bogus value for meta, initialized below
             meta: current_meta.ok_or_else(|| {
                 CrucibleError::IoError(
                     "failed to read any metadata".to_string(),
