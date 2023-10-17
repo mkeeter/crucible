@@ -99,15 +99,22 @@ pub struct RawInner {
     /// Active slot (`A` or `B`) for each superblock
     superblock_slot: Vec<ContextSlot>,
 
+    /// Per-superblock dirty field
+    ///
+    /// This is `false` when every context slot in the superblock matches the
+    /// superblock slot and the file has been flushed to disk, and `true`
+    /// otherwise.
+    superblock_dirty: Vec<bool>,
+
     /// Current metadata, cached here to avoid reading / writing unnecessarily
     meta: OnDiskMeta,
 
-    /// Index of the last modified superblock
+    /// Index of the last modified superblock (or 0 at startup)
     ///
     /// Storing this means that when we want to send a flush, we can edit the
     /// [`OnDiskMeta`] in a superblock that already has edits, which improves
     /// write locality.
-    last_superblock_modified: Option<u64>,
+    last_superblock_modified: u64,
 
     /// Superblock configuration and layout
     layout: RawExtentLayout,
@@ -222,7 +229,7 @@ impl ExtentInner for RawInner {
         // calling `set_dirty` below), we edit the same superblock.
         if let Some(w) = writes.get(0) {
             self.last_superblock_modified =
-                Some(w.offset.value / self.layout.blocks_per_superblock);
+                w.offset.value / self.layout.blocks_per_superblock;
         }
 
         self.set_dirty()?;
@@ -609,7 +616,6 @@ impl RawInner {
         {
             let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
             bincode::serialize_into(buf.as_mut_slice(), &meta)?;
-            file.seek(SeekFrom::Start(0))?;
             file.write_all(&buf)?;
         }
 
@@ -625,8 +631,9 @@ impl RawInner {
                 ContextSlot::A;
                 layout.superblock_count as usize
             ],
+            superblock_dirty: vec![false; layout.superblock_count as usize],
             meta,
-            last_superblock_modified: None,
+            last_superblock_modified: 0,
             layout,
         };
 
@@ -699,6 +706,8 @@ impl RawInner {
         let mut block_buf = vec![0u8; layout.block_size_bytes as usize];
         let mut current_meta: Option<OnDiskMeta> = None;
         let mut active_context = vec![];
+        let mut superblock_slot = vec![];
+        let mut superblock_dirty = vec![];
         for superblock_index in 0..layout.superblock_count {
             file_buffered.read_exact(&mut meta_buf)?;
 
@@ -721,6 +730,7 @@ impl RawInner {
             }
 
             // Update `self.active_context` based on block data hashes
+            let pos = active_context.len();
             for block_offset in 0..layout.blocks_per_superblock {
                 let block_index = block_offset
                     + superblock_index * layout.blocks_per_superblock;
@@ -763,6 +773,20 @@ impl RawInner {
                     .ok_or(anyhow!("no slot found for {block_index}"))?;
                 active_context.push(value);
             }
+            let mut count_a = 0;
+            let mut count_b = 0;
+            for slot in &active_context[pos..] {
+                match slot {
+                    ContextSlot::A => count_a += 1,
+                    ContextSlot::B => count_b += 1,
+                }
+            }
+            superblock_slot.push(if count_a > count_b {
+                ContextSlot::A
+            } else {
+                ContextSlot::B
+            });
+            superblock_dirty.push(count_a > 0 && count_b > 0);
         }
 
         let out = Self {
@@ -775,18 +799,11 @@ impl RawInner {
                     "failed to read any metadata".to_string(),
                 )
             })?,
-            last_superblock_modified: None,
+            last_superblock_modified: 0,
             extent_number,
             extent_size: def.extent_size(),
-
-            // Initializing this with `ContextSlot::A` may not be entirely
-            // accurate, but it's easy!  The downside is that we could
-            // potentially do a little more work on initial writes and flushes,
-            // until this accurately reflects the real value.
-            superblock_slot: vec![
-                ContextSlot::A;
-                layout.superblock_count as usize
-            ],
+            superblock_slot,
+            superblock_dirty,
             layout,
         };
 
@@ -924,15 +941,18 @@ impl RawInner {
         // block contexts on a per-superblock basis (or finer).  For each
         // superblock, context data will be written into the slot
         // `!self.superblock_slots[superblock_index]`.
+        let mut buf = vec![];
         for (superblock_index, group) in block_contexts
             .iter()
             .group_by(|b| b.block / self.layout.blocks_per_superblock)
             .into_iter()
         {
-            let mut buf = vec![];
+            buf.clear();
             let mut group = group.peekable();
+            self.superblock_dirty[superblock_index as usize] = true;
             let start_block = group.peek().unwrap().block;
             for ctx in group {
+                let pos = buf.len();
                 buf.extend(
                     [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize].into_iter(),
                 );
@@ -940,11 +960,7 @@ impl RawInner {
                     block_context: ctx.block_context,
                     on_disk_hash: ctx.on_disk_hash,
                 };
-                let n = buf.len();
-                bincode::serialize_into(
-                    &mut buf[n - BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize..],
-                    &Some(d),
-                )?;
+                bincode::serialize_into(&mut buf[pos..], &Some(d))?;
             }
 
             let offset = self.layout.context_slot_offset(
@@ -1011,7 +1027,7 @@ impl RawInner {
     ) -> Result<(), CrucibleError> {
         let prev_meta = self.meta;
 
-        let i = self.last_superblock_modified.unwrap_or(0);
+        let i = self.last_superblock_modified;
         let offset = (self.layout.blocks_per_superblock + 1)
             * self.extent_size.block_size_in_bytes() as u64
             * i;
@@ -1132,22 +1148,14 @@ impl RawInner {
         &mut self,
         superblock_index: u64,
     ) -> Result<ContextSlot> {
+        let superblock_slot = self.superblock_slot[superblock_index as usize];
+        if !self.superblock_dirty[superblock_index as usize] {
+            return Ok(superblock_slot);
+        }
+
         let n = self.layout.blocks_per_superblock;
         let block_range = (superblock_index * n)
             ..self.layout.block_count.min((superblock_index + 1) * n);
-
-        let superblock_slot = self.superblock_slot[superblock_index as usize];
-
-        // If every block slots matches the superblock slot, then we don't
-        // need to do anything here.
-        //
-        // TODO: track a separate "superblock dirty" variable instead?
-        if block_range
-            .clone()
-            .all(|i| self.active_context[i as usize] == superblock_slot)
-        {
-            return Ok(superblock_slot);
-        }
 
         // Otherwise, we need to copy over any context slots that would
         // otherwise be left behind.  We'll do this by copying chunks that
@@ -1195,7 +1203,8 @@ impl RawInner {
         let n = self.layout.blocks_per_superblock as usize;
         self.active_context
             [i * n..(self.layout.block_count as usize).min((i + 1) * n)]
-            .fill(slot)
+            .fill(slot);
+        self.superblock_dirty[i] = false;
     }
 
     fn write_inner(
