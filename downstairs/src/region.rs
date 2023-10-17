@@ -1202,7 +1202,7 @@ pub(crate) mod test {
         completed_dir, copy_dir, extent_path, remove_copy_cleanup_dir,
         DownstairsBlockContext,
     };
-    use crate::extent_inner_raw::SuperblockLayout;
+    use crate::extent_inner_raw::RawExtentLayout;
 
     use super::*;
 
@@ -2184,7 +2184,7 @@ pub(crate) mod test {
 
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let sb = SuperblockLayout::new(&ddef);
+        let sb = RawExtentLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
@@ -2736,7 +2736,7 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let sb = SuperblockLayout::new(&ddef);
+        let sb = RawExtentLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
@@ -2863,7 +2863,7 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let sb = SuperblockLayout::new(&ddef);
+        let sb = RawExtentLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
@@ -2991,7 +2991,7 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let sb = SuperblockLayout::new(&ddef);
+        let sb = RawExtentLayout::new(&ddef);
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");

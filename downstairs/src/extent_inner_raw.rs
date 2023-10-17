@@ -1674,9 +1674,11 @@ mod test {
         assert_eq!(sb.block_pos(4), 5);
         assert_eq!(sb.block_pos(5), 7); // offset!
         assert_eq!(sb.context_slot_offset(0, false), 32);
-        assert_eq!(sb.context_slot_offset(0, true), 32 + 48);
+        assert_eq!(sb.context_slot_offset(0, true), 32 + 5 * 48);
+        assert_eq!(sb.context_slot_offset(1, false), 32 + 48);
+        assert_eq!(sb.context_slot_offset(1, true), 32 + 5 * 48 + 48);
         assert_eq!(sb.context_slot_offset(5, false), 6 * 512 + 32);
-        assert_eq!(sb.context_slot_offset(5, true), 6 * 512 + 32 + 48);
+        assert_eq!(sb.context_slot_offset(5, true), 6 * 512 + 32 + 5 * 48);
 
         // Check that an image with 4K blocks snaps to 128 KiB
         options.set_block_size(4096); // bytes
