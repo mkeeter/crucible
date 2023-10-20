@@ -877,25 +877,13 @@ impl Region {
 
         let extent_count = dirty_extents.len();
 
-        // Spawn parallel tasks for the flush
-        let mut join_handles: Vec<JoinHandle<Result<(), CrucibleError>>> =
-            Vec::with_capacity(extent_count);
-
+        let mut results = Vec::with_capacity(extent_count);
         for eid in &dirty_extents {
             let extent = self.get_opened_extent(*eid).await;
             let log = self.log.clone();
-            let jh = tokio::spawn(async move {
-                extent.flush(flush_number, gen_number, job_id, &log).await
-            });
-            join_handles.push(jh);
-        }
-
-        // Wait for all flushes to finish - wait until after
-        // cdt::os__flush__done to check the results and bail out.
-        let mut results = Vec::with_capacity(extent_count);
-        for join_handle in join_handles {
             results.push(
-                join_handle
+                extent
+                    .flush(flush_number, gen_number, job_id, &log)
                     .await
                     .map_err(|e| CrucibleError::GenericError(e.to_string())),
             );
@@ -907,7 +895,7 @@ impl Region {
             // If any extent flush failed, then return that as an error. Because
             // the results were all collected above, each extent flush has
             // completed at this point.
-            result??;
+            result?;
         }
 
         // Now everything has succeeded, we can remove these extents from the
