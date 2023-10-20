@@ -69,10 +69,18 @@ impl ExtentInner for SqliteInner {
         Ok(self.dirty.get())
     }
 
+    fn preflush(
+        &mut self,
+        _new_flush: u64,
+        _new_gen: u64,
+        _job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError> {
+        // Nothing to do here; the SQLite backend flushes the file immediately
+        Ok(())
+    }
+
     fn flush(
         &mut self,
-        new_flush: u64,
-        new_gen: u64,
         job_id: JobOrReconciliationId,
     ) -> Result<(), CrucibleError> {
         // Used for profiling
@@ -102,6 +110,16 @@ impl ExtentInner for SqliteInner {
         cdt::extent__flush__file__done!(|| {
             (job_id.get(), self.extent_number, n_dirty_blocks)
         });
+        Ok(())
+    }
+
+    fn postflush(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError> {
+        let n_dirty_blocks = self.dirty_blocks.len() as u64;
 
         // Clear old block contexts. In order to be crash consistent, only
         // perform this after the extent fsync is done. For each block

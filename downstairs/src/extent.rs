@@ -35,7 +35,21 @@ pub(crate) trait ExtentInner: Send + Debug {
     fn flush_number(&self) -> Result<u64, CrucibleError>;
     fn dirty(&self) -> Result<bool, CrucibleError>;
 
+    /// Performs any operations that should happen before `fsync` is called
+    ///
+    /// Returns `Ok(true)` if we need to call `flush` and `postflush` on this
+    /// extent, `Ok(false)` otherwise, and an error if something went wrong.
+    fn preflush(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError>;
     fn flush(
+        &mut self,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError>;
+    fn postflush(
         &mut self,
         new_flush: u64,
         new_gen: u64,
@@ -565,14 +579,13 @@ impl Extent {
         Ok(())
     }
 
-    #[instrument]
-    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
+    pub(crate) async fn preflush<I: Into<JobOrReconciliationId> + Debug>(
         &self,
         new_flush: u64,
         new_gen: u64,
         id: I, // only used for logging
         log: &Logger,
-    ) -> Result<(), CrucibleError> {
+    ) -> Result<bool, CrucibleError> {
         let job_id: JobOrReconciliationId = id.into();
         let mut inner = self.inner.lock().await;
 
@@ -581,7 +594,7 @@ impl Extent {
              * If we have made no writes to this extent since the last flush,
              * we do not need to update the extent on disk
              */
-            return Ok(());
+            return Ok(false);
         }
 
         // Read only extents should never have the dirty bit set. If they do,
@@ -592,7 +605,32 @@ impl Extent {
             crucible_bail!(ModifyingReadOnlyRegion);
         }
 
-        inner.flush(new_flush, new_gen, job_id)
+        inner.preflush(new_flush, new_gen, job_id)?;
+        Ok(true)
+    }
+
+    #[instrument]
+    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
+        &self,
+        id: I, // only used for logging
+        log: &Logger,
+    ) -> Result<(), CrucibleError> {
+        let job_id: JobOrReconciliationId = id.into();
+        let mut inner = self.inner.lock().await;
+        inner.flush(job_id)
+    }
+
+    #[instrument]
+    pub(crate) async fn postflush<I: Into<JobOrReconciliationId> + Debug>(
+        &self,
+        new_flush: u64,
+        new_gen: u64,
+        id: I, // only used for logging
+        log: &Logger,
+    ) -> Result<(), CrucibleError> {
+        let job_id: JobOrReconciliationId = id.into();
+        let mut inner = self.inner.lock().await;
+        inner.postflush(new_flush, new_gen, job_id)
     }
 
     pub async fn get_meta_info(&self) -> ExtentMeta {

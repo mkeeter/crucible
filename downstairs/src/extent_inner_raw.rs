@@ -427,20 +427,12 @@ impl ExtentInner for RawInner {
         Ok(())
     }
 
-    fn flush(
+    fn preflush(
         &mut self,
         new_flush: u64,
         new_gen: u64,
         job_id: JobOrReconciliationId,
     ) -> Result<(), CrucibleError> {
-        if !self.dirty()? {
-            /*
-             * If we have made no writes to this extent since the last flush,
-             * we do not need to update the extent on disk
-             */
-            return Ok(());
-        }
-
         cdt::extent__flush__start!(|| {
             (job_id.get(), self.extent_number, 0)
         });
@@ -448,7 +440,13 @@ impl ExtentInner for RawInner {
         // We put all of our metadata updates into a single write to make this
         // operation atomic.
         self.set_flush_number(new_flush, new_gen)?;
+        Ok(())
+    }
 
+    fn flush(
+        &mut self,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError> {
         // Now, we fsync to ensure data is flushed to disk.  It's okay to crash
         // before this point, because setting the flush number is atomic.
         cdt::extent__flush__file__start!(|| {
@@ -469,7 +467,15 @@ impl ExtentInner for RawInner {
         cdt::extent__flush__file__done!(|| {
             (job_id.get(), self.extent_number, 0)
         });
+        Ok(())
+    }
 
+    fn postflush(
+        &mut self,
+        _new_flush: u64,
+        _new_gen: u64,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError> {
         // Check for fragmentation in the context slots leading to worse
         // performance, and defragment if that's the case.
         let extra_syscalls_per_rw = self
@@ -1576,7 +1582,9 @@ mod test {
         assert_eq!(inner.sync_index, 0);
 
         // Flush!  This will bump the sync number, marking slot B as synched
-        inner.flush(12, 12, JobId(11).into())?;
+        inner.preflush(12, 12, JobId(11).into())?;
+        inner.flush(JobId(11).into())?;
+        inner.postflush(12, 12, JobId(11).into())?;
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.sync_index, 1);
 
@@ -1626,7 +1634,9 @@ mod test {
         assert_eq!(inner.sync_index, 0);
 
         // Flush, which should bump the sync number (marking slot 0 as synched)
-        inner.flush(12, 12, JobId(11).into())?;
+        inner.preflush(12, 12, JobId(11).into())?;
+        inner.flush(JobId(11).into())?;
+        inner.postflush(12, 12, JobId(11).into())?;
 
         // The context should be written to slot 0
         inner.write(JobId(12), &[&write], false, IOV_MAX_TEST)?;

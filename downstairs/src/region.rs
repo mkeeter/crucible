@@ -812,7 +812,7 @@ impl Region {
      */
     #[instrument]
     pub(crate) async fn region_flush_extent<
-        I: Into<JobOrReconciliationId> + Debug,
+        I: Into<JobOrReconciliationId> + Debug + Copy,
     >(
         &self,
         eid: usize,
@@ -830,7 +830,11 @@ impl Region {
 
         let extent = self.get_opened_extent(eid).await;
         extent
-            .flush(flush_number, gen_number, job_id, &self.log)
+            .preflush(flush_number, gen_number, job_id, &self.log)
+            .await?;
+        extent.flush(job_id, &self.log).await?;
+        extent
+            .postflush(flush_number, gen_number, job_id, &self.log)
             .await?;
 
         Ok(())
@@ -877,25 +881,97 @@ impl Region {
 
         let extent_count = dirty_extents.len();
 
-        let mut results = Vec::with_capacity(extent_count);
+        // Spawn parallel tasks for the preflush
+        //
+        // There isn't any actual async work being done here (other than
+        // claiming an uncontested Tokio mutex), but spawning multiple tasks
+        // gives us free multithreading on Tokio's thread pool.
+        let mut join_handles: Vec<JoinHandle<Result<bool, CrucibleError>>> =
+            Vec::with_capacity(extent_count);
         for eid in &dirty_extents {
+            let extent = self.get_opened_extent(*eid).await;
+            let log = self.log.clone();
+            let jh = tokio::spawn(async move {
+                extent
+                    .preflush(flush_number, gen_number, job_id, &log)
+                    .await
+            });
+            join_handles.push(jh);
+        }
+
+        // Wait for all preflushes to finish; any that return `Ok(true)` are now
+        // running and must be handled below.
+        let mut preflush_results = Vec::with_capacity(extent_count);
+        let mut running = vec![];
+        for (join_handle, extent) in
+            join_handles.into_iter().zip(&dirty_extents)
+        {
+            let r = join_handle
+                .await
+                .map_err(|e| CrucibleError::GenericError(e.to_string()));
+
+            // Only continue with `flush` and `postflush` if preflush succeeded
+            if r == Ok(Ok(true)) {
+                running.push(*extent);
+            }
+            preflush_results.push(r);
+        }
+
+        // Perform the actual `fdsync` portion of flushing.
+        //
+        // This is done serially, because it goes through a lock in the OS;
+        // spawning separate tasks leads to high contention for that lock.
+        let mut results = Vec::with_capacity(extent_count);
+        for eid in &running {
             let extent = self.get_opened_extent(*eid).await;
             let log = self.log.clone();
             results.push(
                 extent
-                    .flush(flush_number, gen_number, job_id, &log)
+                    .flush(job_id, &log)
                     .await
                     .map_err(|e| CrucibleError::GenericError(e.to_string())),
             );
         }
 
+        // Finally, run `postflush` for any extents that passed `preflush` and
+        // `flush`.  This is also done in many tasks for efficiency.
+        let mut join_handles: Vec<JoinHandle<Result<(), CrucibleError>>> =
+            Vec::with_capacity(extent_count);
+        for (eid, r) in running.iter().zip(&results) {
+            if r.is_ok() {
+                let extent = self.get_opened_extent(*eid).await;
+                let log = self.log.clone();
+                let jh = tokio::spawn(async move {
+                    extent
+                        .postflush(flush_number, gen_number, job_id, &log)
+                        .await
+                });
+                join_handles.push(jh);
+            }
+        }
+
+        let mut postflush_results = vec![];
+        for join_handle in join_handles {
+            let r = join_handle
+                .await
+                .map_err(|e| CrucibleError::GenericError(e.to_string()));
+
+            postflush_results.push(r);
+        }
+
         cdt::os__flush__done!(|| job_id.0);
 
+        // If any extent flush failed (at any stage), then return that as an
+        // error. Because the results were all collected above, each extent
+        // flush has completed at this point.
+        for result in preflush_results {
+            result??;
+        }
         for result in results {
-            // If any extent flush failed, then return that as an error. Because
-            // the results were all collected above, each extent flush has
-            // completed at this point.
             result?;
+        }
+        for result in postflush_results {
+            result??;
         }
 
         // Now everything has succeeded, we can remove these extents from the
