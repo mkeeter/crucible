@@ -579,13 +579,26 @@ impl Extent {
         Ok(())
     }
 
-    pub(crate) async fn preflush<I: Into<JobOrReconciliationId> + Debug>(
+    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
         &self,
         new_flush: u64,
         new_gen: u64,
         id: I, // only used for logging
         log: &Logger,
-    ) -> Result<bool, CrucibleError> {
+    ) -> Result<(), CrucibleError> {
+        let lock = tokio::sync::Semaphore::new(1);
+        self.flush_shared(new_flush, new_gen, id, log, &lock).await
+    }
+
+    #[instrument]
+    pub(crate) async fn flush_shared<I: Into<JobOrReconciliationId> + Debug>(
+        &self,
+        new_flush: u64,
+        new_gen: u64,
+        id: I, // only used for logging
+        log: &Logger,
+        lock: &tokio::sync::Semaphore,
+    ) -> Result<(), CrucibleError> {
         let job_id: JobOrReconciliationId = id.into();
         let mut inner = self.inner.lock().await;
 
@@ -594,7 +607,7 @@ impl Extent {
              * If we have made no writes to this extent since the last flush,
              * we do not need to update the extent on disk
              */
-            return Ok(false);
+            return Ok(());
         }
 
         // Read only extents should never have the dirty bit set. If they do,
@@ -606,31 +619,16 @@ impl Extent {
         }
 
         inner.preflush(new_flush, new_gen, job_id)?;
-        Ok(true)
-    }
-
-    #[instrument]
-    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
-        &self,
-        id: I, // only used for logging
-        log: &Logger,
-    ) -> Result<(), CrucibleError> {
-        let job_id: JobOrReconciliationId = id.into();
-        let mut inner = self.inner.lock().await;
-        inner.flush(job_id)
-    }
-
-    #[instrument]
-    pub(crate) async fn postflush<I: Into<JobOrReconciliationId> + Debug>(
-        &self,
-        new_flush: u64,
-        new_gen: u64,
-        id: I, // only used for logging
-        log: &Logger,
-    ) -> Result<(), CrucibleError> {
-        let job_id: JobOrReconciliationId = id.into();
-        let mut inner = self.inner.lock().await;
-        inner.postflush(new_flush, new_gen, job_id)
+        {
+            // The `flush` operation will content for an OS-level mutex, so use
+            // a Tokio semaphore to limit how many tasks do it simultaneously.
+            // This matters because `region_flush` spawns Tokio tasks for every
+            // single dirty region at once.
+            let _permit = lock.acquire().await;
+            inner.flush(job_id)?;
+        }
+        inner.postflush(new_flush, new_gen, job_id)?;
+        Ok(())
     }
 
     pub async fn get_meta_info(&self) -> ExtentMeta {
