@@ -529,8 +529,8 @@ impl SqliteInner {
         use crate::{
             extent::EXTENT_META_RAW,
             extent_inner_raw::{
-                OnDiskDownstairsBlockContext, OnDiskMeta,
-                BLOCK_CONTEXT_SLOT_SIZE_BYTES, BLOCK_META_SIZE_BYTES,
+                OnDiskMeta, BLOCK_CONTEXT_SLOT_SIZE_BYTES,
+                BLOCK_META_SIZE_BYTES,
             },
         };
 
@@ -558,10 +558,7 @@ impl SqliteInner {
         for c in ctxs {
             let ctx = match c.len() {
                 0 => None,
-                1 => Some(OnDiskDownstairsBlockContext {
-                    block_context: c[0].block_context,
-                    on_disk_hash: c[0].on_disk_hash,
-                }),
+                1 => Some(c[0].block_context),
                 i => panic!("invalid context count: {i}"),
             };
             // Put the context into the first slot, if present

@@ -21,13 +21,6 @@ use std::io::{BufReader, IoSliceMut, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-/// Equivalent to `DownstairsBlockContext`, but without one's own block number
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OnDiskDownstairsBlockContext {
-    pub block_context: BlockContext,
-    pub on_disk_hash: u64,
-}
-
 /// Equivalent to `ExtentMeta`, but ordered for efficient on-disk serialization
 ///
 /// In particular, the `dirty` byte is first, so it's easy to read at a known
@@ -42,7 +35,7 @@ pub struct OnDiskMeta {
 
 /// Size of backup data
 ///
-/// This must be large enough to fit an `Option<OnDiskDownstairsBlockContext>`
+/// This must be large enough to fit an `Option<BlockContext>`
 /// serialized using `bincode`.
 pub const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 48;
 
@@ -72,7 +65,7 @@ const DEFRAGMENT_THRESHOLD: u64 = 3;
 ///   each containing `extent_size` elements (i.e. one slot for each block).
 ///   Each slot is [`BLOCK_CONTEXT_SLOT_SIZE_BYTES`] in size, so this section of
 ///   the file is `BLOCK_CONTEXT_SLOT_SIZE_BYTES * extent_size * 2` bytes in
-///   total.  The slots contain an `Option<OnDiskDownstairsBlockContext>`,
+///   total.  The slots contain an `Option<BlockContext>`,
 ///   serialized using `bincode`.
 #[derive(Debug)]
 pub struct RawInner {
@@ -253,16 +246,10 @@ impl ExtentInner for RawInner {
         let block_ctx: Vec<_> = writes
             .iter()
             .filter(|write| !writes_to_skip.contains(&write.offset.value))
-            .map(|write| {
-                // TODO it would be nice if we could profile what % of time we're
-                // spending on hashes locally vs writing to disk
-                let on_disk_hash = integrity_hash(&[&write.data[..]]);
-
-                DownstairsBlockContext {
-                    block_context: write.block_context,
-                    block: write.offset.value,
-                    on_disk_hash,
-                }
+            .map(|write| DownstairsBlockContext {
+                block_context: write.block_context,
+                block: write.offset.value,
+                on_disk_hash: 0,
             })
             .collect();
 
@@ -417,8 +404,7 @@ impl ExtentInner for RawInner {
             let ctx_iter = block_contexts.into_iter();
 
             for (resp, r_ctx) in resp_iter.zip(ctx_iter) {
-                resp.block_contexts =
-                    r_ctx.into_iter().map(|x| x.block_context).collect();
+                resp.block_contexts = r_ctx.into_iter().collect();
             }
 
             req_run_start += n_contiguous_requests;
@@ -508,7 +494,19 @@ impl ExtentInner for RawInner {
         count: u64,
     ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
         let out = RawInner::get_block_contexts(self, block, count)?;
-        Ok(out.into_iter().map(|v| v.into_iter().collect()).collect())
+        Ok(out
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.into_iter()
+                    .map(|b| DownstairsBlockContext {
+                        block: block + i as u64,
+                        block_context: b,
+                        on_disk_hash: 0, // TODO
+                    })
+                    .collect()
+            })
+            .collect())
     }
 }
 
@@ -673,7 +671,7 @@ impl RawInner {
                 let mut buf = vec![0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
                 for _block in 0..bcount as usize {
                     file_buffered.read_exact(&mut buf)?;
-                    let context: Option<OnDiskDownstairsBlockContext> =
+                    let context: Option<BlockContext> =
                         bincode::deserialize(&buf).map_err(|e| {
                             CrucibleError::IoError(format!(
                                 "context deserialization failed: {e}"
@@ -716,15 +714,26 @@ impl RawInner {
                     }
                     file_buffered.read_exact(&mut buf)?;
                     last_seek_block = block + 1; // since we just read a block
-                    let hash = integrity_hash(&[&buf]);
 
                     let mut matching_slot = None;
                     let mut empty_slot = None;
 
                     for slot in [ContextSlot::A, ContextSlot::B] {
                         let context = [context_a, context_b][slot as usize];
+
                         if let Some(context) = context {
-                            if context.on_disk_hash == hash {
+                            let hash = if let Some(crypt) =
+                                context.encryption_context
+                            {
+                                integrity_hash(&[
+                                    &crypt.nonce[..],
+                                    &crypt.tag[..],
+                                    &buf,
+                                ])
+                            } else {
+                                integrity_hash(&[&buf])
+                            };
+                            if context.hash == hash {
                                 matching_slot = Some(slot);
                             }
                         } else if empty_slot.is_none() {
@@ -783,36 +792,44 @@ impl RawInner {
     ) -> Result<(), CrucibleError> {
         // Read the block data itself:
         let block_size = self.extent_size.block_size_in_bytes();
-        let mut buf = vec![0; block_size as usize];
+        let mut data_buf = vec![0; block_size as usize];
         nix::sys::uio::pread(
             self.file.as_raw_fd(),
-            &mut buf,
+            &mut data_buf,
             (block_size as u64 * block) as i64,
         )
         .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-        let hash = integrity_hash(&[&buf]);
 
         // Then, read the slot data and decide if either slot
         // (1) is present and
         // (2) has a matching hash
-        let mut buf = [0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
+        let mut context_buf = [0; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         let mut matching_slot = None;
         let mut empty_slot = None;
         for slot in [ContextSlot::A, ContextSlot::B] {
             nix::sys::uio::pread(
                 self.file.as_raw_fd(),
-                &mut buf,
+                &mut context_buf,
                 self.context_slot_offset(block, slot) as i64,
             )
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-            let context: Option<OnDiskDownstairsBlockContext> =
-                bincode::deserialize(&buf).map_err(|e| {
+            let context: Option<BlockContext> =
+                bincode::deserialize(&context_buf).map_err(|e| {
                     CrucibleError::IoError(format!(
                         "context deserialization failed: {e:?}"
                     ))
                 })?;
             if let Some(context) = context {
-                if context.on_disk_hash == hash {
+                let hash = if let Some(crypt) = context.encryption_context {
+                    integrity_hash(&[
+                        &crypt.nonce[..],
+                        &crypt.tag[..],
+                        &data_buf,
+                    ])
+                } else {
+                    integrity_hash(&[&data_buf])
+                };
+                if context.hash == hash {
                     matching_slot = Some(slot);
                 }
             } else if empty_slot.is_none() {
@@ -911,10 +928,7 @@ impl RawInner {
             for block_context in group {
                 let n = buf.len();
                 buf.extend([0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]);
-                let d = OnDiskDownstairsBlockContext {
-                    block_context: block_context.block_context,
-                    on_disk_hash: block_context.on_disk_hash,
-                };
+                let d = block_context.block_context;
                 bincode::serialize_into(&mut buf[n..], &Some(d))?;
             }
             let offset = self.context_slot_offset(block_start, slot);
@@ -999,7 +1013,7 @@ impl RawInner {
         &mut self,
         block: u64,
         count: u64,
-    ) -> Result<Vec<Option<DownstairsBlockContext>>> {
+    ) -> Result<Vec<Option<BlockContext>>> {
         let mut out = vec![];
         let mut buf = vec![];
         let mut reads = 0u64;
@@ -1017,17 +1031,11 @@ impl RawInner {
                 offset as i64,
             )
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-            for (i, chunk) in buf
-                .chunks_exact(BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize)
-                .enumerate()
+            for chunk in
+                buf.chunks_exact(BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize)
             {
-                let ctx: Option<OnDiskDownstairsBlockContext> =
-                    bincode::deserialize(chunk)?;
-                out.push(ctx.map(|c| DownstairsBlockContext {
-                    block: group_start + i as u64,
-                    block_context: c.block_context,
-                    on_disk_hash: c.on_disk_hash,
-                }));
+                let ctx: Option<BlockContext> = bincode::deserialize(chunk)?;
+                out.push(ctx);
             }
             reads += 1;
         }
@@ -1072,7 +1080,7 @@ impl RawInner {
     fn get_block_context(
         &mut self,
         block: u64,
-    ) -> Result<Option<DownstairsBlockContext>> {
+    ) -> Result<Option<BlockContext>> {
         let mut out = self.get_block_contexts(block, 1)?;
         assert_eq!(out.len(), 1);
         Ok(out.pop().unwrap())
@@ -1249,15 +1257,14 @@ mod test {
 
         let ctx = inner.get_block_context(0)?.unwrap();
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
+            ctx.encryption_context.unwrap().nonce,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
+            ctx.encryption_context.unwrap().tag,
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
-        assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
+        assert_eq!(ctx.hash, 123);
 
         // Block 1 should still be blank
         assert!(inner.get_block_context(1)?.is_none());
@@ -1282,10 +1289,9 @@ mod test {
         let ctx = inner.get_block_context(0)?.unwrap();
 
         // Second context was appended
-        assert_eq!(ctx.block_context.encryption_context.unwrap().nonce, blob1);
-        assert_eq!(ctx.block_context.encryption_context.unwrap().tag, blob2);
-        assert_eq!(ctx.block_context.hash, 1024);
-        assert_eq!(ctx.on_disk_hash, 65536);
+        assert_eq!(ctx.encryption_context.unwrap().nonce, blob1);
+        assert_eq!(ctx.encryption_context.unwrap().tag, blob2);
+        assert_eq!(ctx.hash, 1024);
 
         Ok(())
     }
@@ -1332,56 +1338,52 @@ mod test {
         // Verify block 0's context
         let ctx = inner.get_block_context(0)?.unwrap();
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
+            ctx.encryption_context.unwrap().nonce,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
+            ctx.encryption_context.unwrap().tag,
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
-        assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
+        assert_eq!(ctx.hash, 123);
 
         // Verify block 1's context
         let ctx = inner.get_block_context(1)?.unwrap();
 
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
+            ctx.encryption_context.unwrap().nonce,
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
+            ctx.encryption_context.unwrap().tag,
             [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
-        assert_eq!(ctx.block_context.hash, 9999);
-        assert_eq!(ctx.on_disk_hash, 1234567890);
+        assert_eq!(ctx.hash, 9999);
 
         // Return both block 0's and block 1's context, and verify
 
         let ctxs = inner.get_block_contexts(0, 2)?;
         let ctx = ctxs[0].as_ref().unwrap();
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
+            ctx.encryption_context.unwrap().nonce,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
+            ctx.encryption_context.unwrap().tag,
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
-        assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
+        assert_eq!(ctx.hash, 123);
 
         let ctx = ctxs[1].as_ref().unwrap();
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
+            ctx.encryption_context.unwrap().nonce,
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
+            ctx.encryption_context.unwrap().tag,
             [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
-        assert_eq!(ctx.block_context.hash, 9999);
-        assert_eq!(ctx.on_disk_hash, 1234567890);
+        assert_eq!(ctx.hash, 9999);
 
         // Append a whole bunch of block context rows
         for i in 0..10 {
@@ -1412,10 +1414,7 @@ mod test {
         let ctxs = inner.get_block_contexts(0, 2)?;
 
         assert!(ctxs[0].is_some());
-        assert_eq!(ctxs[0].as_ref().unwrap().on_disk_hash, 9);
-
         assert!(ctxs[1].is_some());
-        assert_eq!(ctxs[1].as_ref().unwrap().on_disk_hash, 9);
 
         Ok(())
     }
@@ -1714,15 +1713,12 @@ mod test {
 
     #[test]
     fn test_serialized_sizes() {
-        let c = OnDiskDownstairsBlockContext {
-            block_context: BlockContext {
-                hash: u64::MAX,
-                encryption_context: Some(EncryptionContext {
-                    nonce: [0xFF; 12],
-                    tag: [0xFF; 16],
-                }),
-            },
-            on_disk_hash: u64::MAX,
+        let c = BlockContext {
+            hash: u64::MAX,
+            encryption_context: Some(EncryptionContext {
+                nonce: [0xFF; 12],
+                tag: [0xFF; 16],
+            }),
         };
         let mut ctx_buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         bincode::serialize_into(ctx_buf.as_mut_slice(), &Some(c)).unwrap();
