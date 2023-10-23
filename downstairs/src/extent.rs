@@ -57,23 +57,6 @@ pub(crate) trait ExtentInner: Send + Debug {
         only_write_unwritten: bool,
         iov_max: usize,
     ) -> Result<(), CrucibleError>;
-
-    #[cfg(test)]
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError>;
-
-    /// Sets the dirty flag and updates a block context
-    ///
-    /// This should only be called from test functions, where we want to
-    /// manually modify block contexts and test associated behavior
-    #[cfg(test)]
-    fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
-    ) -> Result<(), CrucibleError>;
 }
 
 /// BlockContext, with the addition of block index and on_disk_hash

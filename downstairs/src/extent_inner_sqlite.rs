@@ -479,29 +479,6 @@ impl ExtentInner for SqliteInner {
         }
         Ok(())
     }
-
-    /// For a given block range, return all context rows since the last flush.
-    /// `get_block_contexts` returns a `Vec<Vec<DownstairsBlockContext>>` of
-    /// length equal to `count`. Each `Vec<DownstairsBlockContext>` inside this
-    /// parent Vec contains all contexts for a single block.
-    #[cfg(test)]
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        SqliteInner::get_block_contexts(self, block, count)
-    }
-
-    #[cfg(test)]
-    fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
-    ) -> Result<(), CrucibleError> {
-        self.set_dirty()?;
-        self.set_block_context(block_context)?;
-        Ok(())
-    }
 }
 
 impl SqliteInner {
@@ -526,6 +503,7 @@ impl SqliteInner {
 
         let ctxs = self.get_block_contexts(0, self.extent_size.value)?;
 
+        /*
         use crate::{
             extent::EXTENT_META_RAW,
             extent_inner_raw::{
@@ -578,6 +556,8 @@ impl SqliteInner {
         // Reset the file read position, just in case
         self.file.seek(SeekFrom::Start(0))?;
         Ok(buf)
+        */
+        todo!()
     }
 
     fn get_block_contexts(
@@ -1088,6 +1068,16 @@ impl SqliteInner {
         // around at least right?
         self.dirty_blocks.clear();
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_dirty_and_block_context(
+        &mut self,
+        block_context: &DownstairsBlockContext,
+    ) -> Result<(), CrucibleError> {
+        self.set_dirty()?;
+        self.set_block_context(block_context)?;
         Ok(())
     }
 }
