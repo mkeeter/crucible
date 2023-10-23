@@ -249,7 +249,7 @@ impl ExtentInner for RawInner {
             .map(|write| DownstairsBlockContext {
                 block_context: write.block_context,
                 block: write.offset.value,
-                on_disk_hash: 0,
+                on_disk_hash: 0, // TODO
             })
             .collect();
 
