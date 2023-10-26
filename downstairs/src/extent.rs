@@ -369,18 +369,20 @@ impl Extent {
             drop(inner);
 
             // Reopen the file and import those changes
-            let mut f =
-                OpenOptions::new().read(true).write(true).open(&path)?;
-            extent_inner_raw::RawInner::import(
-                &mut f,
-                def,
-                ctxs,
-                dirty,
-                flush_number,
-                gen_number,
-            )?;
-            f.sync_all()
-                .with_context(|| format!("{path:?}: fsync failure"))?;
+            {
+                let mut f =
+                    OpenOptions::new().read(true).write(true).open(&path)?;
+                extent_inner_raw::RawInner::import(
+                    &mut f,
+                    def,
+                    ctxs,
+                    dirty,
+                    flush_number,
+                    gen_number,
+                )?;
+                f.sync_all()
+                    .with_context(|| format!("{path:?}: fsync failure"))?;
+            }
 
             // Remove the .db file, because our extent is now a raw extent and
             // has been persisted to disk.

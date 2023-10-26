@@ -9,11 +9,13 @@ use crate::{
     region::{BatchedPwritev, JobOrReconciliationId},
     Block, BlockContext, CrucibleError, JobId, ReadResponse, RegionDefinition,
 };
+use crucible_protocol::EncryptionContext;
 
 use anyhow::{bail, Result};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
+use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -21,12 +23,27 @@ use std::io::{BufReader, IoSliceMut, Read};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-/// Equivalent to `DownstairsBlockContext`, but without one's own block number
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Equivalent to `DownstairsBlockContext`, but zerocopy-friendly
+///
+/// Fields are laid out to have no padding!
+#[derive(Debug, Clone, AsBytes, FromZeroes, FromBytes)]
+#[repr(C)]
 pub struct OnDiskDownstairsBlockContext {
-    pub block_context: BlockContext,
     pub on_disk_hash: u64,
+    pub context_hash: u64,
+
+    /// Either `0`, `HAS_CONTEXT`, or `HAS_ENCRYPTED_CONTEXT`
+    pub flags: u32,
+
+    /// If `flags == HAS_ENCRYPTED_CONTEXT`, contains the encryption nonce
+    pub nonce: [u8; 12],
+
+    /// If `flags == HAS_ENCRYPTED_CONTEXT`, contains the encryption tag
+    pub tag: [u8; 16],
 }
+
+const HAS_CONTEXT: u32 = 1;
+const HAS_ENCRYPTED_CONTEXT: u32 = 2;
 
 /// Equivalent to `ExtentMeta`, but ordered for efficient on-disk serialization
 ///
@@ -540,10 +557,7 @@ impl RawInner {
         let layout = RawLayout::new(def.extent_size());
         let block_count = layout.block_count() as usize;
 
-        println!("resizing to {}", layout.file_size());
         file.set_len(layout.file_size())?;
-        println!("resizing done");
-
         layout.write_context_slots_contiguous(
             file,
             0,
@@ -556,7 +570,6 @@ impl RawInner {
             std::iter::repeat(None).take(block_count),
             ContextSlot::B,
         )?;
-
         layout.write_active_context_and_metadata(
             file,
             vec![ContextSlot::A; block_count].as_slice(),
@@ -1240,17 +1253,26 @@ impl RawLayout {
         buf.clear();
 
         for block_context in iter {
-            let n = buf.len();
-            buf.extend([0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]);
-            let d = block_context.map(|b| OnDiskDownstairsBlockContext {
-                block_context: b.block_context,
-                on_disk_hash: b.on_disk_hash,
-            });
-            bincode::serialize_into(&mut buf[n..], &d).map_err(|e| {
-                CrucibleError::IoError(format!(
-                    "could not serialize context: {e}"
-                ))
-            })?;
+            let out = match block_context {
+                None => OnDiskDownstairsBlockContext::new_zeroed(),
+                Some(ctx) => match ctx.block_context.encryption_context {
+                    Some(enc) => OnDiskDownstairsBlockContext {
+                        on_disk_hash: ctx.on_disk_hash,
+                        context_hash: ctx.block_context.hash,
+                        flags: HAS_ENCRYPTED_CONTEXT,
+                        tag: enc.tag,
+                        nonce: enc.nonce,
+                    },
+                    None => OnDiskDownstairsBlockContext {
+                        on_disk_hash: ctx.on_disk_hash,
+                        context_hash: ctx.block_context.hash,
+                        flags: HAS_CONTEXT,
+                        nonce: [0u8; 12],
+                        tag: [0u8; 16],
+                    },
+                },
+            };
+            buf.extend(out.as_bytes());
         }
         let offset = self.context_slot_offset(block_start, slot);
         nix::sys::uio::pwrite(file.as_raw_fd(), &buf, offset as i64)
@@ -1273,18 +1295,35 @@ impl RawLayout {
         nix::sys::uio::pread(file.as_raw_fd(), &mut buf, offset as i64)
             .map_err(|e| CrucibleError::IoError(e.to_string()))?;
 
-        let mut out = vec![];
+        let mut out = Vec::with_capacity(block_count as usize);
         for (i, chunk) in buf
             .chunks_exact(BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize)
             .enumerate()
         {
-            let ctx: Option<OnDiskDownstairsBlockContext> =
-                bincode::deserialize(chunk)?;
-            out.push(ctx.map(|c| DownstairsBlockContext {
-                block: block_start + i as u64,
-                block_context: c.block_context,
-                on_disk_hash: c.on_disk_hash,
-            }));
+            let ctx = OnDiskDownstairsBlockContext::read_from(chunk).unwrap();
+            out.push(match ctx.flags {
+                0 => None,
+                HAS_CONTEXT => Some(DownstairsBlockContext {
+                    block: block_start + i as u64,
+                    block_context: BlockContext {
+                        hash: ctx.context_hash,
+                        encryption_context: None,
+                    },
+                    on_disk_hash: ctx.on_disk_hash,
+                }),
+                HAS_ENCRYPTED_CONTEXT => Some(DownstairsBlockContext {
+                    block: block_start + i as u64,
+                    block_context: BlockContext {
+                        hash: ctx.context_hash,
+                        encryption_context: Some(EncryptionContext {
+                            nonce: ctx.nonce,
+                            tag: ctx.tag,
+                        }),
+                    },
+                    on_disk_hash: ctx.on_disk_hash,
+                }),
+                _ => panic!("invalid flags"),
+            });
         }
         self.buf.set(buf);
         Ok(out)
@@ -1971,18 +2010,10 @@ mod test {
 
     #[test]
     fn test_serialized_sizes() {
-        let c = OnDiskDownstairsBlockContext {
-            block_context: BlockContext {
-                hash: u64::MAX,
-                encryption_context: Some(EncryptionContext {
-                    nonce: [0xFF; 12],
-                    tag: [0xFF; 16],
-                }),
-            },
-            on_disk_hash: u64::MAX,
-        };
-        let mut ctx_buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
-        bincode::serialize_into(ctx_buf.as_mut_slice(), &Some(c)).unwrap();
+        assert_eq!(
+            BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize,
+            std::mem::size_of::<OnDiskDownstairsBlockContext>()
+        );
 
         let m = OnDiskMeta {
             dirty: true,
