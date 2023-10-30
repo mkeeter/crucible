@@ -8447,16 +8447,6 @@ impl IOStateCount {
         self.show(IOState::Error(e));
     }
 
-    fn get_mut(&mut self, state: &IOState) -> &mut ClientData<u32> {
-        match state {
-            IOState::New => &mut self.new,
-            IOState::InProgress => &mut self.in_progress,
-            IOState::Done => &mut self.done,
-            IOState::Skipped => &mut self.skipped,
-            IOState::Error(_) => &mut self.error,
-        }
-    }
-
     fn get(&self, state: &IOState) -> &ClientData<u32> {
         match state {
             IOState::New => &self.new,
@@ -8492,14 +8482,6 @@ impl IOStateCount {
             sum += state_stat[cid];
         }
         println!("{:4}", sum);
-    }
-
-    pub fn incr(&mut self, state: &IOState, cid: ClientId) {
-        self.get_mut(state)[cid] += 1;
-    }
-
-    pub fn decr(&mut self, state: &IOState, cid: ClientId) {
-        self.get_mut(state)[cid] -= 1;
     }
 }
 
