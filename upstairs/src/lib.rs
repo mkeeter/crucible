@@ -72,6 +72,9 @@ pub use live_repair::{check_for_repair, ExtentInfo, RepairCheck};
 mod active_jobs;
 use active_jobs::ActiveJobs;
 
+mod ack_state;
+use ack_state::{AckState, AckStatus};
+
 use async_trait::async_trait;
 
 // Max number of outstanding IOs between the upstairs and the downstairs
@@ -2810,6 +2813,9 @@ struct Downstairs {
      */
     ds_active: ActiveJobs,
 
+    /// Ackable state, tracked on a per-job basis
+    ack_state: AckState,
+
     /// The number of write bytes that haven't finished yet
     ///
     /// This is used to configure backpressure to the host, because writes
@@ -2892,6 +2898,7 @@ impl Downstairs {
         ];
         Self {
             clients: ClientData(clients),
+            ack_state: AckState::default(),
             ds_active: ActiveJobs::new(),
             write_bytes_outstanding: 0,
             completed: AllocRingBuffer::new(2048),
@@ -2943,7 +2950,12 @@ impl Downstairs {
         ds_id: JobId,
         client_id: ClientId,
     ) -> Option<IOop> {
-        let mut handle = match self.ds_active.get_mut(&ds_id) {
+        // If current state is Skipped, then we have nothing to do here.
+        if matches!(self.job_state(client_id, ds_id), IOState::Skipped) {
+            return None;
+        }
+
+        let job = match self.ds_active.get(&ds_id) {
             Some(handle) => handle,
             None => {
                 // This job, that we thought was good, is not.  As we don't
@@ -2953,20 +2965,16 @@ impl Downstairs {
                 return None;
             }
         };
-        let job = handle.job();
-
-        // If current state is Skipped, then we have nothing to do here.
-        if matches!(job.state[client_id], IOState::Skipped) {
-            return None;
-        }
 
         let new_state = IOState::InProgress;
-        let old_state = job.state.insert(client_id, new_state.clone());
+        let old_state = self.clients[client_id]
+            .job_state
+            .insert(ds_id, new_state.clone())
+            .unwrap();
         assert_eq!(old_state, IOState::New);
         self.clients[client_id].io_state_count.decr(&old_state);
         self.clients[client_id].io_state_count.incr(&new_state);
         let mut out = job.work.clone();
-        drop(handle);
 
         if self.clients[client_id].dependencies_need_cleanup() {
             match &mut out {
@@ -3265,19 +3273,22 @@ impl Downstairs {
             self.ds_active.len(),
         );
 
-        self.ds_active.for_each(|ds_id, job| {
-            let state = &job.state[client_id];
+        for ds_id in self.ds_active.keys() {
+            let state = &self.clients[client_id].job_state[ds_id];
 
             if matches!(state, IOState::InProgress | IOState::New) {
                 info!(self.log, "{} change {} to skipped", client_id, ds_id);
-                let old_state = job.state.insert(client_id, IOState::Skipped);
+                let old_state = self.clients[client_id]
+                    .job_state
+                    .insert(*ds_id, IOState::Skipped)
+                    .unwrap();
                 self.clients[client_id].io_state_count.decr(&old_state);
                 self.clients[client_id]
                     .io_state_count
                     .incr(&IOState::Skipped);
                 self.clients[client_id].skipped_jobs.insert(*ds_id);
             }
-        });
+        }
 
         // All of IOState::New jobs are now IOState::Skipped, so clear our
         // cache of new jobs for this downstairs.
@@ -3309,15 +3320,22 @@ impl Downstairs {
             self.ds_active.len(),
         );
 
-        self.ds_active.for_each(|ds_id, job| {
+        for (ds_id, job) in self.ds_active.iter_mut() {
             let is_read = job.work.is_read();
             let is_write = matches!(job.work, IOop::Write { .. });
-            let wc = job.state_count();
-            let jobs_completed_ok = wc.completed_ok();
+
+            let jobs_completed_ok = self
+                .clients
+                .iter()
+                .filter(|c| matches!(c.job_state[ds_id], IOState::Done))
+                .count();
 
             // We don't need to send anything before our last good flush
             if *ds_id <= lf {
-                assert_eq!(IOState::Done, job.state[client_id]);
+                assert_eq!(
+                    IOState::Done,
+                    self.clients[client_id].job_state[ds_id]
+                );
                 return;
             }
 
@@ -3326,7 +3344,7 @@ impl Downstairs {
              * to New and no extra work is required.
              * If it's Done, then we need to look further
              */
-            if IOState::Done == job.state[client_id] {
+            if IOState::Done == self.clients[client_id].job_state[ds_id] {
                 /*
                  * If the job is acked, then we are good to go and
                  * we can re-send it downstairs and the upstairs ack
@@ -3337,13 +3355,14 @@ impl Downstairs {
                  * if this downstairs job was part of what made it AckReady
                  * and if so, we need to undo that AckReady status.
                  */
-                if job.ack_status == AckStatus::AckReady {
+                let ack = self.ack_state.get_mut(&job.ds_id).unwrap();
+                if *ack.ack_status == AckStatus::AckReady {
                     if is_read {
                         if jobs_completed_ok == 1 {
                             info!(self.log, "Remove read data for {}", ds_id);
                             job.data = None;
-                            job.ack_status = AckStatus::NotAcked;
                             job.read_response_hashes = Vec::new();
+                            *ack.ack_status = AckStatus::NotAcked;
                         }
                     } else if is_write {
                         /*
@@ -3361,19 +3380,22 @@ impl Downstairs {
                                 self.log,
                                 "Remove AckReady for Wu/F {}", ds_id
                             );
-                            job.ack_status = AckStatus::NotAcked;
+                            *ack.ack_status = AckStatus::NotAcked;
                         }
                     }
                 }
             }
-            let old_state = job.state.insert(client_id, IOState::New);
+            let old_state = self.clients[client_id]
+                .job_state
+                .insert(*ds_id, IOState::New)
+                .unwrap();
             job.replay = true;
             if old_state != IOState::New {
                 self.clients[client_id].io_state_count.decr(&old_state);
                 self.clients[client_id].io_state_count.incr(&IOState::New);
                 self.clients[client_id].new_jobs.insert(*ds_id);
             }
-        });
+        }
     }
 
     // This method is called when we have decided to fault a downstairs
@@ -3394,11 +3416,14 @@ impl Downstairs {
         let mut retire_check = vec![];
         let mut number_jobs_skipped = 0;
 
-        self.ds_active.for_each(|ds_id, job| {
-            let state = &job.state[client_id];
+        for (ds_id, job) in &self.ds_active {
+            let state = &self.clients[client_id].job_state[ds_id];
 
             if matches!(state, IOState::InProgress | IOState::New) {
-                let old_state = job.state.insert(client_id, IOState::Skipped);
+                let old_state = self.clients[client_id]
+                    .job_state
+                    .insert(*ds_id, IOState::Skipped)
+                    .unwrap();
                 self.clients[client_id].io_state_count.decr(&old_state);
                 self.clients[client_id]
                     .io_state_count
@@ -3408,19 +3433,31 @@ impl Downstairs {
 
                 // Check to see if this being skipped means we can ACK
                 // the job back to the guest.
-                if job.ack_status == AckStatus::Acked {
+                let ack = self.ack_state.get_mut(&job.ds_id).unwrap();
+                if *ack.ack_status == AckStatus::Acked {
                     // Push this onto a queue to do the retire check when
                     // we aren't doing a mutable iteration.
                     retire_check.push(*ds_id);
-                } else if job.ack_status == AckStatus::NotAcked {
-                    let wc = job.state_count();
-                    if (wc.error + wc.skipped + wc.done) == 3 {
+                } else if *ack.ack_status == AckStatus::NotAcked {
+                    let jobs_completed = self
+                        .clients
+                        .iter()
+                        .filter(|c| {
+                            matches!(
+                                c.job_state[ds_id],
+                                IOState::Done
+                                    | IOState::Error(..)
+                                    | IOState::Skipped
+                            )
+                        })
+                        .count();
+                    if jobs_completed == 3 {
                         notify_guest = true;
                         info!(
                             self.log,
                             "[{}] notify = true for {}", client_id, ds_id
                         );
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                     }
                 } else {
                     info!(
@@ -3428,11 +3465,11 @@ impl Downstairs {
                         "[{}] job {} middle: {}",
                         client_id,
                         ds_id,
-                        job.ack_status
+                        ack.ack_status
                     );
                 }
             }
-        });
+        }
 
         info!(
             self.log,
@@ -3482,7 +3519,7 @@ impl Downstairs {
      * Build a list of jobs that are ready to be acked.
      */
     fn ackable_work(&mut self) -> BTreeSet<JobId> {
-        self.ds_active.ackable_work()
+        self.ack_state.ackable_work()
     }
 
     /**
@@ -3490,13 +3527,15 @@ impl Downstairs {
      */
     async fn enqueue(
         &mut self,
-        mut io: DownstairsIO,
+        io: DownstairsIO,
         ds_done_tx: mpsc::Sender<()>,
     ) {
         let mut skipped = 0;
         let is_write = matches!(io.work, IOop::Write { .. });
         for cid in ClientId::iter() {
-            assert_eq!(io.state[cid], IOState::New);
+            let prev =
+                self.clients[cid].job_state.insert(io.ds_id, IOState::New);
+            assert!(prev.is_none());
 
             let current = self.clients[cid].state;
             // If a downstairs is faulted or ready for repair, we can move
@@ -3511,7 +3550,9 @@ impl Downstairs {
                 | DsState::Replaced
                 | DsState::Replacing
                 | DsState::LiveRepairReady => {
-                    io.state.insert(cid, IOState::Skipped);
+                    self.clients[cid]
+                        .job_state
+                        .insert(io.ds_id, IOState::Skipped);
                     self.clients[cid].io_state_count.incr(&IOState::Skipped);
                     skipped += 1;
                     self.clients[cid].skipped_jobs.insert(io.ds_id);
@@ -3536,7 +3577,9 @@ impl Downstairs {
                     } else {
                         // Move this IO to skipped, we are not ready for
                         // the downstairs to receive it.
-                        io.state.insert(cid, IOState::Skipped);
+                        self.clients[cid]
+                            .job_state
+                            .insert(io.ds_id, IOState::Skipped);
                         self.clients[cid]
                             .io_state_count
                             .incr(&IOState::Skipped);
@@ -3571,32 +3614,27 @@ impl Downstairs {
         // do that work here.
         if skipped == 3 {
             warn!(self.log, "job {} skipped on all downstairs", &ds_id);
+        }
 
-            // Move this job to done ourselves.
-            let mut handle = self.ds_active.get_mut(&ds_id).unwrap();
-            let job = handle.job();
-            assert_eq!(job.ack_status, AckStatus::NotAcked);
-            job.ack_status = AckStatus::AckReady;
+        if skipped == 3 || is_write {
+            self.ack_state.insert(ds_id, AckStatus::AckReady);
             info!(self.log, "Enqueue job {} goes straight to AckReady", ds_id);
 
             ds_done_tx.send(()).await.unwrap();
-        } else if is_write {
-            let mut handle = self.ds_active.get_mut(&ds_id).unwrap();
-            let job = handle.job();
-            assert_eq!(job.ack_status, AckStatus::NotAcked);
-            job.ack_status = AckStatus::AckReady;
-
-            ds_done_tx.send(()).await.unwrap();
+        } else {
+            self.ack_state.insert(ds_id, AckStatus::NotAcked);
         }
     }
 
     /**
      * Enqueue a new downstairs live repair request.
      */
-    fn enqueue_repair(&mut self, mut io: DownstairsIO) {
+    fn enqueue_repair(&mut self, io: DownstairsIO) {
         // Puts the repair IO onto the downstairs work queue.
         for cid in ClientId::iter() {
-            assert_eq!(io.state[cid], IOState::New);
+            let prev =
+                self.clients[cid].job_state.insert(io.ds_id, IOState::New);
+            assert!(prev.is_none());
 
             let current = self.clients[cid].state;
             // If a downstairs is faulted, we can move that job directly
@@ -3606,7 +3644,9 @@ impl Downstairs {
                 | DsState::Replaced
                 | DsState::Replacing
                 | DsState::LiveRepairReady => {
-                    io.state.insert(cid, IOState::Skipped);
+                    self.clients[cid]
+                        .job_state
+                        .insert(io.ds_id, IOState::Skipped);
                     self.clients[cid].io_state_count.incr(&IOState::Skipped);
                     self.clients[cid].skipped_jobs.insert(io.ds_id);
                 }
@@ -3620,26 +3660,27 @@ impl Downstairs {
         let ds_id = io.ds_id;
         debug!(self.log, "Enqueue repair job {}", ds_id);
         self.ds_active.insert(ds_id, io);
+        self.ack_state.insert(ds_id, AckStatus::NotAcked);
     }
 
+    #[cfg(test)]
     fn ack(&mut self, ds_id: JobId) {
         /*
          * Move AckReady to Acked.
          */
-        let mut handle = self
-            .ds_active
+        let ack = self
+            .ack_state
             .get_mut(&ds_id)
             .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))
             .unwrap();
-        let job = handle.job();
 
-        if job.ack_status != AckStatus::AckReady {
+        if *ack.ack_status != AckStatus::AckReady {
             panic!(
                 "Job {} not in proper state to ACK:{:?}",
-                ds_id, job.ack_status,
+                ds_id, *ack.ack_status,
             );
         }
-        job.ack_status = AckStatus::Acked;
+        *ack.ack_status = AckStatus::Acked;
     }
 
     /*
@@ -3668,7 +3709,7 @@ impl Downstairs {
             .ds_active
             .get(&ds_id)
             .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
-        let wc = job.state_count();
+        let wc = self.job_state_count(ds_id);
 
         let bad_job = match &job.work {
             IOop::Read { .. } => wc.error == 3,
@@ -4017,14 +4058,9 @@ impl Downstairs {
         let mut notify_guest = false;
         let deactivate = up_state == UpState::Deactivating;
 
-        let mut handle = self
-            .ds_active
-            .get_mut(&ds_id)
-            .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
-        let job = handle.job();
-        let mut jobs_completed_ok = job.state_count().completed_ok();
-
-        if job.state[client_id] == IOState::Skipped {
+        let job_state_count = self.job_state_count(ds_id);
+        let mut jobs_completed_ok = job_state_count.completed_ok();
+        if self.job_state(client_id, ds_id) == &IOState::Skipped {
             // This job was already marked as skipped, and at that time
             // all required action was taken on it.  We can drop any more
             // processing of it here and return.
@@ -4034,6 +4070,11 @@ impl Downstairs {
             );
             return Ok(true);
         }
+
+        let mut job = self
+            .ds_active
+            .get_mut(&ds_id)
+            .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
 
         // Validate integrity hashes and optionally authenticated decryption.
         //
@@ -4122,7 +4163,10 @@ impl Downstairs {
             IOState::Done
         };
 
-        let old_state = job.state.insert(client_id, new_state.clone());
+        let old_state = self.clients[client_id]
+            .job_state
+            .insert(ds_id, new_state.clone())
+            .unwrap();
         self.clients[client_id].io_state_count.decr(&old_state);
         self.clients[client_id].io_state_count.incr(&new_state);
 
@@ -4243,7 +4287,7 @@ impl Downstairs {
                     }
                 }
             }
-        } else if job.ack_status == AckStatus::Acked {
+        } else if *self.ack_state.get(&job.ds_id).unwrap() == AckStatus::Acked {
             assert_eq!(new_state, IOState::Done);
             /*
              * If this job is already acked, then we don't have much
@@ -4286,7 +4330,7 @@ impl Downstairs {
                             read_response_hashes,
                             job.guest_id,
                             requests,
-                            job.state,
+                            job_state_count,
                         );
                         if job.replay {
                             info!(self.log, "REPLAY {}", msg);
@@ -4315,7 +4359,8 @@ impl Downstairs {
             }
         } else {
             assert_eq!(new_state, IOState::Done);
-            assert_ne!(job.ack_status, AckStatus::Acked);
+            let ack = self.ack_state.get_mut(&job.ds_id).unwrap();
+            assert_ne!(*ack.ack_status, AckStatus::Acked);
 
             let read_data: Vec<ReadResponse> = read_data.unwrap();
 
@@ -4336,8 +4381,8 @@ impl Downstairs {
                         job.data = Some(read_data);
                         job.read_response_hashes = read_response_hashes;
                         notify_guest = true;
-                        assert_eq!(job.ack_status, AckStatus::NotAcked);
-                        job.ack_status = AckStatus::AckReady;
+                        assert_eq!(*ack.ack_status, AckStatus::NotAcked);
+                        *ack.ack_status = AckStatus::AckReady;
                         debug!(
                             self.log,
                             "[{}] Read AckReady {}", client_id, job.ds_id
@@ -4381,7 +4426,7 @@ impl Downstairs {
                     assert!(extent_info.is_none());
                     if jobs_completed_ok == 2 {
                         notify_guest = true;
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                         cdt::up__to__ds__write__done!(|| job.guest_id);
                     }
                 }
@@ -4393,7 +4438,7 @@ impl Downstairs {
                     assert!(extent_info.is_none());
                     if jobs_completed_ok == 2 {
                         notify_guest = true;
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                         cdt::up__to__ds__write__unwritten__done!(
                             || job.guest_id
                         );
@@ -4425,7 +4470,7 @@ impl Downstairs {
 
                     if jobs_completed_ok == ack_at_num_jobs {
                         notify_guest = true;
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                         cdt::up__to__ds__flush__done!(|| job.guest_id);
                         if deactivate {
                             debug!(
@@ -4470,7 +4515,7 @@ impl Downstairs {
 
                     if jobs_completed_ok == 3 {
                         notify_guest = true;
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                         debug!(
                             self.log,
                             "[{}] ExtentFlushClose {} AckReady",
@@ -4495,7 +4540,7 @@ impl Downstairs {
                             client_id,
                             ds_id
                         );
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                     }
                 }
                 IOop::ExtentLiveReopen {
@@ -4511,7 +4556,7 @@ impl Downstairs {
                             client_id,
                             ds_id
                         );
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                     }
                 }
                 IOop::ExtentLiveNoOp { dependencies: _ } => {
@@ -4522,7 +4567,7 @@ impl Downstairs {
                             self.log,
                             "[{}] ExtentLiveNoOp AckReady {}", client_id, ds_id
                         );
-                        job.ack_status = AckStatus::AckReady;
+                        *ack.ack_status = AckStatus::AckReady;
                     }
                 }
             }
@@ -4534,22 +4579,32 @@ impl Downstairs {
          * to the guest, then there will be no more work on this job
          * but messages may still be unprocessed.
          */
-        if job.ack_status == AckStatus::Acked {
-            drop(handle);
+        let ack = *self.ack_state.get(&ds_id).unwrap();
+        if ack == AckStatus::Acked {
             self.retire_check(ds_id);
-        } else if job.ack_status == AckStatus::NotAcked {
+        } else if ack == AckStatus::NotAcked {
             // If we reach this then the job probably has errors and
             // hasn't acked back yet. We check for NotAcked so we don't
             // double count three done and return true if we already have
             // AckReady set.
-            let wc = job.state_count();
+            let jobs_completed = self
+                .clients
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.job_state[&ds_id],
+                        IOState::Done | IOState::Error(..) | IOState::Skipped
+                    )
+                })
+                .count();
 
             // If we are a write or a flush with one success, then
             // we must switch our state to failed.  This condition is
             // handled in Downstairs::result()
-            if (wc.error + wc.skipped + wc.done) == 3 {
+            if jobs_completed == 3 {
                 notify_guest = true;
-                job.ack_status = AckStatus::AckReady;
+                *self.ack_state.get_mut(&ds_id).unwrap().ack_status =
+                    AckStatus::AckReady;
                 debug!(self.log, "[{}] Set AckReady {}", client_id, job.ds_id);
             }
         }
@@ -4577,7 +4632,7 @@ impl Downstairs {
 
         // Only a completed flush will remove jobs from the active queue -
         // currently we have to keep everything around for use during replay
-        let wc = self.ds_active.get(&ds_id).unwrap().state_count();
+        let wc = self.job_state_count(ds_id);
         if (wc.error + wc.skipped + wc.done) == 3 {
             assert!(!self.completed.contains(&ds_id));
             assert_eq!(wc.active, 0);
@@ -4598,8 +4653,9 @@ impl Downstairs {
                 // there is nothing to prevent a flush ACK from getting
                 // ahead of the ACK from something that flush depends on.
                 // The downstairs does handle the dependency.
-                let wc = job.state_count();
-                if wc.active != 0 || job.ack_status != AckStatus::Acked {
+                let wc = self.job_state_count(id);
+                let ack_status = *self.ack_state.get(&job.ds_id).unwrap();
+                if wc.active != 0 || ack_status != AckStatus::Acked {
                     warn!(
                         self.log,
                         "[rc] leave job {} on the queue when removing {} {:?}",
@@ -4613,21 +4669,25 @@ impl Downstairs {
                 // Assert the job is actually done, then complete it
                 assert_eq!(wc.error + wc.skipped + wc.done, 3);
                 assert!(!self.completed.contains(&id));
-                assert_eq!(job.ack_status, AckStatus::Acked);
+                assert_eq!(ack_status, AckStatus::Acked);
                 assert_eq!(job.ds_id, id);
 
                 retired.push(job.ds_id);
                 self.completed.push(id);
-                let summary = job.io_summarize();
+                let summary = self.job_io_summarize(id);
                 self.completed_jobs.push(summary);
-                for cid in ClientId::iter() {
-                    let old_state = &job.state[cid];
-                    self.clients[cid].io_state_count.decr(old_state);
-                }
             }
             // Now that we've collected jobs to retire, remove them from the map
-            for &id in &retired {
-                let job = self.ds_active.remove(&id);
+            for id in &retired {
+                // Remove the job from everywhere that it's tracked
+                let job = self.ds_active.remove(id);
+                self.ack_state.remove(id);
+                for cid in ClientId::iter() {
+                    let old_state =
+                        self.clients[cid].job_state.remove(id).unwrap();
+                    self.clients[cid].io_state_count.decr(&old_state);
+                }
+
                 // Update pending bytes when this job is retired
                 match &job.work {
                     IOop::Write { writes, .. }
@@ -4680,14 +4740,9 @@ impl Downstairs {
         ds_id: JobId,
         client_id: ClientId,
     ) -> Result<(), CrucibleError> {
-        let job = self
-            .ds_active
-            .get(&ds_id)
-            .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
-
-        let state = &job.state[client_id];
-
-        if let IOState::Error(e) = state {
+        if let Some(IOState::Error(e)) =
+            self.clients[client_id].job_state.get(&ds_id)
+        {
             Err(e.clone())
         } else {
             Ok(())
@@ -4836,6 +4891,61 @@ impl Downstairs {
             error: f(|d| d.error),
         }
     }
+
+    fn job_state_count(&self, id: JobId) -> WorkCounts {
+        let mut wc: WorkCounts = Default::default();
+
+        for state in self.clients.iter().map(|c| &c.job_state[&id]) {
+            match state {
+                IOState::New | IOState::InProgress => wc.active += 1,
+                IOState::Error(_) => wc.error += 1,
+                IOState::Skipped => wc.skipped += 1,
+                IOState::Done => wc.done += 1,
+            }
+        }
+
+        wc
+    }
+
+    fn job_state(&self, client_id: ClientId, job_id: JobId) -> &IOState {
+        &self.clients[client_id].job_state[&job_id]
+    }
+
+    /*
+     * Return a summary of this job in the form of the WorkSummary struct.
+     */
+    pub fn job_io_summarize(&self, id: JobId) -> WorkSummary {
+        let job = self.ds_active.get(&id).unwrap();
+        let (job_type, num_blocks, deps) = job.work.ioop_summary();
+
+        let mut state = Vec::with_capacity(3);
+        /*
+         * Convert the possible job states (and handle the None)
+         */
+        for cid in ClientId::iter() {
+            /*
+             * We don't ever expect the job state to return None, but
+             * if it does because something else is wrong, I don't want
+             * to panic here while trying to debug it.
+             */
+            let dss = format!("{}", self.job_state(cid, id));
+            state.push(dss);
+        }
+
+        WorkSummary {
+            id: job.ds_id,
+            replay: job.replay,
+            job_type,
+            num_blocks,
+            deps,
+            ack_status: *self.ack_state.get(&job.ds_id).unwrap(),
+            state,
+        }
+    }
+
+    fn multiborrow(&mut self) -> (&mut ActiveJobs, &mut AckState) {
+        (&mut self.ds_active, &mut self.ack_state)
+    }
 }
 
 #[derive(Debug)]
@@ -4968,6 +5078,9 @@ struct DownstairsClient {
      * Counters for the in flight work for the downstairs
      */
     io_state_count: ClientIOStateCount,
+
+    /// Map of work status
+    job_state: BTreeMap<JobId, IOState>,
 }
 
 impl DownstairsClient {
@@ -4993,6 +5106,7 @@ impl DownstairsClient {
             replaced: 0,
             flow_control: 0,
             io_state_count: ClientIOStateCount::new(),
+            job_state: BTreeMap::new(),
         }
     }
 
@@ -5751,8 +5865,8 @@ impl Upstairs {
              * Now count our jobs.  Any job not done or skipped means
              * we are not ready to deactivate.
              */
-            for (id, job) in &ds.ds_active {
-                let state = &job.state[client_id];
+            for id in ds.ds_active.keys() {
+                let state = &ds.clients[client_id].job_state[id];
                 if state == &IOState::New || state == &IOState::InProgress {
                     info!(
                         self.log,
@@ -7485,6 +7599,8 @@ impl Upstairs {
                         DsState::Faulted,
                     );
                 }
+            } else {
+                // XXX should we do anything about the error here?
             }
         }
 
@@ -7887,16 +8003,8 @@ impl std::fmt::Display for DsState {
 struct DownstairsIO {
     ds_id: JobId, // This MUST match our hashmap index
 
-    guest_id: u64, // The hahsmap ID from the parent guest work.
+    guest_id: u64, // The hashmap ID from the parent guest work.
     work: IOop,
-
-    /// Map of work status, tracked on a per-client basis
-    state: ClientData<IOState>,
-
-    /*
-     * Has this been acked to the guest yet?
-     */
-    ack_status: AckStatus,
 
     /*
      * Is this a replay job, meaning we may have already sent it
@@ -7914,21 +8022,6 @@ struct DownstairsIO {
 }
 
 impl DownstairsIO {
-    fn state_count(&self) -> WorkCounts {
-        let mut wc: WorkCounts = Default::default();
-
-        for state in self.state.iter() {
-            match state {
-                IOState::New | IOState::InProgress => wc.active += 1,
-                IOState::Error(_) => wc.error += 1,
-                IOState::Skipped => wc.skipped += 1,
-                IOState::Done => wc.done += 1,
-            }
-        }
-
-        wc
-    }
-
     /*
      * Return the size of the IO in bytes
      * Depending on the IO (write or read) we have to look in a different
@@ -7987,37 +8080,6 @@ impl DownstairsIO {
                 extent: _,
             } => 0,
             IOop::ExtentLiveNoOp { dependencies: _ } => 0,
-        }
-    }
-
-    /*
-     * Return a summary of this job in the form of the WorkSummary struct.
-     */
-    pub fn io_summarize(&self) -> WorkSummary {
-        let (job_type, num_blocks, deps) = self.work.ioop_summary();
-
-        let mut state = Vec::with_capacity(3);
-        /*
-         * Convert the possible job states (and handle the None)
-         */
-        for cid in ClientId::iter() {
-            /*
-             * We don't ever expect the job state to return None, but
-             * if it does because something else is wrong, I don't want
-             * to panic here while trying to debug it.
-             */
-            let dss = format!("{}", self.state[cid]);
-            state.push(dss);
-        }
-
-        WorkSummary {
-            id: self.ds_id,
-            replay: self.replay,
-            job_type,
-            num_blocks,
-            deps,
-            ack_status: self.ack_status,
-            state,
         }
     }
 }
@@ -8482,32 +8544,6 @@ impl IOStateCount {
             sum += state_stat[cid];
         }
         println!("{:4}", sum);
-    }
-}
-
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub enum AckStatus {
-    NotAcked,
-    AckReady,
-    Acked,
-}
-
-impl fmt::Display for AckStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Make sure to right-align output on 8 characters to match with
-        // show_all_work
-        match self {
-            AckStatus::NotAcked => {
-                write!(f, "{0:>8}", "NotAcked")
-            }
-            AckStatus::AckReady => {
-                write!(f, "{0:>8}", "AckReady")
-            }
-            AckStatus::Acked => {
-                write!(f, "{0:>8}", "Acked")
-            }
-        }
     }
 }
 
@@ -9752,14 +9788,15 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
             let mut ds = up.downstairs.lock().await;
             debug!(up.log, "up_ds_listen process {}", ds_id_done);
 
-            let mut handle = ds.ds_active.get_mut(ds_id_done).unwrap();
-            let done = handle.job();
+            let (ds_active, ack_state) = ds.multiborrow();
+            let done = ds_active.get_mut(ds_id_done).unwrap();
+            let ack = ack_state.get_mut(ds_id_done).unwrap();
 
             /*
              * Make sure the job state has not changed since we made the
              * list.
              */
-            if done.ack_status != AckStatus::AckReady {
+            if *ack.ack_status != AckStatus::AckReady {
                 info!(
                     up.log,
                     "Job {} no longer ready, skip for now", ds_id_done
@@ -9773,9 +9810,11 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
 
             let io_size = done.io_size();
             let data = done.data.take();
-            drop(handle);
 
-            ds.ack(ds_id);
+            // Ack this while we're still holding it
+            *ack.ack_status = AckStatus::Acked;
+            drop(ack);
+
             debug!(ds.log, "[A] ack job {}:{}", ds_id, gw_id);
 
             gw.gw_ds_complete(gw_id, ds_id, data, ds.result(ds_id), &up.log)
@@ -10549,8 +10588,6 @@ fn create_write_eob(
         ds_id,
         guest_id: gw_id,
         work: awrite,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -10581,8 +10618,6 @@ fn create_read_eob(
         ds_id,
         guest_id: gw_id,
         work: aread,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -10614,8 +10649,6 @@ fn create_flush(
         ds_id,
         guest_id,
         work: flush,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -10663,7 +10696,7 @@ async fn show_all_work(up: &Arc<Upstairs>) -> WQCounts {
         );
 
         for (id, job) in &ds.ds_active {
-            let ack = job.ack_status;
+            let ack = *ds.ack_state.get(id).unwrap();
 
             let (job_type, num_blocks): (String, usize) = match &job.work {
                 IOop::Read {
@@ -10759,7 +10792,7 @@ async fn show_all_work(up: &Arc<Upstairs>) -> WQCounts {
             );
 
             for cid in ClientId::iter() {
-                let state = &job.state[cid];
+                let state = &ds.job_state(cid, *id);
                 // XXX I have no idea why this is two spaces instead of
                 // one...
                 print!("  {0:>5}", state);
