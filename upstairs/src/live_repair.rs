@@ -438,8 +438,6 @@ fn create_reopen_io(
         ds_id,
         guest_id: gw_id,
         work: reopen_ioop,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -470,8 +468,7 @@ fn create_close_io(
         ds_id,
         guest_id: gw_id,
         work: close_ioop,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
+
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -500,8 +497,7 @@ fn create_repair_io(
         ds_id,
         guest_id: gw_id,
         work: repair_ioop,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
+
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -519,8 +515,7 @@ fn create_noop_io(
         ds_id,
         guest_id: gw_id,
         work: noop_ioop,
-        state: ClientData::new(IOState::New),
-        ack_status: AckStatus::NotAcked,
+
         replay: false,
         data: None,
         read_response_hashes: Vec::new(),
@@ -1393,7 +1388,7 @@ pub mod repair_test {
     ) {
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
-        let state = ds.ds_active.get(&ds_id).unwrap().ack_status;
+        let state = *ds.ack_state.get(&ds_id).unwrap();
         assert_eq!(state, AckStatus::AckReady);
         ds.ack(ds_id);
         gw.gw_ds_complete(gw_id, ds_id, None, result, &up.log).await;
@@ -1745,7 +1740,7 @@ pub mod repair_test {
                 panic!("Expected ExtentFlushClose, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(ds_close_id).done, 3);
 
         let job = ds.ds_active.get(&ds_repair_id).unwrap();
         match &job.work {
@@ -1754,7 +1749,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(ds_repair_id).done, 3);
 
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
         match &job.work {
@@ -1763,7 +1758,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(ds_noop_id).done, 3);
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
         match &job.work {
@@ -1772,7 +1767,7 @@ pub mod repair_test {
                 panic!("Expected ExtentLiveReopen, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(ds_reopen_id).done, 3);
     }
 
     // Loop over the possible downstairs to be in LiveRepair and
@@ -1911,7 +1906,7 @@ pub mod repair_test {
                 panic!("Expected LiveRepair, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(job.ds_id).done, 3);
 
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
         match &job.work {
@@ -1920,7 +1915,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(ds_noop_id).done, 3);
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
         match &job.work {
@@ -1930,7 +1925,7 @@ pub mod repair_test {
             }
         }
 
-        assert_eq!(job.state_count().done, 3);
+        assert_eq!(ds.job_state_count(ds_reopen_id).done, 3);
         assert_eq!(ds.clients[or_ds].state, DsState::LiveRepair);
     }
 
@@ -2067,8 +2062,9 @@ pub mod repair_test {
                 panic!("Expected ExtentFlushClose, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 2);
-        assert_eq!(job.state_count().error, 1);
+        let state_count = ds.job_state_count(ds_close_id);
+        assert_eq!(state_count.done, 2);
+        assert_eq!(state_count.error, 1);
 
         // Because the close failed, we sent a NoOp instead of repair.
         let job = ds.ds_active.get(&ds_repair_id).unwrap();
@@ -2078,12 +2074,13 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
+        let state_count = ds.job_state_count(ds_repair_id);
         if err_ds == or_ds {
-            assert_eq!(job.state_count().done, 2);
-            assert_eq!(job.state_count().skipped, 1);
+            assert_eq!(state_count.done, 2);
+            assert_eq!(state_count.skipped, 1);
         } else {
-            assert_eq!(job.state_count().done, 1);
-            assert_eq!(job.state_count().skipped, 2);
+            assert_eq!(state_count.done, 1);
+            assert_eq!(state_count.skipped, 2);
         }
 
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
@@ -2093,12 +2090,13 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
+        let state_count = ds.job_state_count(ds_noop_id);
         if err_ds == or_ds {
-            assert_eq!(job.state_count().done, 2);
-            assert_eq!(job.state_count().skipped, 1);
+            assert_eq!(state_count.done, 2);
+            assert_eq!(state_count.skipped, 1);
         } else {
-            assert_eq!(job.state_count().done, 1);
-            assert_eq!(job.state_count().skipped, 2);
+            assert_eq!(state_count.done, 1);
+            assert_eq!(state_count.skipped, 2);
         }
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
@@ -2108,12 +2106,13 @@ pub mod repair_test {
                 panic!("Expected ExtentLiveReopen, got: {:?}", x);
             }
         }
+        let state_count = ds.job_state_count(ds_reopen_id);
         if err_ds == or_ds {
-            assert_eq!(job.state_count().done, 2);
-            assert_eq!(job.state_count().skipped, 1);
+            assert_eq!(state_count.done, 2);
+            assert_eq!(state_count.skipped, 1);
         } else {
-            assert_eq!(job.state_count().done, 1);
-            assert_eq!(job.state_count().skipped, 2);
+            assert_eq!(state_count.done, 1);
+            assert_eq!(state_count.skipped, 2);
         }
 
         assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
@@ -2270,9 +2269,9 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-
-        assert_eq!(job.state_count().done, 2);
-        assert_eq!(job.state_count().error, 1);
+        let state_count = ds.job_state_count(ds_repair_id);
+        assert_eq!(state_count.done, 2);
+        assert_eq!(state_count.error, 1);
 
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
         match &job.work {
@@ -2281,15 +2280,16 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
+        let state_count = ds.job_state_count(ds_noop_id);
 
         // What we expect changes a little depending on if we will fail two
         // different downstairs or just one.
         if err_ds != or_ds {
-            assert_eq!(job.state_count().done, 1);
-            assert_eq!(job.state_count().skipped, 2);
+            assert_eq!(state_count.done, 1);
+            assert_eq!(state_count.skipped, 2);
         } else {
-            assert_eq!(job.state_count().done, 2);
-            assert_eq!(job.state_count().skipped, 1);
+            assert_eq!(state_count.done, 2);
+            assert_eq!(state_count.skipped, 1);
         }
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
@@ -2299,12 +2299,13 @@ pub mod repair_test {
                 panic!("Expected ExtentLiveReopen, got: {:?}", x);
             }
         }
+        let state_count = ds.job_state_count(ds_reopen_id);
         if err_ds != or_ds {
-            assert_eq!(job.state_count().done, 1);
-            assert_eq!(job.state_count().skipped, 2);
+            assert_eq!(state_count.done, 1);
+            assert_eq!(state_count.skipped, 2);
         } else {
-            assert_eq!(job.state_count().done, 2);
-            assert_eq!(job.state_count().skipped, 1);
+            assert_eq!(state_count.done, 2);
+            assert_eq!(state_count.skipped, 1);
         }
 
         assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
@@ -2436,16 +2437,18 @@ pub mod repair_test {
 
         // Differences from the usual path start here.
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
+        let state_count = ds.job_state_count(ds_noop_id);
         match &job.work {
             IOop::ExtentLiveNoOp { .. } => {}
             x => {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(job.state_count().done, 2);
-        assert_eq!(job.state_count().error, 1);
+        assert_eq!(state_count.done, 2);
+        assert_eq!(state_count.error, 1);
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
+        let state_count = ds.job_state_count(ds_reopen_id);
         match &job.work {
             IOop::ExtentLiveReopen { .. } => {}
             x => {
@@ -2454,11 +2457,11 @@ pub mod repair_test {
         }
         if err_ds != or_ds {
             info!(up.log, "err:{} or:{}", err_ds, or_ds);
-            assert_eq!(job.state_count().done, 1);
-            assert_eq!(job.state_count().skipped, 2);
+            assert_eq!(state_count.done, 1);
+            assert_eq!(state_count.skipped, 2);
         } else {
-            assert_eq!(job.state_count().done, 2);
-            assert_eq!(job.state_count().skipped, 1);
+            assert_eq!(state_count.done, 2);
+            assert_eq!(state_count.skipped, 1);
         }
 
         assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
@@ -2587,9 +2590,9 @@ pub mod repair_test {
 
         // All that is different from the normal path is the results from
         // the reopen job, so that is all we need to check here.
-        let job = ds.ds_active.get(&ds_reopen_id).unwrap();
-        assert_eq!(job.state_count().done, 2);
-        assert_eq!(job.state_count().error, 1);
+        let state_count = ds.job_state_count(ds_reopen_id);
+        assert_eq!(state_count.done, 2);
+        assert_eq!(state_count.error, 1);
 
         assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
         assert_eq!(ds.clients[or_ds].state, DsState::Faulted);
@@ -3793,9 +3796,9 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(ds.job_state(cid, job.ds_id), &IOState::New);
         }
-        assert_eq!(job.ack_status, AckStatus::NotAcked);
+        assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
         assert!(job.data.is_none());
     }
@@ -3870,9 +3873,9 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(ds.job_state(cid, job.ds_id), &IOState::New);
         }
-        assert_eq!(job.ack_status, AckStatus::NotAcked);
+        assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
         assert!(job.data.is_none());
     }
@@ -3939,9 +3942,9 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(ds.job_state(cid, job.ds_id), &IOState::New);
         }
-        assert_eq!(job.ack_status, AckStatus::NotAcked);
+        assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
         assert!(job.data.is_none());
     }
@@ -4031,9 +4034,9 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(ds.job_state(cid, job.ds_id), &IOState::New);
         }
-        assert_eq!(job.ack_status, AckStatus::NotAcked);
+        assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
         assert!(job.data.is_none());
     }
@@ -5171,9 +5174,18 @@ pub mod repair_test {
         assert!(jobs[1].work.deps().is_empty());
         assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
         // Check that the IOs were skipped on downstairs 1.
-        assert_eq!(jobs[0].state[ClientId::new(1)], IOState::Skipped);
-        assert_eq!(jobs[1].state[ClientId::new(1)], IOState::Skipped);
-        assert_eq!(jobs[2].state[ClientId::new(1)], IOState::Skipped);
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[0].ds_id),
+            &IOState::Skipped
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[1].ds_id),
+            &IOState::Skipped
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[2].ds_id),
+            &IOState::Skipped
+        );
     }
 
     #[tokio::test]
@@ -5430,9 +5442,18 @@ pub mod repair_test {
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
         for job in jobs.iter().take(3) {
-            assert_eq!(job.state[ClientId::new(0)], IOState::New);
-            assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
-            assert_eq!(job.state[ClientId::new(2)], IOState::New);
+            assert_eq!(
+                ds.job_state(ClientId::new(0), job.ds_id),
+                &IOState::New
+            );
+            assert_eq!(
+                ds.job_state(ClientId::new(1), job.ds_id),
+                &IOState::Skipped
+            );
+            assert_eq!(
+                ds.job_state(ClientId::new(2), job.ds_id),
+                &IOState::New
+            );
         }
         assert!(ds.clients[ClientId::new(1)].extent_limit.is_none());
     }
@@ -5469,9 +5490,18 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 7);
         for job in jobs.iter().take(7) {
-            assert_eq!(job.state[ClientId::new(0)], IOState::New);
-            assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
-            assert_eq!(job.state[ClientId::new(2)], IOState::New);
+            assert_eq!(
+                ds.job_state(ClientId::new(0), job.ds_id),
+                &IOState::New
+            );
+            assert_eq!(
+                ds.job_state(ClientId::new(1), job.ds_id),
+                &IOState::Skipped
+            );
+            assert_eq!(
+                ds.job_state(ClientId::new(2), job.ds_id),
+                &IOState::New
+            );
         }
 
         // Verify that the four jobs we added match what should have
@@ -5516,9 +5546,18 @@ pub mod repair_test {
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
         for job in jobs.iter().take(3) {
-            assert_eq!(job.state[ClientId::new(0)], IOState::Skipped);
-            assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
-            assert_eq!(job.state[ClientId::new(2)], IOState::Skipped);
+            assert_eq!(
+                ds.job_state(ClientId::new(0), job.ds_id),
+                &IOState::Skipped
+            );
+            assert_eq!(
+                ds.job_state(ClientId::new(1), job.ds_id),
+                &IOState::Skipped
+            );
+            assert_eq!(
+                ds.job_state(ClientId::new(2), job.ds_id),
+                &IOState::Skipped
+            );
         }
 
         // No repair jobs should be submitted
@@ -5567,10 +5606,8 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         // Manually move all these jobs to done.
         for job_id in (1000..1003).map(JobId) {
-            let mut handle = ds.ds_active.get_mut(&job_id).unwrap();
-            let job = handle.job();
             for cid in ClientId::iter() {
-                job.state.insert(cid, IOState::Done);
+                ds.clients[cid].job_state.insert(job_id, IOState::Done);
             }
         }
         drop(ds);
@@ -5597,11 +5634,13 @@ pub mod repair_test {
         // LiveRepair downstairs might need a change
         assert!(ds.clients[ClientId::new(1)].dependencies_need_cleanup());
         for job_id in (1003..1006).map(JobId) {
-            let job = ds.ds_active.get(&job_id).unwrap();
             // jobs 3,4,5 will be skipped for our LiveRepair downstairs.
-            assert_eq!(job.state[ClientId::new(0)], IOState::New);
-            assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
-            assert_eq!(job.state[ClientId::new(2)], IOState::New);
+            assert_eq!(ds.job_state(ClientId::new(0), job_id), &IOState::New);
+            assert_eq!(
+                ds.job_state(ClientId::new(1), job_id),
+                &IOState::Skipped
+            );
+            assert_eq!(ds.job_state(ClientId::new(2), job_id), &IOState::New);
         }
 
         // Walk the three new jobs, verify that the dependencies will be
@@ -5663,10 +5702,8 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         // Manually move all these jobs to done.
         for job_id in (1000..1003).map(JobId) {
-            let mut handle = ds.ds_active.get_mut(&job_id).unwrap();
-            let job = handle.job();
             for cid in ClientId::iter() {
-                job.state.insert(cid, IOState::Done);
+                ds.clients[cid].job_state.insert(job_id, IOState::Done);
             }
         }
 
@@ -5702,10 +5739,10 @@ pub mod repair_test {
         // For the three latest jobs, they should be New as they are IOs that
         // are on an extent we "already repaired".
         for job_id in (1006..1009).map(JobId) {
-            let job = ds.ds_active.get(&job_id).unwrap();
-            assert_eq!(job.state[ClientId::new(0)], IOState::New);
-            assert_eq!(job.state[ClientId::new(1)], IOState::New);
-            assert_eq!(job.state[ClientId::new(2)], IOState::New);
+            // jobs 3,4,5 will be skipped for our LiveRepair downstairs.
+            assert_eq!(ds.job_state(ClientId::new(0), job_id), &IOState::New);
+            assert_eq!(ds.job_state(ClientId::new(1), job_id), &IOState::New);
+            assert_eq!(ds.job_state(ClientId::new(2), job_id), &IOState::New);
         }
 
         // Walk the three final jobs, verify that the dependencies will be
@@ -5788,10 +5825,8 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         // Manually move all these jobs to done.
         for job_id in (1000..1003).map(JobId) {
-            let mut handle = ds.ds_active.get_mut(&job_id).unwrap();
-            let job = handle.job();
             for cid in ClientId::iter() {
-                job.state.insert(cid, IOState::Done);
+                ds.clients[cid].job_state.insert(job_id, IOState::Done);
             }
         }
 
@@ -5856,9 +5891,12 @@ pub mod repair_test {
 
         let mut ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&JobId(1007)).unwrap();
-        assert_eq!(job.state[ClientId::new(0)], IOState::New);
-        assert_eq!(job.state[ClientId::new(1)], IOState::Skipped);
-        assert_eq!(job.state[ClientId::new(2)], IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(0), job.ds_id), &IOState::New);
+        assert_eq!(
+            ds.job_state(ClientId::new(1), job.ds_id),
+            &IOState::Skipped
+        );
+        assert_eq!(ds.job_state(ClientId::new(2), job.ds_id), &IOState::New);
 
         let mut current_deps = job.work.deps().clone();
         assert_eq!(current_deps, &[JobId(1002)]);
@@ -5878,9 +5916,9 @@ pub mod repair_test {
         // the final job of the repair) on both the Active and LiveRepair
         // downstairs, since it masks job 0
         let job = ds.ds_active.get(&JobId(1008)).unwrap();
-        assert_eq!(job.state[ClientId::new(0)], IOState::New);
-        assert_eq!(job.state[ClientId::new(1)], IOState::New);
-        assert_eq!(job.state[ClientId::new(2)], IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(0), job.ds_id), &IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(1), job.ds_id), &IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(2), job.ds_id), &IOState::New);
 
         let mut current_deps = job.work.deps().clone();
         assert_eq!(current_deps, &[JobId(1006)]);
@@ -5896,9 +5934,9 @@ pub mod repair_test {
         // This final job depends on everything on Active downstairs, but
         // a smaller subset for the LiveRepair downstairs
         let job = ds.ds_active.get(&JobId(1013)).unwrap();
-        assert_eq!(job.state[ClientId::new(0)], IOState::New);
-        assert_eq!(job.state[ClientId::new(1)], IOState::New);
-        assert_eq!(job.state[ClientId::new(2)], IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(0), job.ds_id), &IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(1), job.ds_id), &IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(2), job.ds_id), &IOState::New);
 
         // The last write depends on
         // 1) the final operation on the repair of extent 0
@@ -5952,12 +5990,9 @@ pub mod repair_test {
 
         let mut ds = up.downstairs.lock().await;
         // Manually move this jobs to done.
-        let mut handle = ds.ds_active.get_mut(&JobId(1000)).unwrap();
-        let job = handle.job();
         for cid in ClientId::iter() {
-            job.state.insert(cid, IOState::Done);
+            ds.clients[cid].job_state.insert(JobId(1000), IOState::Done);
         }
-        drop(handle);
         drop(ds);
 
         let eid = 0;
@@ -6058,9 +6093,9 @@ pub mod repair_test {
         // This second write after starting a repair should only require the
         // repair job on all downstairs
         let job = ds.ds_active.get(&JobId(1005)).unwrap();
-        assert_eq!(job.state[ClientId::new(0)], IOState::New);
-        assert_eq!(job.state[ClientId::new(1)], IOState::New);
-        assert_eq!(job.state[ClientId::new(2)], IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(0), job.ds_id), &IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(1), job.ds_id), &IOState::New);
+        assert_eq!(ds.job_state(ClientId::new(2), job.ds_id), &IOState::New);
 
         let mut current_deps = job.work.deps().clone();
         assert_eq!(&current_deps, &[JobId(1004)]);
@@ -6174,15 +6209,33 @@ pub mod repair_test {
         // The first job, should have the dependences for the new repair work
         assert_eq!(jobs[0].ds_id, JobId(1004));
         assert_eq!(jobs[0].work.deps(), &[JobId(1003)]);
-        assert_eq!(jobs[0].state[ClientId::new(0)], IOState::New);
-        assert_eq!(jobs[0].state[ClientId::new(1)], IOState::New);
-        assert_eq!(jobs[0].state[ClientId::new(2)], IOState::New);
+        assert_eq!(
+            ds.job_state(ClientId::new(0), jobs[0].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[0].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(2), jobs[0].ds_id),
+            &IOState::New
+        );
 
         // The 2nd job should aldo have the dependences for the new repair work
         assert_eq!(jobs[1].work.deps(), &[JobId(1003)]);
-        assert_eq!(jobs[1].state[ClientId::new(0)], IOState::New);
-        assert_eq!(jobs[1].state[ClientId::new(1)], IOState::New);
-        assert_eq!(jobs[1].state[ClientId::new(2)], IOState::New);
+        assert_eq!(
+            ds.job_state(ClientId::new(0), jobs[1].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[1].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(2), jobs[1].ds_id),
+            &IOState::New
+        );
     }
 
     #[tokio::test]
@@ -6280,20 +6333,47 @@ pub mod repair_test {
         // The first job should have no dependencies
         assert_eq!(jobs[0].ds_id, JobId(1000));
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(jobs[0].state[ClientId::new(0)], IOState::New);
-        assert_eq!(jobs[0].state[ClientId::new(1)], IOState::Skipped);
-        assert_eq!(jobs[0].state[ClientId::new(2)], IOState::New);
+        assert_eq!(
+            ds.job_state(ClientId::new(0), jobs[0].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[0].ds_id),
+            &IOState::Skipped
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(2), jobs[0].ds_id),
+            &IOState::New
+        );
 
         assert_eq!(jobs[1].ds_id, JobId(1005));
         assert_eq!(jobs[1].work.deps(), &[JobId(1004)]);
-        assert_eq!(jobs[1].state[ClientId::new(0)], IOState::New);
-        assert_eq!(jobs[1].state[ClientId::new(1)], IOState::New);
-        assert_eq!(jobs[1].state[ClientId::new(2)], IOState::New);
+        assert_eq!(
+            ds.job_state(ClientId::new(0), jobs[1].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[1].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(2), jobs[1].ds_id),
+            &IOState::New
+        );
 
         assert_eq!(jobs[2].ds_id, JobId(1010));
         assert_eq!(jobs[2].work.deps(), &[JobId(1004), JobId(1009)]);
-        assert_eq!(jobs[2].state[ClientId::new(0)], IOState::New);
-        assert_eq!(jobs[2].state[ClientId::new(1)], IOState::New);
-        assert_eq!(jobs[2].state[ClientId::new(2)], IOState::New);
+        assert_eq!(
+            ds.job_state(ClientId::new(0), jobs[2].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(1), jobs[2].ds_id),
+            &IOState::New
+        );
+        assert_eq!(
+            ds.job_state(ClientId::new(2), jobs[2].ds_id),
+            &IOState::New
+        );
     }
 }

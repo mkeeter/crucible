@@ -159,8 +159,7 @@ async fn build_downstairs_job_list(up: &Arc<Upstairs>) -> Vec<WorkSummary> {
 
     let mut jobs = Vec::new();
     for id in kvec.iter() {
-        let job = ds.ds_active.get(id).unwrap();
-        let work_summary = job.io_summarize();
+        let work_summary = ds.job_io_summarize(*id);
         jobs.push(work_summary);
     }
     jobs
