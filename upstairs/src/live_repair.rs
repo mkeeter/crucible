@@ -1014,7 +1014,7 @@ impl Upstairs {
         for ds_repair in repair.iter() {
             // We should be walking up the extents one at a time.
             let DsStateData::LiveRepair { extent_limit, .. } =
-                &mut ds.clients[*ds_repair].state 
+                &mut ds.clients[*ds_repair].state
                 else { panic!("bad state") };
             if eid > 0 {
                 assert_eq!(*extent_limit, Some(eid - 1));
