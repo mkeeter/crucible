@@ -1841,11 +1841,12 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
+            .await;
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
@@ -1934,12 +1935,14 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(2), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(2), DsStateData::Faulted)
+            .await;
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
@@ -2016,11 +2019,12 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(2), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(2), DsStateData::Faulted)
+            .await;
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
@@ -2105,11 +2109,12 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
+            .await;
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
@@ -2184,12 +2189,14 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(2), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(2), DsStateData::Faulted)
+            .await;
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
@@ -2251,12 +2258,13 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         // Only DS 0 is faulted.
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
@@ -3821,40 +3829,45 @@ pub(crate) mod up_test {
         // Verify the correct downstairs progression
         // New -> WA -> WQ -> Active
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
     }
 
     #[tokio::test]
     async fn downstairs_transition_replay() {
         // Verify offline goes to replay
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
         up.set_active().await.unwrap();
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
-        up.ds_transition(ClientId::new(0), DsState::Replay).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Replay)
+            .await;
     }
 
     #[tokio::test]
     async fn downstairs_transition_deactivate_new() {
         // Verify deactivate goes to new
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
         up.set_active().await.unwrap();
-        up.ds_transition(ClientId::new(0), DsState::Deactivated)
+        up.ds_transition(ClientId::new(0), DsStateData::Deactivated)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::New).await;
+        up.ds_transition(ClientId::new(0), DsStateData::New).await;
     }
 
     #[tokio::test]
@@ -3862,7 +3875,7 @@ pub(crate) mod up_test {
     async fn downstairs_transition_deactivate_not_new() {
         // Verify deactivate goes to new
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::Deactivated)
+        up.ds_transition(ClientId::new(0), DsStateData::Deactivated)
             .await;
     }
 
@@ -3871,9 +3884,9 @@ pub(crate) mod up_test {
     async fn downstairs_transition_deactivate_not_wa() {
         // Verify no deactivate from wa
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Deactivated)
+        up.ds_transition(ClientId::new(0), DsStateData::Deactivated)
             .await;
     }
 
@@ -3882,11 +3895,11 @@ pub(crate) mod up_test {
     async fn downstairs_transition_deactivate_not_wq() {
         // Verify no deactivate from wq
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Deactivated)
+        up.ds_transition(ClientId::new(0), DsStateData::Deactivated)
             .await;
     }
 
@@ -3894,12 +3907,14 @@ pub(crate) mod up_test {
     async fn downstairs_transition_active_to_faulted() {
         // Verify active upstairs can go to faulted
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
     }
 
     #[tokio::test]
@@ -3907,13 +3922,14 @@ pub(crate) mod up_test {
     async fn downstairs_transition_disconnect_no_active() {
         // Verify no activation from disconnected
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Deactivated)
+        up.ds_transition(ClientId::new(0), DsStateData::Deactivated)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
     }
 
     #[tokio::test]
@@ -3921,13 +3937,16 @@ pub(crate) mod up_test {
     async fn downstairs_transition_offline_no_active() {
         // Verify no activation from offline
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
     }
 
     // Deactivate tests
@@ -3950,9 +3969,9 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.clients[ClientId::new(0)].state = DsState::Active;
-        ds.clients[ClientId::new(1)].state = DsState::Active;
-        ds.clients[ClientId::new(2)].state = DsState::Active;
+        ds.clients[ClientId::new(0)].state = DsStateData::Active;
+        ds.clients[ClientId::new(1)].state = DsStateData::Active;
+        ds.clients[ClientId::new(2)].state = DsStateData::Active;
 
         // Build a write, put it on the work queue.
         let id1 = ds.next_id();
@@ -4057,9 +4076,15 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure the correct DS have changed state.
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Deactivated);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::Deactivated);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::Active);
+        assert_eq!(
+            ds.clients[ClientId::new(0)].state,
+            DsStateData::Deactivated
+        );
+        assert_eq!(
+            ds.clients[ClientId::new(2)].state,
+            DsStateData::Deactivated
+        );
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::Active);
 
         // Send and complete the flush
         ds.in_progress(flush_id, ClientId::new(1));
@@ -4090,9 +4115,9 @@ pub(crate) mod up_test {
 
         // Verify after the ds_missing, all downstairs are New
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::New);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::New);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::New);
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::New);
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::New);
+        assert_eq!(ds.clients[ClientId::new(2)].state, DsStateData::New);
     }
 
     #[tokio::test]
@@ -4106,9 +4131,9 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.clients[ClientId::new(0)].state = DsState::Active;
-        ds.clients[ClientId::new(1)].state = DsState::Active;
-        ds.clients[ClientId::new(2)].state = DsState::Active;
+        ds.clients[ClientId::new(0)].state = DsStateData::Active;
+        ds.clients[ClientId::new(1)].state = DsStateData::Active;
+        ds.clients[ClientId::new(2)].state = DsStateData::Active;
 
         drop(ds);
         up.set_deactivate(None, ds_done_tx.clone()).await.unwrap();
@@ -4120,9 +4145,18 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure the correct DS have changed state.
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Deactivated);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::Deactivated);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::Deactivated);
+        assert_eq!(
+            ds.clients[ClientId::new(0)].state,
+            DsStateData::Deactivated
+        );
+        assert_eq!(
+            ds.clients[ClientId::new(1)].state,
+            DsStateData::Deactivated
+        );
+        assert_eq!(
+            ds.clients[ClientId::new(2)].state,
+            DsStateData::Deactivated
+        );
         drop(ds);
 
         // Mark all three DS as missing, which moves their state to New
@@ -4153,9 +4187,9 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.clients[ClientId::new(0)].state = DsState::Active;
-        ds.clients[ClientId::new(1)].state = DsState::Active;
-        ds.clients[ClientId::new(2)].state = DsState::Active;
+        ds.clients[ClientId::new(0)].state = DsStateData::Active;
+        ds.clients[ClientId::new(1)].state = DsStateData::Active;
+        ds.clients[ClientId::new(2)].state = DsStateData::Active;
 
         // Build a write, put it on the work queue.
         let id1 = ds.next_id();
@@ -4224,9 +4258,9 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure no DS have changed state.
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Active);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::Active);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::Active);
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::Active);
+        assert_eq!(ds.clients[ClientId::new(2)].state, DsStateData::Active);
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::Active);
     }
 
     #[tokio::test]
@@ -4252,9 +4286,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         up.set_active().await.unwrap();
         let mut ds = up.downstairs.lock().await;
-        ds.clients[ClientId::new(0)].state = DsState::Active;
-        ds.clients[ClientId::new(1)].state = DsState::Active;
-        ds.clients[ClientId::new(2)].state = DsState::Active;
+        ds.clients[ClientId::new(0)].state = DsStateData::Active;
+        ds.clients[ClientId::new(1)].state = DsStateData::Active;
+        ds.clients[ClientId::new(2)].state = DsStateData::Active;
 
         drop(ds);
 
@@ -4265,9 +4299,9 @@ pub(crate) mod up_test {
 
         ds = up.downstairs.lock().await;
         // Make sure no DS have changed state.
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Active);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::Active);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::Active);
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::Active);
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::Active);
+        assert_eq!(ds.clients[ClientId::new(2)].state, DsStateData::Active);
     }
 
     #[tokio::test]
@@ -4283,9 +4317,9 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         // Make sure no DS have changed state.
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::New);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::New);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::New);
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::New);
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::New);
+        assert_eq!(ds.clients[ClientId::new(2)].state, DsStateData::New);
     }
 
     #[tokio::test]
@@ -4293,9 +4327,9 @@ pub(crate) mod up_test {
     async fn downstairs_transition_same_wa() {
         // Verify we can't go to the same state we are in
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
     }
 
@@ -4303,11 +4337,11 @@ pub(crate) mod up_test {
     #[should_panic]
     async fn downstairs_transition_same_wq() {
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
     }
 
@@ -4315,33 +4349,40 @@ pub(crate) mod up_test {
     #[should_panic]
     async fn downstairs_transition_same_active() {
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
     }
 
     #[tokio::test]
     #[should_panic]
     async fn downstairs_transition_no_new_to_offline() {
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
     }
 
     #[tokio::test]
     #[should_panic]
     async fn downstairs_transition_same_offline() {
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
     }
 
     #[tokio::test]
@@ -4350,11 +4391,11 @@ pub(crate) mod up_test {
         // Verify state can't go backwards
         // New -> WA -> WQ -> WA
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
     }
 
@@ -4363,7 +4404,7 @@ pub(crate) mod up_test {
     async fn downstairs_bad_transition_wq() {
         // Verify error when going straight to WQ
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
     }
 
@@ -4372,7 +4413,8 @@ pub(crate) mod up_test {
     async fn downstairs_transition_bad_replay() {
         // Verify new goes to replay will fail
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::Replay).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Replay)
+            .await;
     }
 
     #[tokio::test]
@@ -4380,13 +4422,15 @@ pub(crate) mod up_test {
     async fn downstairs_transition_bad_offline() {
         // Verify offline cannot go to WQ
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Offline).await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Offline)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
     }
 
@@ -4395,12 +4439,13 @@ pub(crate) mod up_test {
     async fn downstairs_transition_bad_active() {
         // Verify active can't go back to WQ
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
     }
 
@@ -4408,26 +4453,28 @@ pub(crate) mod up_test {
     async fn downstairs_transition_active_faulted() {
         // Verify
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::Active).await;
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Active)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
     }
 
     #[tokio::test]
     async fn reconcile_not_ready() {
         // Verify reconcile returns false when a downstairs is not ready
         let up = Upstairs::test_default(None);
-        up.ds_transition(ClientId::new(0), DsState::WaitActive)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(0), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(0), DsStateData::WaitQuorum)
             .await;
 
-        up.ds_transition(ClientId::new(1), DsState::WaitActive)
+        up.ds_transition(ClientId::new(1), DsStateData::WaitActive)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::WaitQuorum)
+        up.ds_transition(ClientId::new(1), DsStateData::WaitQuorum)
             .await;
 
         let (ds_work_tx, _) = mpsc::channel(500);
@@ -4459,9 +4506,9 @@ pub(crate) mod up_test {
         // No repairs on the queue, should return None
         let up = Upstairs::test_default(None);
         let mut ds = up.downstairs.lock().await;
-        ds.clients[ClientId::new(0)].state = DsState::Repair;
-        ds.clients[ClientId::new(1)].state = DsState::Repair;
-        ds.clients[ClientId::new(2)].state = DsState::Repair;
+        ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+        ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+        ds.clients[ClientId::new(2)].state = DsStateData::Repair;
         let w = ds.rep_in_progress(ClientId::new(0));
         assert_eq!(w, None);
     }
@@ -4484,17 +4531,23 @@ pub(crate) mod up_test {
                 },
             ));
             // A downstairs is not in Repair state
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::WaitQuorum;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::WaitQuorum;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
         }
         // Move that job to next to do.
         let nw = up.new_rec_work().await;
         assert!(nw.is_err());
         let mut ds = up.downstairs.lock().await;
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::FailedRepair);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::WaitQuorum);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::FailedRepair);
+        assert_eq!(
+            ds.clients[ClientId::new(0)].state,
+            DsStateData::FailedRepair
+        );
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::WaitQuorum);
+        assert_eq!(
+            ds.clients[ClientId::new(2)].state,
+            DsStateData::FailedRepair
+        );
 
         // Verify rep_in_progress now returns none for all DS
         assert!(ds.reconcile_task_list.is_empty());
@@ -4512,9 +4565,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put two jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4534,7 +4587,7 @@ pub(crate) mod up_test {
         assert!(ds.rep_in_progress(ClientId::new(2)).is_some());
 
         // Now verify we can be done even if a DS is gone
-        ds.clients[ClientId::new(1)].state = DsState::New;
+        ds.clients[ClientId::new(1)].state = DsStateData::New;
         // Now, make sure we consider this done only after all three are done
         assert!(!ds.rep_done(ClientId::new(0), rep_id));
         assert!(!ds.rep_done(ClientId::new(1), rep_id));
@@ -4546,9 +4599,15 @@ pub(crate) mod up_test {
         let nw = up.new_rec_work().await;
         assert!(nw.is_err());
         let mut ds = up.downstairs.lock().await;
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::FailedRepair);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::New);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::FailedRepair);
+        assert_eq!(
+            ds.clients[ClientId::new(0)].state,
+            DsStateData::FailedRepair
+        );
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::New);
+        assert_eq!(
+            ds.clients[ClientId::new(2)].state,
+            DsStateData::FailedRepair
+        );
 
         // Verify rep_in_progress now returns none for all DS
         assert!(ds.reconcile_task_list.is_empty());
@@ -4565,9 +4624,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4584,12 +4643,12 @@ pub(crate) mod up_test {
         // Mark all three as in progress
         assert!(ds.rep_in_progress(ClientId::new(0)).is_some());
         assert!(ds.rep_in_progress(ClientId::new(1)).is_some());
-        ds.clients[ClientId::new(2)].state = DsState::New;
+        ds.clients[ClientId::new(2)].state = DsStateData::New;
         assert!(ds.rep_in_progress(ClientId::new(2)).is_none());
 
         // Okay, now the DS is back and ready for repair, verify it will
         // start taking work.
-        ds.clients[ClientId::new(2)].state = DsState::Repair;
+        ds.clients[ClientId::new(2)].state = DsStateData::Repair;
         assert!(ds.rep_in_progress(ClientId::new(2)).is_some());
     }
 
@@ -4601,9 +4660,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4628,9 +4687,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4652,9 +4711,9 @@ pub(crate) mod up_test {
         let mut rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put two jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4714,9 +4773,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put two jobs on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4760,9 +4819,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4801,9 +4860,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -4837,9 +4896,9 @@ pub(crate) mod up_test {
         let rep_id = ReconciliationId(0);
         {
             let mut ds = up.downstairs.lock().await;
-            ds.clients[ClientId::new(0)].state = DsState::Repair;
-            ds.clients[ClientId::new(1)].state = DsState::Repair;
-            ds.clients[ClientId::new(2)].state = DsState::Repair;
+            ds.clients[ClientId::new(0)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(1)].state = DsStateData::Repair;
+            ds.clients[ClientId::new(2)].state = DsStateData::Repair;
             // Put a job on the todo list
             ds.reconcile_task_list.push_back(ReconcileIO::new(
                 rep_id,
@@ -5672,9 +5731,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -5716,9 +5775,9 @@ pub(crate) mod up_test {
             .await
             .unwrap(),);
         // client 0 is failed, the others should be okay still
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Process the operation for client 1
         assert!(!up
@@ -5730,9 +5789,9 @@ pub(crate) mod up_test {
             )
             .await
             .unwrap(),);
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Three failures, But since this is a write we already have marked
         // the ACK as ready.
@@ -5741,9 +5800,9 @@ pub(crate) mod up_test {
             .process_ds_operation(next_id, ClientId::new(2), response, None)
             .await
             .unwrap());
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Faulted);
 
         // Verify we can still ack this (failed) work
         let mut ds = up.downstairs.lock().await;
@@ -5760,9 +5819,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -5800,7 +5859,7 @@ pub(crate) mod up_test {
             .await
             .unwrap());
         // client 0 should be marked failed.
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
 
         let ok_response = Ok(vec![]);
         // Process the good operation for client 1
@@ -5819,9 +5878,9 @@ pub(crate) mod up_test {
             .process_ds_operation(next_id, ClientId::new(2), ok_response, None)
             .await
             .unwrap());
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Verify we can ack this work, then ack it.
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
@@ -5943,9 +6002,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -5988,18 +6047,18 @@ pub(crate) mod up_test {
             .await
             .unwrap());
         // client 0 is failed, the others should be okay still
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Process the operation for client 1
         assert!(!up
             .process_ds_operation(next_id, ClientId::new(1), err_response, None)
             .await
             .unwrap());
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         let ok_response = Ok(vec![]);
         // Because we ACK writes, this op will always return false
@@ -6007,9 +6066,9 @@ pub(crate) mod up_test {
             .process_ds_operation(next_id, ClientId::new(2), ok_response, None)
             .await
             .unwrap());
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Verify we can ack this work
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
@@ -6252,9 +6311,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -6294,9 +6353,9 @@ pub(crate) mod up_test {
             .unwrap(),);
 
         // Verify client states
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // A faulted write won't change skipped job count.
         let ds = up.downstairs.lock().await;
@@ -6417,9 +6476,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -6474,9 +6533,9 @@ pub(crate) mod up_test {
             .unwrap(),);
 
         // Verify client states
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Verify we can ack this work
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
@@ -6507,9 +6566,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -6553,9 +6612,9 @@ pub(crate) mod up_test {
             .unwrap());
 
         // Verify client states
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Faulted);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Active);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Active);
 
         // Verify we can ack this work
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 1);
@@ -6591,9 +6650,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
         let write_one = enqueue_write(&up, true, ds_done_tx.clone()).await;
@@ -6660,9 +6719,9 @@ pub(crate) mod up_test {
         .unwrap();
 
         // Verify client states
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Faulted);
 
         // Verify we can ack this work plus the previous two
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 3);
@@ -6699,9 +6758,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
 
@@ -6777,9 +6836,9 @@ pub(crate) mod up_test {
         .unwrap();
 
         // Verify client states
-        assert_eq!(up.ds_state(ClientId::new(0)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(1)).await, DsState::Active);
-        assert_eq!(up.ds_state(ClientId::new(2)).await, DsState::Faulted);
+        assert_eq!(up.ds_state(ClientId::new(0)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(1)).await, DsStateData::Active);
+        assert_eq!(up.ds_state(ClientId::new(2)).await, DsStateData::Faulted);
 
         // Verify we can ack this work plus the previous two
         assert_eq!(up.downstairs.lock().await.ackable_work().len(), 3);
@@ -6832,12 +6891,13 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
 
         // Create a write
         let write_one = enqueue_write(&up, false, ds_done_tx.clone()).await;
@@ -6895,12 +6955,13 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
 
         // Create a write
         let write_one = enqueue_write(&up, true, ds_done_tx.clone()).await;
@@ -7039,13 +7100,15 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(2), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(2), DsStateData::Faulted)
+            .await;
 
         // Create a write
         let write_one = enqueue_write(&up, true, ds_done_tx.clone()).await;
@@ -7176,13 +7239,13 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::Faulted).await;
+            up.ds_transition(cid, DsStateData::Faulted).await;
         }
 
         // Create a read.
@@ -7243,13 +7306,13 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::Faulted).await;
+            up.ds_transition(cid, DsStateData::Faulted).await;
         }
 
         // Create a write.
@@ -7301,13 +7364,13 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::Faulted).await;
+            up.ds_transition(cid, DsStateData::Faulted).await;
         }
 
         // Create a flush.
@@ -7367,13 +7430,13 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::Faulted).await;
+            up.ds_transition(cid, DsStateData::Faulted).await;
         }
 
         // Create a read.
@@ -7441,13 +7504,13 @@ pub(crate) mod up_test {
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::Faulted).await;
+            up.ds_transition(cid, DsStateData::Faulted).await;
         }
 
         // Create a read.
@@ -9125,9 +9188,9 @@ pub(crate) mod up_test {
         let up = Upstairs::test_default(None);
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
 
         let mut gw = up.guest.guest_work.lock().await;
