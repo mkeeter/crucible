@@ -1013,8 +1013,9 @@ impl Upstairs {
         // Update our extent limit to this extent.
         for ds_repair in repair.iter() {
             // We should be walking up the extents one at a time.
-            let DsStateData::LiveRepair { extent_limit, .. } = 
-                &mut ds.clients[*ds_repair].state else { panic!("bad state") };
+            let DsStateData::LiveRepair { extent_limit, .. } =
+                &mut ds.clients[*ds_repair].state 
+                else { panic!("bad state") };
             if eid > 0 {
                 assert_eq!(*extent_limit, Some(eid - 1));
             } else {
@@ -2740,8 +2741,13 @@ pub mod repair_test {
         let id = 1000;
 
         let mut ds = up.downstairs.lock().await;
-        assert!(matches!(ds.clients[ClientId::new(1)].state,
-        DsStateData::LiveRepair { extent_limit: None, .. }));
+        assert!(matches!(
+            ds.clients[ClientId::new(1)].state,
+            DsStateData::LiveRepair {
+                extent_limit: None,
+                ..
+            }
+        ));
         // Check all three IOs.
         for job_id in (id..id + 3).map(JobId) {
             assert!(ds.in_progress(job_id, ClientId::new(0)).is_some());
@@ -5653,7 +5659,8 @@ pub mod repair_test {
         // Manually move all these jobs to done.
         for job_id in (1000..1003).map(JobId) {
             for cid in ClientId::iter() {
-                ds.clients[cid].job_state.insert(job_id, IOState::Done);
+                ds.clients[cid].job_state.get_mut(&job_id).unwrap().state =
+                    IOState::Done;
             }
         }
         let repair_min_id = ds.peek_next_id();
@@ -5666,7 +5673,10 @@ pub mod repair_test {
             .await;
         up.ds_transition(
             ClientId::new(1),
-            DsStateData::LiveRepair { repair_min_id, extent_limit: None },
+            DsStateData::LiveRepair {
+                repair_min_id,
+                extent_limit: None,
+            },
         )
         .await;
 
@@ -5754,7 +5764,8 @@ pub mod repair_test {
         // Manually move all these jobs to done.
         for job_id in (1000..1003).map(JobId) {
             for cid in ClientId::iter() {
-                ds.clients[cid].job_state.insert(job_id, IOState::Done);
+                ds.clients[cid].job_state.get_mut(&job_id).unwrap().state =
+                    IOState::Done;
             }
         }
         let repair_min_id = ds.peek_next_id();
@@ -5767,7 +5778,10 @@ pub mod repair_test {
             .await;
         up.ds_transition(
             ClientId::new(1),
-            DsStateData::LiveRepair { repair_min_id, extent_limit: None },
+            DsStateData::LiveRepair {
+                repair_min_id,
+                extent_limit: None,
+            },
         )
         .await;
         let mut ds = up.downstairs.lock().await;
@@ -5884,7 +5898,8 @@ pub mod repair_test {
         // Manually move all these jobs to done.
         for job_id in (1000..1003).map(JobId) {
             for cid in ClientId::iter() {
-                ds.clients[cid].job_state.insert(job_id, IOState::Done);
+                ds.clients[cid].job_state.get_mut(&job_id).unwrap().state =
+                    IOState::Done;
             }
         }
         let repair_min_id = ds.peek_next_id();
@@ -5897,7 +5912,10 @@ pub mod repair_test {
             .await;
         up.ds_transition(
             ClientId::new(1),
-            DsStateData::LiveRepair { repair_min_id, extent_limit: None },
+            DsStateData::LiveRepair {
+                repair_min_id,
+                extent_limit: None,
+            },
         )
         .await;
         let mut ds = up.downstairs.lock().await;
@@ -6053,7 +6071,11 @@ pub mod repair_test {
         let mut ds = up.downstairs.lock().await;
         // Manually move this jobs to done.
         for cid in ClientId::iter() {
-            ds.clients[cid].job_state.insert(JobId(1000), IOState::Done);
+            ds.clients[cid]
+                .job_state
+                .get_mut(&JobId(1000))
+                .unwrap()
+                .state = IOState::Done;
         }
         let repair_min_id = ds.peek_next_id();
         drop(ds);
@@ -6067,7 +6089,10 @@ pub mod repair_test {
             .await;
         up.ds_transition(
             ClientId::new(1),
-            DsStateData::LiveRepair { repair_min_id, extent_limit: None },
+            DsStateData::LiveRepair {
+                repair_min_id,
+                extent_limit: None,
+            },
         )
         .await;
 
@@ -6239,7 +6264,10 @@ pub mod repair_test {
             .await;
         up.ds_transition(
             ClientId::new(1),
-            DsStateData::LiveRepair { repair_min_id, extent_limit: None },
+            DsStateData::LiveRepair {
+                repair_min_id,
+                extent_limit: None,
+            },
         )
         .await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
@@ -6357,7 +6385,10 @@ pub mod repair_test {
             .await;
         up.ds_transition(
             ClientId::new(1),
-            DsStateData::LiveRepair { repair_min_id, extent_limit: None },
+            DsStateData::LiveRepair {
+                repair_min_id,
+                extent_limit: None,
+            },
         )
         .await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
