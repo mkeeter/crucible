@@ -4850,6 +4850,11 @@ struct DownstairsClient {
      * This will contain the extent info for each downstairs as reported
      * by those downstairs and is used to decide if an extent requires
      * repair or not.
+     *
+     * Unfortunately, this cannot live in `DsStateData::LiveRepair` because it's
+     * populated by both the source (`Active`) downstairs and the target
+     * (`LiveRepair`) downstairs; they then compare to decide whether an extent
+     * needs to be copied over.
      */
     repair_info: Option<ExtentInfo>,
 
