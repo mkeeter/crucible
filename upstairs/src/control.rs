@@ -124,7 +124,10 @@ async fn upstairs_fill_info(
     let repair_needed = ds.reconcile_repair_needed;
     let extents_repaired = ds.collect_stats(|c| c.extents_repaired);
     let extents_confirmed = ds.collect_stats(|c| c.extents_confirmed);
-    let extent_limit = ds.collect_stats(|c| c.extent_limit);
+    let extent_limit = ds.collect_stats(|c| match c.state {
+        DsStateData::LiveRepair { extent_limit, .. } => extent_limit,
+        _ => None,
+    });
     let live_repair_completed = ds.collect_stats(|c| c.live_repair_completed);
     let live_repair_aborted = ds.collect_stats(|c| c.live_repair_aborted);
 
