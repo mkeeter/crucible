@@ -1024,7 +1024,6 @@ where
                  * any work that we were holding that we did not flush.
                  */
                 ds.re_new(up_coms.client_id);
-                assert!(ds.clients[up_coms.client_id].extent_limit.is_none());
             }
             _ => {
                 panic!(
@@ -3390,8 +3389,7 @@ impl Downstairs {
         // our cache to reflect that.
         self.clients[client_id].new_jobs.clear();
 
-        // As this downstairs is now faulted, we clear the extent_limit.
-        self.clients[client_id].extent_limit = None;
+        // The caller will transition this client to a Faulted state
         notify_guest
     }
 
@@ -4665,7 +4663,11 @@ impl Downstairs {
     fn get_extent_under_repair(&self) -> Option<std::ops::RangeInclusive<u64>> {
         let mut extent_under_repair = None;
         for cid in ClientId::iter() {
-            if let Some(eur) = self.clients[cid].extent_limit {
+            if let DsStateData::LiveRepair {
+                extent_limit: Some(eur),
+                ..
+            } = self.clients[cid].state
+            {
                 if extent_under_repair.is_none() {
                     extent_under_repair = Some(eur);
                 } else {
@@ -4878,26 +4880,6 @@ struct DownstairsClient {
     ro_lr_skipped: usize,
 
     /**
-     * Extent limit, if set, indicates the extent where LiveRepair has already
-     * submitted, or possibly even already finished the LiveRepair of this
-     * extent. If you are changing this value, it must happen at the same
-     * time the repair IOs are enqueued on the work list for the extent under
-     * repair, don't release the downstairs lock until both are done.
-     *
-     * This limit, if used in a flush indicates that extents <= this
-     * value should be issued a flush, and extents > this value should
-     * not be flushed.
-     *
-     * When deciding to skip an IO on a downstairs in LiveRepair, any
-     * IO at or below this extent should go ahead and be submitted.  Any IO
-     * above this extent should still be skipped.
-     *
-     * This is only used during live repair, and will only ever be
-     * set on a downstairs that is undergoing live repair.
-     */
-    extent_limit: Option<u64>,
-
-    /**
      * Count of downstairs connections
      */
     connected: usize,
@@ -4942,7 +4924,6 @@ impl DownstairsClient {
             live_repair_completed: 0,
             live_repair_aborted: 0,
             ro_lr_skipped: 0,
-            extent_limit: None,
             connected: 0,
             replaced: 0,
             flow_control: 0,
@@ -4954,7 +4935,6 @@ impl DownstairsClient {
 
     fn end_live_repair(&mut self) {
         self.repair_info = None;
-        self.extent_limit = None;
     }
 
     /*
@@ -5046,15 +5026,12 @@ impl DownstairsClient {
                 skipped = true;
                 self.skipped_jobs.insert(io.ds_id);
             }
-            DsStateData::LiveRepair { .. } => {
+            DsStateData::LiveRepair { extent_limit, .. } => {
                 // Pick the latest repair limit that's relevant for this
                 // downstairs.  This is either the extent under repair (if
                 // there are no reserved repair jobs), or the last extent
                 // for which we have reserved a repair job ID.
-                if last_repair_job_extent.is_some() {
-                    assert!(self.extent_limit.is_some());
-                }
-                let my_limit = last_repair_job_extent.or(self.extent_limit);
+                let my_limit = last_repair_job_extent.or(extent_limit);
                 if io.work.send_io_live_repair(my_limit) {
                     // Leave this IO as New, the downstairs will receive it.
                     self.io_state_count.incr(&IOState::New);
@@ -5139,7 +5116,7 @@ impl DownstairsClient {
             self.skipped_jobs,
             deps
         );
-        let DsStateData::LiveRepair { repair_min_id } = self.state else {
+        let DsStateData::LiveRepair { repair_min_id, .. } = self.state else {
             panic!("expected to be in LiveRepair")
         };
 
@@ -5156,6 +5133,14 @@ impl DownstairsClient {
         );
         deps.retain(|x| x >= &repair_min_id);
         info!(self.log, "{} final dependency list {:?}", ds_id, deps);
+    }
+
+    /// Helper function to set `extent_limit` when `self.state` is `LiveRepair`
+    #[cfg(test)]
+    fn set_extent_under_repair(&mut self, eur: u64) {
+        let DsStateData::LiveRepair { extent_limit, .. } =
+            &mut self.state else { panic!() };
+        *extent_limit = Some(eur);
     }
 }
 
@@ -8030,7 +8015,29 @@ pub(crate) enum DsStateData {
     Active,
     Faulted,
     LiveRepairReady,
-    LiveRepair { repair_min_id: JobId },
+    LiveRepair {
+        /// When repairing, this will be the minimum job ID the downstairs under
+        /// repair needs to consider for dependencies.
+        repair_min_id: JobId,
+
+        /// Extent limit, set, indicates the extent where LiveRepair has already
+        /// submitted, or possibly even already finished the LiveRepair of this
+        /// extent. If you are changing this value, it must happen at the same
+        /// time the repair IOs are enqueued on the work list for the extent
+        /// under repair, don't release the downstairs lock until both are done.
+        ///
+        /// This limit, if used in a flush indicates that extents <= this value
+        /// should be issued a flush, and extents > this value should not be
+        /// flushed.
+        ///
+        /// When deciding to skip an IO on a downstairs in LiveRepair, any IO at
+        /// or below this extent should go ahead and be submitted.  Any IO above
+        /// this extent should still be skipped.
+        ///
+        /// This is only used during live repair, and will only ever be set on a
+        /// downstairs that is undergoing live repair.
+        extent_limit: Option<u64>,
+    },
     Migrating,
     Offline,
     Replay,
