@@ -2891,10 +2891,20 @@ struct Downstairs {
 
 impl Downstairs {
     fn new(log: Logger, ds_target: ClientMap<SocketAddr>) -> Self {
+        let log = log.new(o!("" => "downstairs".to_string()));
         let clients = [
-            DownstairsClient::new(ds_target.get(&ClientId::new(0)).copied()),
-            DownstairsClient::new(ds_target.get(&ClientId::new(1)).copied()),
-            DownstairsClient::new(ds_target.get(&ClientId::new(2)).copied()),
+            DownstairsClient::new(
+                ds_target.get(&ClientId::new(0)).copied(),
+                log.new(o!("client" => "0")),
+            ),
+            DownstairsClient::new(
+                ds_target.get(&ClientId::new(1)).copied(),
+                log.new(o!("client" => "1")),
+            ),
+            DownstairsClient::new(
+                ds_target.get(&ClientId::new(2)).copied(),
+                log.new(o!("client" => "2")),
+            ),
         ];
         Self {
             clients: ClientData(clients),
@@ -2950,107 +2960,32 @@ impl Downstairs {
         ds_id: JobId,
         client_id: ClientId,
     ) -> Option<IOop> {
-        // If current state is Skipped, then we have nothing to do here.
-        if matches!(self.job_state(client_id, ds_id), IOState::Skipped) {
-            return None;
-        }
-
-        let job = match self.ds_active.get(&ds_id) {
-            Some(handle) => handle,
+        match self.ds_active.get(&ds_id) {
+            Some(job) => {
+                self.clients[client_id].in_progress(job, self.repair_min_id)
+            }
             None => {
                 // This job, that we thought was good, is not.  As we don't
                 // keep the lock when gathering job IDs to work on, it is
                 // possible to have a out of date work list.
                 warn!(self.log, "[{client_id}] Job {ds_id} not on active list");
-                return None;
-            }
-        };
-
-        let new_state = IOState::InProgress;
-        let old_state = self.clients[client_id]
-            .job_state
-            .insert(ds_id, new_state.clone())
-            .unwrap();
-        assert_eq!(old_state, IOState::New);
-        self.clients[client_id].io_state_count.decr(&old_state);
-        self.clients[client_id].io_state_count.incr(&new_state);
-        let mut out = job.work.clone();
-
-        if self.clients[client_id].dependencies_need_cleanup() {
-            match &mut out {
-                IOop::Write { dependencies, .. }
-                | IOop::WriteUnwritten { dependencies, .. }
-                | IOop::Flush { dependencies, .. }
-                | IOop::Read { dependencies, .. }
-                | IOop::ExtentClose { dependencies, .. }
-                | IOop::ExtentFlushClose { dependencies, .. }
-                | IOop::ExtentLiveRepair { dependencies, .. }
-                | IOop::ExtentLiveReopen { dependencies, .. }
-                | IOop::ExtentLiveNoOp { dependencies } => {
-                    self.remove_dep_if_live_repair(
-                        client_id,
-                        dependencies,
-                        ds_id,
-                    );
-                }
+                None
             }
         }
-        // If our downstairs is under repair, then include any extent limit sent
-        // in the IOop; otherwise, clear it out
-        if let IOop::Flush { extent_limit, .. } = &mut out {
-            if self.clients[client_id].state != DsState::LiveRepair {
-                *extent_limit = None;
-            }
-        }
-        Some(out)
     }
 
-    /// Given a client ID that is undergoing LiveRepair, go through the list
-    /// of dependencies and remove any jobs that this downstairs has already
-    /// skipped, as the downstairs on the other side will not have received
-    /// these IOs.
-    ///
-    /// First off, any job that was "skipped" should not be a dependency for
-    /// this specific downstairs.  In addition, any job that happened before
-    /// the skipped jobs that was marked as "Done" should also be removed, as
-    /// there will be no replay here and we are basically rebuilding this
-    /// downstairs from other downstairs.
+    #[cfg(test)]
     fn remove_dep_if_live_repair(
         &mut self,
         client_id: ClientId,
         deps: &mut Vec<JobId>,
         ds_id: JobId,
     ) {
-        debug!(
-            self.log,
-            "[{}] {} Remove check skipped:{:?} from deps:{:?}",
-            client_id,
+        self.clients[client_id].remove_dep_if_live_repair(
+            deps,
             ds_id,
-            self.clients[client_id].skipped_jobs,
-            deps
-        );
-        assert_eq!(self.clients[client_id].state, DsState::LiveRepair);
-        assert!(self.repair_min_id.is_some());
-
-        deps.retain(|x| !self.clients[client_id].skipped_jobs.contains(x));
-
-        // If we are repairing, then there must be a repair_min_id set so we
-        // know where to stop with dependency inclusion.
-        if let Some(repair_min_id) = self.repair_min_id {
-            debug!(
-                self.log,
-                "[{}] {} Remove check < min repaired:{} from deps:{:?}",
-                client_id,
-                ds_id,
-                repair_min_id,
-                deps
-            );
-            deps.retain(|x| x >= &repair_min_id);
-        }
-        info!(
-            self.log,
-            "[{}] {} final dependency list {:?}", client_id, ds_id, deps
-        );
+            self.repair_min_id.unwrap(),
+        )
     }
 
     /**
@@ -3273,21 +3208,8 @@ impl Downstairs {
             self.ds_active.len(),
         );
 
-        for ds_id in self.ds_active.keys() {
-            let state = &self.clients[client_id].job_state[ds_id];
-
-            if matches!(state, IOState::InProgress | IOState::New) {
-                info!(self.log, "{} change {} to skipped", client_id, ds_id);
-                let old_state = self.clients[client_id]
-                    .job_state
-                    .insert(*ds_id, IOState::Skipped)
-                    .unwrap();
-                self.clients[client_id].io_state_count.decr(&old_state);
-                self.clients[client_id]
-                    .io_state_count
-                    .incr(&IOState::Skipped);
-                self.clients[client_id].skipped_jobs.insert(*ds_id);
-            }
+        for &ds_id in self.ds_active.keys() {
+            self.clients[client_id].skip_in_progress_job(ds_id);
         }
 
         // All of IOState::New jobs are now IOState::Skipped, so clear our
@@ -3416,19 +3338,8 @@ impl Downstairs {
         let mut retire_check = vec![];
         let mut number_jobs_skipped = 0;
 
-        for (ds_id, job) in &self.ds_active {
-            let state = &self.clients[client_id].job_state[ds_id];
-
-            if matches!(state, IOState::InProgress | IOState::New) {
-                let old_state = self.clients[client_id]
-                    .job_state
-                    .insert(*ds_id, IOState::Skipped)
-                    .unwrap();
-                self.clients[client_id].io_state_count.decr(&old_state);
-                self.clients[client_id]
-                    .io_state_count
-                    .incr(&IOState::Skipped);
-                self.clients[client_id].skipped_jobs.insert(*ds_id);
+        for (&ds_id, job) in &self.ds_active {
+            if self.clients[client_id].skip_in_progress_job(ds_id) {
                 number_jobs_skipped += 1;
 
                 // Check to see if this being skipped means we can ACK
@@ -3437,14 +3348,14 @@ impl Downstairs {
                 if *ack.ack_status == AckStatus::Acked {
                     // Push this onto a queue to do the retire check when
                     // we aren't doing a mutable iteration.
-                    retire_check.push(*ds_id);
+                    retire_check.push(ds_id);
                 } else if *ack.ack_status == AckStatus::NotAcked {
                     let jobs_completed = self
                         .clients
                         .iter()
                         .filter(|c| {
                             matches!(
-                                c.job_state[ds_id],
+                                c.job_state[&ds_id],
                                 IOState::Done
                                     | IOState::Error(..)
                                     | IOState::Skipped
@@ -3532,65 +3443,12 @@ impl Downstairs {
     ) {
         let mut skipped = 0;
         let is_write = matches!(io.work, IOop::Write { .. });
-        for cid in ClientId::iter() {
-            let prev =
-                self.clients[cid].job_state.insert(io.ds_id, IOState::New);
-            assert!(prev.is_none());
 
-            let current = self.clients[cid].state;
-            // If a downstairs is faulted or ready for repair, we can move
-            // that job directly to IOState::Skipped
-            // If a downstairs is in repair, then we need to see if this
-            // IO is on a repaired extent or not.  If an IO spans extents
-            // where some are repaired and some are not, then this IO had
-            // better have the dependencies already set to reflect the
-            // requirement that a repair IO will need to finish first.
-            match current {
-                DsState::Faulted
-                | DsState::Replaced
-                | DsState::Replacing
-                | DsState::LiveRepairReady => {
-                    self.clients[cid]
-                        .job_state
-                        .insert(io.ds_id, IOState::Skipped);
-                    self.clients[cid].io_state_count.incr(&IOState::Skipped);
-                    skipped += 1;
-                    self.clients[cid].skipped_jobs.insert(io.ds_id);
-                }
-                DsState::LiveRepair => {
-                    // Pick the latest repair limit that's relevant for this
-                    // downstairs.  This is either the extent under repair (if
-                    // there are no reserved repair jobs), or the last extent
-                    // for which we have reserved a repair job ID.
-                    let my_limit =
-                        self.clients[cid].extent_limit.map(|first| {
-                            self.repair_job_ids
-                                .last_key_value()
-                                .map(|(k, _)| *k)
-                                .unwrap_or(first as u64)
-                        });
-                    assert!(self.repair_min_id.is_some());
-                    if io.work.send_io_live_repair(my_limit) {
-                        // Leave this IO as New, the downstairs will receive it.
-                        self.clients[cid].io_state_count.incr(&IOState::New);
-                        self.clients[cid].new_jobs.insert(io.ds_id);
-                    } else {
-                        // Move this IO to skipped, we are not ready for
-                        // the downstairs to receive it.
-                        self.clients[cid]
-                            .job_state
-                            .insert(io.ds_id, IOState::Skipped);
-                        self.clients[cid]
-                            .io_state_count
-                            .incr(&IOState::Skipped);
-                        skipped += 1;
-                        self.clients[cid].skipped_jobs.insert(io.ds_id);
-                    }
-                }
-                _ => {
-                    self.clients[cid].io_state_count.incr(&IOState::New);
-                    self.clients[cid].new_jobs.insert(io.ds_id);
-                }
+        let last_repair_job_extent =
+            self.repair_job_ids.last_key_value().map(|(k, _)| *k);
+        for cid in ClientId::iter() {
+            if !self.clients[cid].enqueue(&io, last_repair_job_extent) {
+                skipped += 1;
             }
         }
 
@@ -4723,16 +4581,7 @@ impl Downstairs {
             .get(&ds_id)
             .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
 
-        match &job.work {
-            IOop::Flush {
-                dependencies: _dependencies,
-                flush_number: _flush_number,
-                gen_number: _gen_number,
-                snapshot_details: _,
-                extent_limit: _,
-            } => Ok(true),
-            _ => Ok(false),
-        }
+        Ok(matches!(&job.work, IOop::Flush { .. }))
     }
 
     fn client_error(
@@ -4825,10 +4674,10 @@ impl Downstairs {
         for cid in ClientId::iter() {
             if let Some(eur) = self.clients[cid].extent_limit {
                 if extent_under_repair.is_none() {
-                    extent_under_repair = Some(eur as u64);
+                    extent_under_repair = Some(eur);
                 } else {
                     // We only support one extent being repaired at a time
-                    assert_eq!(Some(eur as u64), extent_under_repair);
+                    assert_eq!(Some(eur), extent_under_repair);
                 }
             }
         }
@@ -4942,10 +4791,6 @@ impl Downstairs {
             state,
         }
     }
-
-    fn multiborrow(&mut self) -> (&mut ActiveJobs, &mut AckState) {
-        (&mut self.ds_active, &mut self.ack_state)
-    }
 }
 
 #[derive(Debug)]
@@ -5057,7 +4902,7 @@ struct DownstairsClient {
      * This is only used during live repair, and will only ever be
      * set on a downstairs that is undergoing live repair.
      */
-    extent_limit: Option<usize>,
+    extent_limit: Option<u64>,
 
     /**
      * Count of downstairs connections
@@ -5081,10 +4926,13 @@ struct DownstairsClient {
 
     /// Map of work status
     job_state: BTreeMap<JobId, IOState>,
+
+    /// Logger for client messages
+    log: Logger,
 }
 
 impl DownstairsClient {
-    fn new(target: Option<SocketAddr>) -> Self {
+    fn new(target: Option<SocketAddr>, log: Logger) -> Self {
         Self {
             uuid: None,
             target,
@@ -5107,6 +4955,7 @@ impl DownstairsClient {
             flow_control: 0,
             io_state_count: ClientIOStateCount::new(),
             job_state: BTreeMap::new(),
+            log,
         }
     }
 
@@ -5147,6 +4996,179 @@ impl DownstairsClient {
 
     fn total_live_work(&self) -> usize {
         (self.io_state_count.new + self.io_state_count.in_progress) as usize
+    }
+
+    /// Skips the given job if it is `InProgress` or `New`
+    ///
+    /// Returns `true` if the job was skipped and `false` otherwise
+    ///
+    /// Note that the job may still be in `self.new_jobs` and it is the caller's
+    /// responsibility to remove it (typically in bulk by calling `clear()`,
+    /// because we're skipping every single in-progress job).
+    fn skip_in_progress_job(&mut self, ds_id: JobId) -> bool {
+        let state = &self.job_state[&ds_id];
+
+        if matches!(state, IOState::InProgress | IOState::New) {
+            info!(self.log, "change {ds_id} to skipped");
+            let old_state =
+                self.job_state.insert(ds_id, IOState::Skipped).unwrap();
+            self.io_state_count.decr(&old_state);
+            self.io_state_count.incr(&IOState::Skipped);
+            self.skipped_jobs.insert(ds_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Enqueues the given IO work into this DownstairsClient
+    ///
+    /// Returns `true` if the work is scheduled as a new job; `false` if it is
+    /// skipped (due to the downstairs being faulted or under live repair).
+    fn enqueue(
+        &mut self,
+        io: &DownstairsIO,
+        last_repair_job_extent: Option<u64>,
+    ) -> bool {
+        let prev = self.job_state.insert(io.ds_id, IOState::New);
+        assert!(prev.is_none());
+
+        let mut skipped = false;
+        let current = self.state;
+        // If a downstairs is faulted or ready for repair, we can move
+        // that job directly to IOState::Skipped
+        // If a downstairs is in repair, then we need to see if this
+        // IO is on a repaired extent or not.  If an IO spans extents
+        // where some are repaired and some are not, then this IO had
+        // better have the dependencies already set to reflect the
+        // requirement that a repair IO will need to finish first.
+        match current {
+            DsState::Faulted
+            | DsState::Replaced
+            | DsState::Replacing
+            | DsState::LiveRepairReady => {
+                self.job_state.insert(io.ds_id, IOState::Skipped);
+                self.io_state_count.incr(&IOState::Skipped);
+                skipped = true;
+                self.skipped_jobs.insert(io.ds_id);
+            }
+            DsState::LiveRepair => {
+                // Pick the latest repair limit that's relevant for this
+                // downstairs.  This is either the extent under repair (if
+                // there are no reserved repair jobs), or the last extent
+                // for which we have reserved a repair job ID.
+                if last_repair_job_extent.is_some() {
+                    assert!(self.extent_limit.is_some());
+                }
+                let my_limit = last_repair_job_extent.or(self.extent_limit);
+                if io.work.send_io_live_repair(my_limit) {
+                    // Leave this IO as New, the downstairs will receive it.
+                    self.io_state_count.incr(&IOState::New);
+                    self.new_jobs.insert(io.ds_id);
+                } else {
+                    // Move this IO to skipped, we are not ready for
+                    // the downstairs to receive it.
+                    self.job_state.insert(io.ds_id, IOState::Skipped);
+                    self.io_state_count.incr(&IOState::Skipped);
+                    skipped = true;
+                    self.skipped_jobs.insert(io.ds_id);
+                }
+            }
+            _ => {
+                self.io_state_count.incr(&IOState::New);
+                self.new_jobs.insert(io.ds_id);
+            }
+        }
+
+        !skipped
+    }
+
+    fn in_progress(
+        &mut self,
+        job: &DownstairsIO,
+        repair_min_id: Option<JobId>,
+    ) -> Option<IOop> {
+        // If current state is Skipped, then we have nothing to do here.
+        if matches!(self.job_state[&job.ds_id], IOState::Skipped) {
+            return None;
+        }
+        // TODO: get the handle persistently here
+
+        let new_state = IOState::InProgress;
+        let old_state =
+            self.job_state.insert(job.ds_id, new_state.clone()).unwrap();
+        assert_eq!(old_state, IOState::New);
+        self.io_state_count.decr(&old_state);
+        self.io_state_count.incr(&new_state);
+        let mut out = job.work.clone();
+
+        if self.dependencies_need_cleanup() {
+            match &mut out {
+                IOop::Write { dependencies, .. }
+                | IOop::WriteUnwritten { dependencies, .. }
+                | IOop::Flush { dependencies, .. }
+                | IOop::Read { dependencies, .. }
+                | IOop::ExtentClose { dependencies, .. }
+                | IOop::ExtentFlushClose { dependencies, .. }
+                | IOop::ExtentLiveRepair { dependencies, .. }
+                | IOop::ExtentLiveReopen { dependencies, .. }
+                | IOop::ExtentLiveNoOp { dependencies } => {
+                    self.remove_dep_if_live_repair(
+                        dependencies,
+                        job.ds_id,
+                        repair_min_id.unwrap(),
+                    );
+                }
+            }
+        }
+        // If our downstairs is under repair, then include any extent limit sent
+        // in the IOop; otherwise, clear it out
+        if let IOop::Flush { extent_limit, .. } = &mut out {
+            if self.state != DsState::LiveRepair {
+                *extent_limit = None;
+            }
+        }
+        Some(out)
+    }
+
+    /// Given a client ID that is undergoing LiveRepair, go through the list
+    /// of dependencies and remove any jobs that this downstairs has already
+    /// skipped, as the downstairs on the other side will not have received
+    /// these IOs.
+    ///
+    /// First off, any job that was "skipped" should not be a dependency for
+    /// this specific downstairs.  In addition, any job that happened before
+    /// the skipped jobs that was marked as "Done" should also be removed, as
+    /// there will be no replay here and we are basically rebuilding this
+    /// downstairs from other downstairs.
+    fn remove_dep_if_live_repair(
+        &mut self,
+        deps: &mut Vec<JobId>,
+        ds_id: JobId,
+        repair_min_id: JobId,
+    ) {
+        debug!(
+            self.log,
+            "{} Remove check skipped:{:?} from deps:{:?}",
+            ds_id,
+            self.skipped_jobs,
+            deps
+        );
+        assert_eq!(self.state, DsState::LiveRepair);
+
+        deps.retain(|x| !self.skipped_jobs.contains(x));
+
+        // If we are repairing, then there must be a repair_min_id set so we
+        // know where to stop with dependency inclusion.
+        debug!(
+            self.log,
+            "{} Remove check < min repaired:{} from deps:{:?}",
+            ds_id,
+            repair_min_id,
+            deps
+        );
+        deps.retain(|x| x >= &repair_min_id);
+        info!(self.log, "{} final dependency list {:?}", ds_id, deps);
     }
 }
 
@@ -9785,10 +9807,13 @@ async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
         let jobs_checked = ack_list.len();
         let mut gw = up.guest.guest_work.lock().await;
         for ds_id_done in ack_list.iter() {
-            let mut ds = up.downstairs.lock().await;
             debug!(up.log, "up_ds_listen process {}", ds_id_done);
 
-            let (ds_active, ack_state) = ds.multiborrow();
+            let mut ds_guard = up.downstairs.lock().await;
+            // Explicitly borrow the MutexGuard as a &mut Downstairs, so we can
+            // do a split borrow of `ds_active` and `ack_state` simultaneously
+            let ds: &mut Downstairs = &mut ds_guard;
+            let (ds_active, ack_state) = (&mut ds.ds_active, &mut ds.ack_state);
             let done = ds_active.get_mut(ds_id_done).unwrap();
             let ack = ack_state.get_mut(ds_id_done).unwrap();
 
