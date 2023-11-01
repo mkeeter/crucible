@@ -5088,18 +5088,18 @@ impl DownstairsClient {
         job: &DownstairsIO,
         repair_min_id: Option<JobId>,
     ) -> Option<IOop> {
+        let state = self.job_state.get_mut(&job.ds_id).unwrap();
         // If current state is Skipped, then we have nothing to do here.
-        if matches!(self.job_state[&job.ds_id], IOState::Skipped) {
+        if matches!(state, IOState::Skipped) {
             return None;
         }
-        // TODO: get the handle persistently here
 
+        // Otherwise, switch state to InProgress and update counters
         let new_state = IOState::InProgress;
-        let old_state =
-            self.job_state.insert(job.ds_id, new_state.clone()).unwrap();
-        assert_eq!(old_state, IOState::New);
-        self.io_state_count.decr(&old_state);
+        self.io_state_count.decr(state);
         self.io_state_count.incr(&new_state);
+        *state = new_state;
+
         let mut out = job.work.clone();
 
         if self.dependencies_need_cleanup() {
