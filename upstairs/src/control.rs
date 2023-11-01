@@ -137,7 +137,7 @@ async fn upstairs_fill_info(
         repair_needed,
         extents_repaired: extents_repaired.to_vec(),
         extents_confirmed: extents_confirmed.to_vec(),
-        extent_limit: extent_limit.to_vec(),
+        extent_limit: extent_limit.map(|v| v.map(|v| v as usize)).to_vec(),
         live_repair_completed: live_repair_completed.to_vec(),
         live_repair_aborted: live_repair_aborted.to_vec(),
     }))
