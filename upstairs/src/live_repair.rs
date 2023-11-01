@@ -117,12 +117,12 @@ pub async fn check_for_repair(
         // There's no state drift to repair anyway, this read-only Upstairs
         // wouldn't have caused any modifications.
         for cid in ClientId::iter() {
-            if ds.clients[cid].state == DsState::LiveRepairReady {
+            if ds.clients[cid].state == DsStateData::LiveRepairReady {
                 up.ds_transition_with_lock(
                     &mut ds,
                     up_state,
                     cid,
-                    DsState::Active,
+                    DsStateData::Active,
                 );
                 ds.clients[cid].ro_lr_skipped += 1;
             }
@@ -136,13 +136,13 @@ pub async fn check_for_repair(
     let repair = ds
         .clients
         .iter()
-        .filter(|c| c.state == DsState::LiveRepair)
+        .filter(|c| matches!(c.state, DsStateData::LiveRepair { .. }))
         .count();
 
     let repair_ready = ds
         .clients
         .iter()
-        .filter(|c| c.state == DsState::LiveRepairReady)
+        .filter(|c| c.state == DsStateData::LiveRepairReady)
         .count();
 
     if repair_ready == 0 {
@@ -162,7 +162,7 @@ pub async fn check_for_repair(
         // and be requesting for a repair before the repair task has wrapped
         // up the failed repair that this downstairs was part of.  For that
         // situation, let the repair finish and retry this repair request.
-        if ds.repair_min_id.is_some() {
+        if ds.repair_task_is_running {
             warn!(up.log, "Upstairs repair task running, trying again later");
             return RepairCheck::RepairInProgress;
         }
@@ -170,19 +170,19 @@ pub async fn check_for_repair(
         // Move the upstairs that were RR to officially ready.
         // We do this now while we have the lock to avoid having to do all
         // these checks again in live_repair_main
+        let repair_min_id = ds.peek_next_id();
         for cid in ClientId::iter() {
-            if ds.clients[cid].state == DsState::LiveRepairReady {
+            if ds.clients[cid].state == DsStateData::LiveRepairReady {
                 up.ds_transition_with_lock(
                     &mut ds,
                     up_state,
                     cid,
-                    DsState::LiveRepair,
+                    DsStateData::LiveRepair { repair_min_id },
                 );
             }
         }
-
         // This being set indicates a LiveRepair is in progress.
-        ds.repair_min_id = Some(ds.peek_next_id());
+        ds.repair_task_is_running = true;
         drop(ds);
 
         let upc = Arc::clone(up);
@@ -247,15 +247,15 @@ async fn live_repair_main(
     // Verify no extent_limits are Some
     assert!(ds.clients.iter().all(|c| c.extent_limit.is_none()));
     // When we transitioned this downstairs to LiveRepair, it should have set
-    // the minimum for repair, though we will update it again below.
-    assert!(ds.repair_min_id.is_some());
+    // `repair_task_is_running`, but we'll double-check it here.
+    assert!(ds.repair_task_is_running);
 
     for cid in ClientId::iter() {
         match ds.clients[cid].state {
-            DsState::LiveRepair => {
+            DsStateData::LiveRepair { .. } => {
                 repair_downstairs.push(cid);
             }
-            DsState::Active => {
+            DsStateData::Active => {
                 source_downstairs = Some(cid);
             }
             state => {
@@ -289,7 +289,12 @@ async fn live_repair_main(
     // This will have been set initially when we first moved the downstairs
     // to LiveRepair.  Now that the actual repair begins and we will start
     // checking it, set the real minimum ID we will compare with.
-    ds.repair_min_id = Some(ds.peek_next_id());
+    let next_id = ds.peek_next_id();
+    for &cid in &repair_downstairs {
+        let DsStateData::LiveRepair { repair_min_id } = &mut ds.clients[cid].state
+            else { panic!("bad state for live repair"); };
+        *repair_min_id = next_id;
+    }
     drop(ds);
 
     // At this point, the actual repair loop for a downstairs starts.
@@ -330,10 +335,13 @@ async fn live_repair_main(
             // Verify state has been cleared.
             for cid in ClientId::iter() {
                 assert!(ds.clients[cid].extent_limit.is_none());
-                assert!(ds.clients[cid].state != DsState::LiveRepair);
+                assert!(!matches!(
+                    ds.clients[cid].state,
+                    DsStateData::LiveRepair { .. }
+                ));
             }
             // This will not be set until the repair task exits.
-            assert!(ds.repair_min_id.is_some());
+            assert!(ds.repair_task_is_running);
 
             if ds.query_repair_ids(eid) {
                 // There are some reservations we need to clear out.
@@ -408,14 +416,22 @@ async fn live_repair_main(
     if failed_repair {
         for cid in ClientId::iter() {
             assert!(ds.clients[cid].extent_limit.is_none());
-            assert!(ds.clients[cid].state != DsState::LiveRepair);
+            assert!(!matches!(
+                ds.clients[cid].state,
+                DsStateData::LiveRepair { .. }
+            ));
         }
         for &cid in repair_downstairs.iter() {
             ds.clients[cid].live_repair_aborted += 1;
         }
     } else {
         for &cid in repair_downstairs.iter() {
-            up.ds_transition_with_lock(&mut ds, up_state, cid, DsState::Active);
+            up.ds_transition_with_lock(
+                &mut ds,
+                up_state,
+                cid,
+                DsStateData::Active,
+            );
             ds.clients[cid].live_repair_completed += 1;
         }
     }
@@ -724,11 +740,11 @@ fn repair_ds_state_change(
     repair: &[ClientId],
 ) -> bool {
     for &cid in repair.iter() {
-        if ds.clients[cid].state != DsState::LiveRepair {
+        if !matches!(ds.clients[cid].state, DsStateData::LiveRepair { .. }) {
             return true;
         }
     }
-    ds.clients[source].state != DsState::Active
+    ds.clients[source].state != DsStateData::Active
 }
 
 impl Upstairs {
@@ -743,7 +759,7 @@ impl Upstairs {
     ) {
         let mut notify_guest = false;
         for cid in ClientId::iter() {
-            if ds.clients[cid].state == DsState::LiveRepair {
+            if matches!(ds.clients[cid].state, DsStateData::LiveRepair { .. }) {
                 if ds.ds_set_faulted(cid) {
                     notify_guest = true;
                 }
@@ -751,7 +767,7 @@ impl Upstairs {
                     ds,
                     up_state,
                     cid,
-                    DsState::Faulted,
+                    DsStateData::Faulted,
                 );
             }
         }
@@ -792,7 +808,7 @@ impl Upstairs {
             if ds
                 .clients
                 .iter()
-                .filter(|c| c.state == DsState::Faulted)
+                .filter(|c| c.state == DsStateData::Faulted)
                 .count()
                 == 3
             {
@@ -983,7 +999,7 @@ impl Upstairs {
             );
             bail!("Abort repair due to state change in downstairs");
         }
-        assert!(ds.repair_min_id.is_some());
+        assert!(ds.repair_task_is_running);
         assert!(ds.clients.iter().all(|c| c.repair_info.is_none()));
 
         // Update our extent limit to this extent.
@@ -1265,7 +1281,10 @@ impl Upstairs {
             assert_eq!(
                 ds.clients
                     .iter()
-                    .filter(|c| c.state == DsState::LiveRepair)
+                    .filter(|c| matches!(
+                        c.state,
+                        DsStateData::LiveRepair { .. }
+                    ))
                     .count(),
                 0
             );
@@ -1293,9 +1312,9 @@ pub mod repair_test {
         let up = Upstairs::test_default(Some(ddef));
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
             // Give all downstairs a repair address
             up.ds_set_repair_address(cid, "0.0.0.0:1".parse().unwrap())
                 .await;
@@ -1303,10 +1322,17 @@ pub mod repair_test {
 
         // Move our downstairs client fail_id to LiveRepair.
         up.set_active().await.unwrap();
-        up.ds_transition(fail_id, DsState::Faulted).await;
-        up.ds_transition(fail_id, DsState::LiveRepairReady).await;
-        up.ds_transition(fail_id, DsState::LiveRepair).await;
-        up.downstairs.lock().await.repair_min_id = Some(JobId(1000));
+        up.ds_transition(fail_id, DsStateData::Faulted).await;
+        up.ds_transition(fail_id, DsStateData::LiveRepairReady)
+            .await;
+        up.ds_transition(
+            fail_id,
+            DsStateData::LiveRepair {
+                repair_min_id: JobId(1000),
+            },
+        )
+        .await;
+        up.downstairs.lock().await.repair_task_is_running = true;
 
         up
     }
@@ -1475,9 +1501,9 @@ pub mod repair_test {
 
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
         assert_eq!(
             check_for_repair(&up, &dst).await,
@@ -1487,9 +1513,9 @@ pub mod repair_test {
         // No downstairs should change state.
         let ds = up.downstairs.lock().await;
         for cid in ClientId::iter() {
-            assert_eq!(ds.clients[cid].state, DsState::Active);
+            assert_eq!(ds.clients[cid].state, DsStateData::Active);
         }
-        assert!(ds.repair_min_id.is_none())
+        assert!(!ds.repair_task_is_running);
     }
 
     #[tokio::test]
@@ -1504,20 +1530,24 @@ pub mod repair_test {
         let up = Upstairs::test_default(Some(ddef));
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
         assert_eq!(
             check_for_repair(&up, &dst).await,
             RepairCheck::RepairStarted
         );
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::LiveRepair);
-        assert!(ds.repair_min_id.is_some())
+        assert!(matches!(
+            ds.clients[ClientId::new(1)].state,
+            DsStateData::LiveRepair { .. }
+        ));
+        assert!(ds.repair_task_is_running);
     }
 
     #[tokio::test]
@@ -1532,25 +1562,33 @@ pub mod repair_test {
         let up = Upstairs::test_default(Some(ddef));
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(2), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(2), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
+            .await;
+        up.ds_transition(ClientId::new(2), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(2), DsStateData::LiveRepairReady)
             .await;
         assert_eq!(
             check_for_repair(&up, &dst).await,
             RepairCheck::RepairStarted
         );
         let ds = up.downstairs.lock().await;
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Active);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::LiveRepair);
-        assert_eq!(ds.clients[ClientId::new(2)].state, DsState::LiveRepair);
-        assert!(ds.repair_min_id.is_some())
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::Active);
+        assert!(matches!(
+            ds.clients[ClientId::new(1)].state,
+            DsStateData::LiveRepair { .. }
+        ));
+        assert!(matches!(
+            ds.clients[ClientId::new(2)].state,
+            DsStateData::LiveRepair { .. }
+        ));
+        assert!(ds.repair_task_is_running);
     }
 
     #[tokio::test]
@@ -1565,18 +1603,25 @@ pub mod repair_test {
         let up = Upstairs::test_default(Some(ddef));
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair {
+                repair_min_id: JobId(1001),
+            },
+        )
+        .await;
         // Make ds 0 ready for repair.
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(0), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(0), DsStateData::LiveRepairReady)
             .await;
         assert_eq!(
             check_for_repair(&up, &dst).await,
@@ -1595,15 +1640,16 @@ pub mod repair_test {
         let up = Upstairs::test_default(Some(ddef));
         up.set_active().await.unwrap();
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
         let mut ds = up.downstairs.lock().await;
-        ds.repair_min_id = Some(JobId(3));
+        ds.repair_task_is_running = true;
         drop(ds);
 
         assert_eq!(
@@ -1923,7 +1969,10 @@ pub mod repair_test {
         }
 
         assert_eq!(ds.job_state_count(ds_reopen_id).done, 3);
-        assert_eq!(ds.clients[or_ds].state, DsState::LiveRepair);
+        assert!(matches!(
+            ds.clients[or_ds].state,
+            DsStateData::LiveRepair { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1991,7 +2040,7 @@ pub mod repair_test {
         // process_ds_operation should force the downstairs to fail
         assert_eq!(
             up.downstairs.lock().await.clients[err_ds].state,
-            DsState::Faulted
+            DsStateData::Faulted
         );
 
         let my_err = Err(CrucibleError::GenericError("bad".to_string()));
@@ -2112,8 +2161,8 @@ pub mod repair_test {
             assert_eq!(state_count.skipped, 2);
         }
 
-        assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
-        assert_eq!(ds.clients[or_ds].state, DsState::Faulted);
+        assert_eq!(ds.clients[err_ds].state, DsStateData::Faulted);
+        assert_eq!(ds.clients[or_ds].state, DsStateData::Faulted);
     }
 
     #[tokio::test]
@@ -2221,7 +2270,7 @@ pub mod repair_test {
         // fail.
         assert_eq!(
             up.downstairs.lock().await.clients[err_ds].state,
-            DsState::Faulted
+            DsStateData::Faulted
         );
         // When we completed the repair jobs, the repair_extent should
         // have gone ahead and issued the NoOp that should be issued
@@ -2305,8 +2354,8 @@ pub mod repair_test {
             assert_eq!(state_count.skipped, 1);
         }
 
-        assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
-        assert_eq!(ds.clients[or_ds].state, DsState::Faulted);
+        assert_eq!(ds.clients[err_ds].state, DsStateData::Faulted);
+        assert_eq!(ds.clients[or_ds].state, DsStateData::Faulted);
     }
 
     #[tokio::test]
@@ -2461,8 +2510,8 @@ pub mod repair_test {
             assert_eq!(state_count.skipped, 1);
         }
 
-        assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
-        assert_eq!(ds.clients[or_ds].state, DsState::Faulted);
+        assert_eq!(ds.clients[err_ds].state, DsStateData::Faulted);
+        assert_eq!(ds.clients[or_ds].state, DsStateData::Faulted);
     }
 
     #[tokio::test]
@@ -2591,8 +2640,8 @@ pub mod repair_test {
         assert_eq!(state_count.done, 2);
         assert_eq!(state_count.error, 1);
 
-        assert_eq!(ds.clients[err_ds].state, DsState::Faulted);
-        assert_eq!(ds.clients[or_ds].state, DsState::Faulted);
+        assert_eq!(ds.clients[err_ds].state, DsStateData::Faulted);
+        assert_eq!(ds.clients[or_ds].state, DsStateData::Faulted);
     }
 
     #[tokio::test]
@@ -5419,9 +5468,9 @@ pub mod repair_test {
         up.abort_repair_ds(&mut ds, UpState::Active, &ds_done_tx);
         up.abort_repair_extent(&mut gw, &mut ds, eid);
 
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Active);
-        assert_eq!(ds.clients[ClientId::new(1)].state, DsState::Faulted);
-        assert_eq!(ds.clients[ClientId::new(0)].state, DsState::Active);
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::Active);
+        assert_eq!(ds.clients[ClientId::new(1)].state, DsStateData::Faulted);
+        assert_eq!(ds.clients[ClientId::new(0)].state, DsStateData::Active);
 
         // Check all three IOs again, downstairs 1 will be skipped..
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
@@ -5505,8 +5554,10 @@ pub mod repair_test {
         // clear the reserved repair jobs, but not bother to submit them
         // as once a downstairs has failed, it's not doing any more work.
         let up = create_test_upstairs(ClientId::new(1)).await;
-        up.ds_transition(ClientId::new(0), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(2), DsState::Faulted).await;
+        up.ds_transition(ClientId::new(0), DsStateData::Faulted)
+            .await;
+        up.ds_transition(ClientId::new(2), DsStateData::Faulted)
+            .await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         let eid = 0u64;
@@ -5560,15 +5611,15 @@ pub mod repair_test {
         let up = Upstairs::test_default(Some(ddef));
 
         for cid in ClientId::iter() {
-            up.ds_transition(cid, DsState::WaitActive).await;
+            up.ds_transition(cid, DsStateData::WaitActive).await;
             let dsr = RegionMetadata {
                 generation: vec![1, 1, 1, 1],
                 flush_numbers: vec![2, 2, 2, 2],
                 dirty: vec![false, false, false, false],
             };
             up.downstairs.lock().await.clients[cid].region_metadata = Some(dsr);
-            up.ds_transition(cid, DsState::WaitQuorum).await;
-            up.ds_transition(cid, DsState::Active).await;
+            up.ds_transition(cid, DsStateData::WaitQuorum).await;
+            up.ds_transition(cid, DsStateData::Active).await;
         }
 
         up.set_active().await.unwrap();
@@ -5595,17 +5646,22 @@ pub mod repair_test {
                 ds.clients[cid].job_state.insert(job_id, IOState::Done);
             }
         }
+        let repair_min_id = ds.peek_next_id();
         drop(ds);
 
         // Fault the downstairs
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair { repair_min_id },
+        )
+        .await;
 
         let mut ds = up.downstairs.lock().await;
-        ds.repair_min_id = Some(ds.peek_next_id());
+        ds.repair_task_is_running = true;
         drop(ds);
         // New jobs will go -> Skipped for the downstairs in repair.
         submit_three_ios(&up, &ds_done_tx).await;
@@ -5691,16 +5747,21 @@ pub mod repair_test {
                 ds.clients[cid].job_state.insert(job_id, IOState::Done);
             }
         }
+        let repair_min_id = ds.peek_next_id();
 
         drop(ds);
         // Fault the downstairs
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair { repair_min_id },
+        )
+        .await;
         let mut ds = up.downstairs.lock().await;
-        ds.repair_min_id = Some(ds.peek_next_id());
+        ds.repair_task_is_running = true;
         drop(ds);
 
         // New jobs will go -> Skipped for the downstairs in repair.
@@ -5814,17 +5875,21 @@ pub mod repair_test {
                 ds.clients[cid].job_state.insert(job_id, IOState::Done);
             }
         }
-
+        let repair_min_id = ds.peek_next_id();
         drop(ds);
 
         // Fault the downstairs
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair { repair_min_id },
+        )
+        .await;
         let mut ds = up.downstairs.lock().await;
-        ds.repair_min_id = Some(ds.peek_next_id());
+        ds.repair_task_is_running = true;
         drop(ds);
 
         // Put a repair job on the queue.
@@ -5978,16 +6043,21 @@ pub mod repair_test {
         for cid in ClientId::iter() {
             ds.clients[cid].job_state.insert(JobId(1000), IOState::Done);
         }
+        let repair_min_id = ds.peek_next_id();
         drop(ds);
 
         let eid = 0;
 
         // Fault the downstairs
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair { repair_min_id },
+        )
+        .await;
 
         // Simulate what happens when we first start repair
         // on extent 0
@@ -5996,7 +6066,7 @@ pub mod repair_test {
 
         let mut gw = up.guest.guest_work.lock().await;
         let mut ds = up.downstairs.lock().await;
-        ds.repair_min_id = Some(ds.peek_next_id());
+        ds.repair_task_is_running = true;
         ds.clients[ClientId::new(1)].extent_limit = Some(eid);
 
         // Upstairs "guest" work IDs.
@@ -6149,12 +6219,17 @@ pub mod repair_test {
         //
 
         let up = create_test_upstairs(ClientId::new(1)).await;
+        let repair_min_id = up.downstairs.lock().await.peek_next_id();
         // Make downstairs 1 in LiveRepair
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair { repair_min_id },
+        )
+        .await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         let mut ds = up.downstairs.lock().await;
@@ -6262,12 +6337,17 @@ pub mod repair_test {
         // every extent that it touches.
 
         let up = create_test_upstairs(ClientId::new(1)).await;
+        let repair_min_id = up.downstairs.lock().await.peek_next_id();
         // Make downstairs 1 in LiveRepair
-        up.ds_transition(ClientId::new(1), DsState::Faulted).await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepairReady)
+        up.ds_transition(ClientId::new(1), DsStateData::Faulted)
             .await;
-        up.ds_transition(ClientId::new(1), DsState::LiveRepair)
+        up.ds_transition(ClientId::new(1), DsStateData::LiveRepairReady)
             .await;
+        up.ds_transition(
+            ClientId::new(1),
+            DsStateData::LiveRepair { repair_min_id },
+        )
+        .await;
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         let mut ds = up.downstairs.lock().await;
