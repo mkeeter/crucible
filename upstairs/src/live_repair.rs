@@ -124,7 +124,7 @@ pub async fn check_for_repair(
                     up_state,
                     DsStateData::Active,
                 );
-                up.clients[cid].lock().unwrap().ro_lr_skipped += 1;
+                clients[cid].ro_lr_skipped += 1;
             }
         }
 
