@@ -5823,34 +5823,25 @@ pub mod repair_test {
         up.abort_repair_ds(&mut ds, &mut clients, UpState::Active, &ds_done_tx);
         up.abort_repair_extent(&mut gw, &mut ds, &mut clients, eid);
 
-        assert_eq!(
-            up.clients[ClientId::new(0)].lock().unwrap().state,
-            DsStateData::Active
-        );
-        assert_eq!(
-            up.clients[ClientId::new(1)].lock().unwrap().state,
-            DsStateData::Faulted
-        );
-        assert_eq!(
-            up.clients[ClientId::new(0)].lock().unwrap().state,
-            DsStateData::Active
-        );
+        assert_eq!(clients[ClientId::new(0)].state, DsStateData::Active);
+        assert_eq!(clients[ClientId::new(1)].state, DsStateData::Faulted);
+        assert_eq!(clients[ClientId::new(0)].state, DsStateData::Active);
 
         // Check all three IOs again, downstairs 1 will be skipped..
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
         for job in jobs.iter().take(3) {
             assert_eq!(
-                up.clients.job_state(ClientId::new(0), job.ds_id),
-                IOState::New
+                clients[ClientId::new(0)].job_state(job.ds_id),
+                &IOState::New
             );
             assert_eq!(
-                up.clients.job_state(ClientId::new(1), job.ds_id),
-                IOState::Skipped
+                clients[ClientId::new(1)].job_state(job.ds_id),
+                &IOState::Skipped
             );
             assert_eq!(
-                up.clients.job_state(ClientId::new(2), job.ds_id),
-                IOState::New
+                clients[ClientId::new(2)].job_state(job.ds_id),
+                &IOState::New
             );
         }
     }
@@ -5953,16 +5944,16 @@ pub mod repair_test {
 
         for job in jobs.iter().take(3) {
             assert_eq!(
-                up.clients.job_state(ClientId::new(0), job.ds_id),
-                IOState::Skipped
+                clients[ClientId::new(0)].job_state(job.ds_id),
+                &IOState::Skipped
             );
             assert_eq!(
-                up.clients.job_state(ClientId::new(1), job.ds_id),
-                IOState::Skipped
+                clients[ClientId::new(1)].job_state(job.ds_id),
+                &IOState::Skipped
             );
             assert_eq!(
-                up.clients.job_state(ClientId::new(2), job.ds_id),
-                IOState::Skipped
+                clients[ClientId::new(2)].job_state(job.ds_id),
+                &IOState::Skipped
             );
         }
 
@@ -6168,47 +6159,42 @@ pub mod repair_test {
         submit_three_ios(&up, &ds_done_tx).await;
 
         let ds = up.downstairs.lock().await;
-        let DsStateData::LiveRepair { extent_limit, .. } =
-            &mut up.clients[ClientId::new(1)].lock().unwrap().state
-            else { panic!() };
-        *extent_limit = Some(1);
+        {
+            let DsStateData::LiveRepair { extent_limit, .. } =
+                &mut up.clients[ClientId::new(1)].lock().unwrap().state
+                else { panic!() };
+            *extent_limit = Some(1);
+        }
         drop(ds);
 
         // New jobs will go -> Skipped for the downstairs in repair.
         submit_three_ios(&up, &ds_done_tx).await;
 
         let ds = up.downstairs.lock().await;
+        let mut clients = up.clients.lock();
+
         // Good downstairs don't need changes
-        assert!(!up.clients[ClientId::new(0)]
-            .lock()
-            .unwrap()
-            .dependencies_need_cleanup());
-        assert!(!up.clients[ClientId::new(2)]
-            .lock()
-            .unwrap()
-            .dependencies_need_cleanup());
+        assert!(!clients[ClientId::new(0)].dependencies_need_cleanup());
+        assert!(!clients[ClientId::new(2)].dependencies_need_cleanup());
 
         // LiveRepair downstairs might need a change
-        assert!(up.clients[ClientId::new(1)]
-            .lock()
-            .unwrap()
-            .dependencies_need_cleanup());
+        assert!(clients[ClientId::new(1)].dependencies_need_cleanup());
 
         // For the three latest jobs, they should be New as they are IOs that
         // are on an extent we "already repaired".
         for job_id in (1006..1009).map(JobId) {
             // jobs 3,4,5 will be skipped for our LiveRepair downstairs.
             assert_eq!(
-                up.clients.job_state(ClientId::new(0), job_id),
-                IOState::New
+                clients[ClientId::new(0)].job_state(job_id),
+                &IOState::New
             );
             assert_eq!(
-                up.clients.job_state(ClientId::new(1), job_id),
-                IOState::New
+                clients[ClientId::new(1)].job_state(job_id),
+                &IOState::New
             );
             assert_eq!(
-                up.clients.job_state(ClientId::new(2), job_id),
-                IOState::New
+                clients[ClientId::new(2)].job_state(job_id),
+                &IOState::New
             );
         }
 
@@ -6219,9 +6205,7 @@ pub mod repair_test {
         let mut current_deps = job.work.deps().clone();
 
         assert_eq!(current_deps, &[JobId(1005)]);
-        up.clients[ClientId::new(1)]
-            .lock()
-            .unwrap()
+        clients[ClientId::new(1)]
             .remove_dep_if_live_repair(&mut current_deps, JobId(1006));
         assert!(current_deps.is_empty());
 
@@ -6229,9 +6213,7 @@ pub mod repair_test {
         let mut current_deps = job.work.deps().clone();
 
         assert_eq!(current_deps, &[JobId(1006)]);
-        up.clients[ClientId::new(1)]
-            .lock()
-            .unwrap()
+        clients[ClientId::new(1)]
             .remove_dep_if_live_repair(&mut current_deps, JobId(1007));
         assert_eq!(current_deps, &[JobId(1006)]);
 
@@ -6239,9 +6221,7 @@ pub mod repair_test {
         let mut current_deps = job.work.deps().clone();
 
         assert_eq!(current_deps, &[JobId(1007)]);
-        up.clients[ClientId::new(1)]
-            .lock()
-            .unwrap()
+        clients[ClientId::new(1)]
             .remove_dep_if_live_repair(&mut current_deps, JobId(1008));
         assert_eq!(current_deps, &[JobId(1007)]);
     }

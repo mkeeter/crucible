@@ -5035,6 +5035,12 @@ impl DownstairsClient {
         std::mem::swap(&mut job.state, &mut state);
         state
     }
+
+    /// Returns the [`IOState`] for the given job
+    #[cfg(test)]
+    fn job_state(&self, job_id: JobId) -> &IOState {
+        &self.job_state[&job_id].state
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
