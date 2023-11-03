@@ -116,20 +116,22 @@ async fn upstairs_fill_info(
     let api_context = rqctx.context();
 
     let act = api_context.up.active.lock().await.up_state;
-    let ds_state = api_context.up.ds_state_copy().await;
     let up_jobs = api_context.up.guest.guest_work.lock().await.active.len();
     let ds = api_context.up.downstairs.lock().await;
+    let clients = api_context.up.clients.lock();
+    let ds_state = clients.ds_state_copy();
     let ds_jobs = ds.ds_active.len();
     let repair_done = ds.reconcile_repaired;
     let repair_needed = ds.reconcile_repair_needed;
-    let extents_repaired = ds.collect_stats(|c| c.extents_repaired);
-    let extents_confirmed = ds.collect_stats(|c| c.extents_confirmed);
-    let extent_limit = ds.collect_stats(|c| match c.state {
+    let extents_repaired = clients.collect_stats(|c| c.extents_repaired);
+    let extents_confirmed = clients.collect_stats(|c| c.extents_confirmed);
+    let extent_limit = clients.collect_stats(|c| match c.state {
         DsStateData::LiveRepair { extent_limit, .. } => extent_limit,
         _ => None,
     });
-    let live_repair_completed = ds.collect_stats(|c| c.live_repair_completed);
-    let live_repair_aborted = ds.collect_stats(|c| c.live_repair_aborted);
+    let live_repair_completed =
+        clients.collect_stats(|c| c.live_repair_completed);
+    let live_repair_aborted = clients.collect_stats(|c| c.live_repair_aborted);
 
     Ok(HttpResponseOk(UpstairsStats {
         state: act,
@@ -157,12 +159,13 @@ struct DownstairsWork {
 
 async fn build_downstairs_job_list(up: &Arc<Upstairs>) -> Vec<WorkSummary> {
     let ds = up.downstairs.lock().await;
+    let clients = up.clients.lock();
     let mut kvec: Vec<_> = ds.ds_active.keys().cloned().collect();
     kvec.sort_unstable();
 
     let mut jobs = Vec::new();
     for id in kvec.iter() {
-        let work_summary = ds.job_io_summarize(*id);
+        let work_summary = ds.job_io_summarize(*id, &clients);
         jobs.push(work_summary);
     }
     jobs
