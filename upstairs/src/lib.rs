@@ -3276,9 +3276,6 @@ impl Downstairs {
                     // we aren't doing a mutable iteration.
                     retire_check.push(ds_id);
                 } else if *ack.ack_status == AckStatus::NotAcked {
-                    // Awkwardly compute jobs completed, which requires locking
-                    // the other two `DownstairsClient` objects but _not_ the
-                    // one that we already locked in `client` above.
                     let state_count = job.io_state.state_count();
                     let jobs_completed = state_count.done
                         + state_count.skipped
@@ -4831,13 +4828,10 @@ impl DownstairsClient {
     /// responsibility to remove it (typically in bulk by calling `clear()`,
     /// because we're skipping every single in-progress job).
     fn skip_in_progress_job(&mut self, ds_id: JobId) -> bool {
-        let state = &mut self.job_state.get_mut(&ds_id).unwrap().state;
+        let state = &self.job_state.get(&ds_id).unwrap().state;
 
         if matches!(state, IOState::InProgress | IOState::New) {
-            info!(self.log, "change {ds_id} to skipped");
-            self.io_state_count.decr(state);
-            self.io_state_count.incr(&IOState::Skipped);
-            *state = IOState::Skipped;
+            self.set_job_state(ds_id, IOState::Skipped);
             self.skipped_jobs.insert(ds_id);
             true
         } else {
@@ -4862,10 +4856,9 @@ impl DownstairsClient {
                 shared_state: io.io_state.claim_writer(self.client_id),
             },
         );
+        self.io_state_count.incr(&IOState::New);
         assert!(prev.is_none());
 
-        let mut skipped = false;
-        let current = self.state;
         // If a downstairs is faulted or ready for repair, we can move
         // that job directly to IOState::Skipped
         // If a downstairs is in repair, then we need to see if this
@@ -4873,16 +4866,14 @@ impl DownstairsClient {
         // where some are repaired and some are not, then this IO had
         // better have the dependencies already set to reflect the
         // requirement that a repair IO will need to finish first.
-        match current {
+        let skipped = match self.state {
             DsStateData::Faulted
             | DsStateData::Replaced
             | DsStateData::Replacing
             | DsStateData::LiveRepairReady => {
-                self.job_state.get_mut(&io.ds_id).unwrap().state =
-                    IOState::Skipped;
-                self.io_state_count.incr(&IOState::Skipped);
+                self.set_job_state(io.ds_id, IOState::Skipped);
                 self.skipped_jobs.insert(io.ds_id);
-                skipped = true;
+                true
             }
             DsStateData::LiveRepair { extent_limit, .. } => {
                 // Pick the latest repair limit that's relevant for this
@@ -4891,23 +4882,19 @@ impl DownstairsClient {
                 // for which we have reserved a repair job ID.
                 let my_limit = last_repair_job_extent.or(extent_limit);
                 if io.work.send_io_live_repair(my_limit) {
-                    // Leave this IO as New, the downstairs will receive it.
-                    self.io_state_count.incr(&IOState::New);
-                    self.new_jobs.insert(io.ds_id);
+                    false
                 } else {
                     // Move this IO to skipped, we are not ready for
                     // the downstairs to receive it.
-                    self.job_state.get_mut(&io.ds_id).unwrap().state =
-                        IOState::Skipped;
-                    self.io_state_count.incr(&IOState::Skipped);
+                    self.set_job_state(io.ds_id, IOState::Skipped);
                     self.skipped_jobs.insert(io.ds_id);
-                    skipped = true;
+                    true
                 }
             }
-            _ => {
-                self.io_state_count.incr(&IOState::New);
-                self.new_jobs.insert(io.ds_id);
-            }
+            _ => false,
+        };
+        if !skipped {
+            self.new_jobs.insert(io.ds_id);
         }
 
         !skipped
@@ -5035,6 +5022,10 @@ impl DownstairsClient {
     }
 
     /// Changes the state of the given job, returning the old state
+    ///
+    /// This function correctly updates three things: `JobState::state`,
+    /// `JobState::shared_state`, and `self.io_state_count`.  It is unwise to
+    /// mutate them separately!
     fn set_job_state(&mut self, ds_id: JobId, mut state: IOState) -> IOState {
         let job = self.job_state.get_mut(&ds_id).unwrap();
         // incr before decr, in case we're setting the state to the same value
