@@ -3238,6 +3238,7 @@ impl Downstairs {
             }
             job.replay = true;
             client.set_job_state(*ds_id, IOState::New);
+            client.new_jobs.insert(*ds_id);
         }
     }
 
