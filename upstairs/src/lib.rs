@@ -7672,8 +7672,8 @@ impl Upstairs {
         let active = self.active.lock().await;
         let up_state = active.up_state;
         let mut ds = self.downstairs.lock().await;
-        let old_client_id = {
-            // Scope for `self.clients` lock
+
+        let needs_ds_done_tx = {
             let mut clients = self.clients.lock();
 
             // We check all targets first to not only find our current target,
@@ -7766,23 +7766,25 @@ impl Upstairs {
             // we can move forward with the replacement.
             info!(self.log, "{id} replacing old: {old} at {old_client_id}");
             clients[old_client_id].target = Some(new);
-            old_client_id
+
+            let needs_ds_done_tx =
+                ds.ds_set_faulted(&mut clients, old_client_id);
+
+            let client = &mut clients[old_client_id];
+            client.region_metadata = None;
+            self.ds_transition_with_lock(
+                client,
+                up_state,
+                DsStateData::Replacing,
+            );
+            client.replaced += 1;
+
+            needs_ds_done_tx
         };
 
-        // TODO: does ordering matter here?  Could we do this last to avoid
-        // dropping + relocking `self.clients`?
-        if ds.ds_set_faulted(&mut self.clients.lock(), old_client_id) {
+        if needs_ds_done_tx {
             let _ = ds_done_tx.send(()).await;
         }
-
-        let mut client = self.clients[old_client_id].lock().unwrap();
-        client.region_metadata = None;
-        self.ds_transition_with_lock(
-            &mut client,
-            up_state,
-            DsStateData::Replacing,
-        );
-        client.replaced += 1;
 
         Ok(ReplaceResult::Started)
     }
