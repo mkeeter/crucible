@@ -3364,12 +3364,15 @@ impl Downstairs {
         // task is around to tell up_ds_listen() that this job is done, so
         // do that work here.
         if skipped == 3 {
-            warn!(self.log, "job {} skipped on all downstairs", &ds_id);
+            warn!(
+                self.log,
+                "job {} skipped on all downstairs, goes straight to AckReady",
+                &ds_id
+            );
         }
 
         if skipped == 3 || is_write {
             self.ack_state.insert(ds_id, AckStatus::AckReady);
-            info!(self.log, "Enqueue job {} goes straight to AckReady", ds_id);
 
             ds_done_tx.send(()).await.unwrap();
         } else {
