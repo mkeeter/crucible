@@ -4673,9 +4673,9 @@ pub(crate) mod up_test {
         assert!(up.ds_deactivate(ClientId::new(1)).await);
 
         // Report all three DS as missing, which moves them to New
-        up.ds_missing(ClientId::new(0)).await;
-        up.ds_missing(ClientId::new(1)).await;
-        up.ds_missing(ClientId::new(2)).await;
+        up.ds_missing(ClientId::new(0));
+        up.ds_missing(ClientId::new(1));
+        up.ds_missing(ClientId::new(2));
 
         // Verify we have disconnected and can go back to init.
         up.deactivate_transition_check().await;
@@ -4739,9 +4739,9 @@ pub(crate) mod up_test {
         drop(ds);
 
         // Mark all three DS as missing, which moves their state to New
-        up.ds_missing(ClientId::new(0)).await;
-        up.ds_missing(ClientId::new(1)).await;
-        up.ds_missing(ClientId::new(2)).await;
+        up.ds_missing(ClientId::new(0));
+        up.ds_missing(ClientId::new(1));
+        up.ds_missing(ClientId::new(2));
 
         // Verify now we can go back to init.
         up.deactivate_transition_check().await;
