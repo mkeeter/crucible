@@ -3831,7 +3831,7 @@ impl Downstairs {
             return Ok(true);
         }
 
-        let mut job = self
+        let job = self
             .ds_active
             .get_mut(&ds_id)
             .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
