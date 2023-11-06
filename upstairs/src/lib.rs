@@ -4260,11 +4260,6 @@ impl Downstairs {
         self.ds_active.get_extents_for(job.ds_id)
     }
 
-    #[cfg(test)]
-    fn job_state_count(&self, id: JobId) -> WorkCounts {
-        self.ds_active.get(&id).unwrap().io_state.state_count()
-    }
-
     /*
      * Return a summary of this job in the form of the WorkSummary struct.
      */

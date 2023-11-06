@@ -1874,7 +1874,7 @@ pub mod repair_test {
                 panic!("Expected ExtentFlushClose, got: {:?}", x);
             }
         }
-        assert_eq!(ds.job_state_count(ds_close_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
 
         let job = ds.ds_active.get(&ds_repair_id).unwrap();
         match &job.work {
@@ -1883,7 +1883,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(ds.job_state_count(ds_repair_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
 
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
         match &job.work {
@@ -1892,7 +1892,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(ds.job_state_count(ds_noop_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
         match &job.work {
@@ -1901,7 +1901,7 @@ pub mod repair_test {
                 panic!("Expected ExtentLiveReopen, got: {:?}", x);
             }
         }
-        assert_eq!(ds.job_state_count(ds_reopen_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
     }
 
     // Loop over the possible downstairs to be in LiveRepair and
@@ -2040,7 +2040,7 @@ pub mod repair_test {
                 panic!("Expected LiveRepair, got: {:?}", x);
             }
         }
-        assert_eq!(ds.job_state_count(job.ds_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
 
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
         match &job.work {
@@ -2049,7 +2049,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        assert_eq!(ds.job_state_count(ds_noop_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
         match &job.work {
@@ -2059,7 +2059,7 @@ pub mod repair_test {
             }
         }
 
-        assert_eq!(ds.job_state_count(ds_reopen_id).done, 3);
+        assert_eq!(job.io_state.state_count().done, 3);
         assert!(matches!(
             up.clients[or_ds].lock().unwrap().state,
             DsStateData::LiveRepair { .. }
@@ -2199,7 +2199,7 @@ pub mod repair_test {
                 panic!("Expected ExtentFlushClose, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_close_id);
+        let state_count = job.io_state.state_count();
         assert_eq!(state_count.done, 2);
         assert_eq!(state_count.error, 1);
 
@@ -2211,7 +2211,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_repair_id);
+        let state_count = job.io_state.state_count();
         if err_ds == or_ds {
             assert_eq!(state_count.done, 2);
             assert_eq!(state_count.skipped, 1);
@@ -2227,7 +2227,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_noop_id);
+        let state_count = job.io_state.state_count();
         if err_ds == or_ds {
             assert_eq!(state_count.done, 2);
             assert_eq!(state_count.skipped, 1);
@@ -2243,7 +2243,7 @@ pub mod repair_test {
                 panic!("Expected ExtentLiveReopen, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_reopen_id);
+        let state_count = job.io_state.state_count();
         if err_ds == or_ds {
             assert_eq!(state_count.done, 2);
             assert_eq!(state_count.skipped, 1);
@@ -2413,7 +2413,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_repair_id);
+        let state_count = job.io_state.state_count();
         assert_eq!(state_count.done, 2);
         assert_eq!(state_count.error, 1);
 
@@ -2424,7 +2424,7 @@ pub mod repair_test {
                 panic!("Expected LiveNoOp, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_noop_id);
+        let state_count = job.io_state.state_count();
 
         // What we expect changes a little depending on if we will fail two
         // different downstairs or just one.
@@ -2443,7 +2443,7 @@ pub mod repair_test {
                 panic!("Expected ExtentLiveReopen, got: {:?}", x);
             }
         }
-        let state_count = ds.job_state_count(ds_reopen_id);
+        let state_count = job.io_state.state_count();
         if err_ds != or_ds {
             assert_eq!(state_count.done, 1);
             assert_eq!(state_count.skipped, 2);
@@ -2588,7 +2588,7 @@ pub mod repair_test {
 
         // Differences from the usual path start here.
         let job = ds.ds_active.get(&ds_noop_id).unwrap();
-        let state_count = ds.job_state_count(ds_noop_id);
+        let state_count = job.io_state.state_count();
         match &job.work {
             IOop::ExtentLiveNoOp { .. } => {}
             x => {
@@ -2599,7 +2599,7 @@ pub mod repair_test {
         assert_eq!(state_count.error, 1);
 
         let job = ds.ds_active.get(&ds_reopen_id).unwrap();
-        let state_count = ds.job_state_count(ds_reopen_id);
+        let state_count = job.io_state.state_count();
         match &job.work {
             IOop::ExtentLiveReopen { .. } => {}
             x => {
@@ -2748,7 +2748,8 @@ pub mod repair_test {
 
         // All that is different from the normal path is the results from
         // the reopen job, so that is all we need to check here.
-        let state_count = ds.job_state_count(ds_reopen_id);
+        let job = ds.ds_active.get(&ds_reopen_id).unwrap();
+        let state_count = job.io_state.state_count();
         assert_eq!(state_count.done, 2);
         assert_eq!(state_count.error, 1);
 
