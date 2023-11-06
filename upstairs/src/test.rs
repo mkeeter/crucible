@@ -8104,13 +8104,6 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&write_one).unwrap();
-        println!("{:b}", job.io_state.data.load(Ordering::SeqCst));
-        for cid in ClientId::iter() {
-            println!(
-                "{:?}",
-                up.clients[cid].lock().unwrap().job_state(job.ds_id)
-            );
-        }
         assert!(job
             .io_state
             .client_state_matches(ClientId::new(0), &IOState::Skipped));

@@ -4720,12 +4720,6 @@ impl DownstairsClient {
         state
     }
 
-    /// Returns the [`IOState`] for the given job
-    #[cfg(test)]
-    fn job_state(&self, job_id: JobId) -> &IOState {
-        &self.job_state[&job_id].state
-    }
-
     /// Performs a checked state transition
     ///
     /// If the transition is valid, sets [`self.state`] and returns `Ok(())`;

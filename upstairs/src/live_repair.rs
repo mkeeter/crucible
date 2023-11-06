@@ -5829,18 +5829,15 @@ pub mod repair_test {
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
         for job in jobs.iter().take(3) {
-            assert_eq!(
-                clients[ClientId::new(0)].job_state(job.ds_id),
-                &IOState::New
-            );
-            assert_eq!(
-                clients[ClientId::new(1)].job_state(job.ds_id),
-                &IOState::Skipped
-            );
-            assert_eq!(
-                clients[ClientId::new(2)].job_state(job.ds_id),
-                &IOState::New
-            );
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(0), &IOState::New));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(1), &IOState::Skipped));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(2), &IOState::New));
         }
     }
 
@@ -5938,18 +5935,15 @@ pub mod repair_test {
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
         for job in jobs.iter().take(3) {
-            assert_eq!(
-                clients[ClientId::new(0)].job_state(job.ds_id),
-                &IOState::Skipped
-            );
-            assert_eq!(
-                clients[ClientId::new(1)].job_state(job.ds_id),
-                &IOState::Skipped
-            );
-            assert_eq!(
-                clients[ClientId::new(2)].job_state(job.ds_id),
-                &IOState::Skipped
-            );
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(0), &IOState::Skipped));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(1), &IOState::Skipped));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(2), &IOState::Skipped));
         }
 
         // No repair jobs should be submitted
@@ -6171,18 +6165,16 @@ pub mod repair_test {
         // are on an extent we "already repaired".
         for job_id in (1006..1009).map(JobId) {
             // jobs 3,4,5 will be skipped for our LiveRepair downstairs.
-            assert_eq!(
-                clients[ClientId::new(0)].job_state(job_id),
-                &IOState::New
-            );
-            assert_eq!(
-                clients[ClientId::new(1)].job_state(job_id),
-                &IOState::New
-            );
-            assert_eq!(
-                clients[ClientId::new(2)].job_state(job_id),
-                &IOState::New
-            );
+            let job = ds.ds_active.get(&job_id).unwrap();
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(0), &IOState::New));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(1), &IOState::New));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(2), &IOState::New));
         }
 
         // Walk the three final jobs, verify that the dependencies will be
