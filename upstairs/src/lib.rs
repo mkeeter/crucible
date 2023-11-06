@@ -3991,7 +3991,12 @@ impl Downstairs {
          */
         let ack = *self.ack_state.get(&ds_id).unwrap();
         if ack == AckStatus::Acked {
-            self.retire_check(ds_id, &mut clients.lock());
+            // Small optimization: only lock the 3x clients if this is a flush,
+            // because `return_check` returns immediately otherwise.
+            let job = self.ds_active.get(&ds_id).unwrap();
+            if matches!(&job.work, IOop::Flush { .. }) {
+                self.retire_check(ds_id, &mut clients.lock());
+            }
         } else if ack == AckStatus::NotAcked {
             // If we reach this then the job probably has errors and
             // hasn't acked back yet. We check for NotAcked so we don't
