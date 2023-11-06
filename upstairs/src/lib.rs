@@ -8764,11 +8764,7 @@ impl AtomicIOState {
     ) -> bool {
         let i = Self::state_bit(client_id, state);
         let v = self.data.load(Ordering::SeqCst);
-        let out = v & (1 << i) != 0;
-        if !out {
-            println!("got v: {v:b}, looking for {client_id} {state:?}");
-        }
-        out
+        v & (1 << i) != 0
     }
 
     fn state_bit(client_id: ClientId, s: &IOState) -> u8 {
