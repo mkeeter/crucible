@@ -1585,7 +1585,7 @@ pub(crate) mod up_test {
     async fn work_read_hash_mismatch_third() {
         // Test that a hash mismatch on the third response will trigger a panic.
         let mut ds = Downstairs::new(csl());
-        let clients = DownstairsClients::new(&ClientMap::new(), &ds.log);
+        let clients = DownstairsClients::new(&ClientMap::new(), false, &ds.log);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
 
         let id = ds.next_id();
@@ -6005,7 +6005,7 @@ pub(crate) mod up_test {
     async fn bad_hash_on_encrypted_read_panic() {
         // Verify that a decryption failure on a read will panic.
         let mut ds = Downstairs::new(csl());
-        let clients = DownstairsClients::new(&ClientMap::new(), &ds.log);
+        let clients = DownstairsClients::new(&ClientMap::new(), false, &ds.log);
         let (ds_done_tx, _ds_done_rx) = mpsc::channel(500);
         let next_id = ds.next_id();
 

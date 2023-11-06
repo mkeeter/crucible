@@ -2910,7 +2910,10 @@ impl Downstairs {
     }
 
     /**
-     * Live repair is over, Clean up any repair related settings.
+     * Live repair is over, clean up any repair related settings.
+     *
+     * The caller should also call `DownstairsClient::end_live_repair` on the
+     * three downstairs clients, which are locked separately.
      */
     fn end_live_repair(&mut self) {
         self.repair_job_ids = BTreeMap::new();
@@ -4639,6 +4642,9 @@ struct DownstairsClient {
      */
     repair_addr: Option<SocketAddr>,
 
+    /// Is this client a member of a read-only volume?
+    read_only: bool,
+
     /**
      * The state of a downstairs connection, based on client ID
      * Ready here indicates it can receive IO.
@@ -4756,11 +4762,13 @@ struct JobState {
 impl DownstairsClient {
     fn new(
         client_id: ClientId,
+        read_only: bool,
         target: Option<SocketAddr>,
         log: Logger,
     ) -> Self {
         Self {
             client_id,
+            read_only,
             uuid: None,
             target,
             repair_addr: None,
@@ -5045,6 +5053,218 @@ impl DownstairsClient {
     fn job_state(&self, job_id: JobId) -> &IOState {
         &self.job_state[&job_id].state
     }
+
+    /// Performs a checked state transition
+    ///
+    /// If the transition is valid, sets [`self.state`] and returns `Ok(())`;
+    /// otherwise, returns an error.
+    fn checked_state_transition(
+        &mut self,
+        up_state: UpState,
+        new_state: DsStateData,
+    ) -> Result<(), CrucibleError> {
+        info!(self.log, "transition from {} to {}", self.state, new_state);
+
+        let old_state = self.state;
+
+        /*
+         * Check that this is a valid transition
+         */
+        match new_state {
+            DsStateData::Replacing => {
+                // A downstairs can be replaced at any time.
+            }
+            DsStateData::Replaced => {
+                if old_state != DsStateData::Replacing {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad state transition: {old_state} -> {new_state}"
+                    )));
+                }
+            }
+            DsStateData::WaitActive => {
+                if old_state == DsStateData::Offline {
+                    if up_state == UpState::Active {
+                        return Err(CrucibleError::GenericError(format!("bad up active state change: {old_state} -> {new_state}")));
+                    }
+                } else if old_state != DsStateData::New
+                    && old_state != DsStateData::Faulted
+                    && old_state != DsStateData::Disconnected
+                {
+                    return Err(CrucibleError::GenericError(format!(
+                        "negotiation failed: {old_state} -> {new_state}"
+                    )));
+                }
+            }
+            DsStateData::WaitQuorum => {
+                if old_state != DsStateData::WaitActive {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad state transition: {old_state} -> {new_state}"
+                    )));
+                }
+            }
+            DsStateData::FailedRepair => {
+                if old_state != DsStateData::WaitActive {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad state transition: {old_state} -> {new_state}"
+                    )));
+                }
+            }
+            DsStateData::Faulted => {
+                match old_state {
+                    DsStateData::Active
+                    | DsStateData::Repair
+                    | DsStateData::LiveRepair { .. }
+                    | DsStateData::LiveRepairReady
+                    | DsStateData::Offline
+                    | DsStateData::Replay => {} /* Okay */
+                    _ => {
+                        return Err(CrucibleError::GenericError(format!(
+                            "bad state transition: {old_state} -> {new_state}"
+                        )));
+                    }
+                }
+            }
+            DsStateData::Repair => {
+                if up_state != UpState::Active {
+                    return Err(CrucibleError::GenericError(format!(
+                        "cannot transition to repair state with \
+                         up_state = {up_state:?}"
+                    )));
+                }
+                if old_state != DsStateData::WaitQuorum {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad old_state for repair: {old_state}"
+                    )));
+                }
+            }
+            DsStateData::Replay => {
+                if up_state != UpState::Active {
+                    return Err(CrucibleError::GenericError(format!(
+                        "cannot transition to replay state with \
+                         up_state = {up_state:?}"
+                    )));
+                }
+                if old_state != DsStateData::Offline {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad old_state for replay: {old_state}"
+                    )));
+                }
+            }
+            DsStateData::Active => {
+                match old_state {
+                    DsStateData::WaitQuorum
+                    | DsStateData::Replay
+                    | DsStateData::Repair
+                    | DsStateData::LiveRepair { .. } => {} // Okay
+
+                    DsStateData::LiveRepairReady if self.read_only => {} // Okay
+
+                    _ => {
+                        return Err(CrucibleError::GenericError(format!(
+                            "bad state transition: {old_state} -> {new_state}"
+                        )));
+                    }
+                }
+                /*
+                 * Make sure repair happened when the upstairs is inactive.
+                 */
+                if old_state == DsStateData::Repair
+                    && up_state == UpState::Active
+                {
+                    return Err(CrucibleError::GenericError(
+                        "cannot have active upstairs during repair".to_owned(),
+                    ));
+                }
+            }
+            DsStateData::Deactivated => {
+                // We only go deactivated if we were actually active, or
+                // somewhere past active.
+                // if deactivate is requested before active, the downstairs
+                // state should just go back to NEW and re-require an
+                // activation.
+                match old_state {
+                    DsStateData::Active
+                    | DsStateData::Replay
+                    | DsStateData::LiveRepair { .. }
+                    | DsStateData::LiveRepairReady
+                    | DsStateData::Repair => {} // Okay
+                    _ => {
+                        return Err(CrucibleError::GenericError(format!(
+                            "bad state transition: {old_state} -> {new_state}"
+                        )));
+                    }
+                }
+            }
+            DsStateData::LiveRepair { .. } => {
+                if old_state != DsStateData::LiveRepairReady {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad state transition: {old_state} -> {new_state}"
+                    )));
+                }
+            }
+            DsStateData::LiveRepairReady => {
+                match old_state {
+                    DsStateData::Faulted | DsStateData::Replaced => {} // Okay
+                    _ => {
+                        return Err(CrucibleError::GenericError(format!(
+                            "bad state transition: {old_state} -> {new_state}"
+                        )));
+                    }
+                }
+            }
+            DsStateData::New => {
+                // Before new, we must have been in
+                // on of these states.
+                match old_state {
+                    DsStateData::Active
+                    | DsStateData::Deactivated
+                    | DsStateData::Faulted => {} // Okay
+                    _ => {
+                        return Err(CrucibleError::GenericError(format!(
+                            "bad state transition: {old_state} -> {new_state}"
+                        )));
+                    }
+                }
+            }
+            DsStateData::Offline => {
+                match old_state {
+                    DsStateData::Active | DsStateData::Replay => {} // Okay
+                    _ => {
+                        return Err(CrucibleError::GenericError(format!(
+                            "bad state transition: {old_state} -> {new_state}"
+                        )));
+                    }
+                }
+            }
+            DsStateData::Disabled => {
+                // A move to Disabled can happen at any time we are talking
+                // to a downstairs.
+            }
+            DsStateData::BadVersion => match old_state {
+                DsStateData::New | DsStateData::Disconnected => {}
+                _ => {
+                    return Err(CrucibleError::GenericError(format!(
+                        "bad state transition: {old_state} -> {new_state}"
+                    )));
+                }
+            },
+            _ => {
+                return Err(CrucibleError::GenericError(format!(
+                    "surprise transition: {old_state} -> {new_state}"
+                )));
+            }
+        }
+
+        if old_state != new_state {
+            info!(self.log, "Transition from {} to {}", old_state, new_state,);
+            self.state = new_state;
+            Ok(())
+        } else {
+            Err(CrucibleError::GenericError(format!(
+                "transition to same state: {new_state}"
+            )))
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -5059,20 +5279,27 @@ impl DownstairsClients {
         self.0.iter()
     }
 
-    fn new(ds_target: &ClientMap<SocketAddr>, log: &Logger) -> Self {
+    fn new(
+        ds_target: &ClientMap<SocketAddr>,
+        read_only: bool,
+        log: &Logger,
+    ) -> Self {
         Self(ClientData([
             std::sync::Mutex::new(DownstairsClient::new(
                 ClientId::new(0),
+                read_only,
                 ds_target.get(&ClientId::new(0)).copied(),
                 log.new(o!("client" => "0")),
             )),
             std::sync::Mutex::new(DownstairsClient::new(
                 ClientId::new(1),
+                read_only,
                 ds_target.get(&ClientId::new(1)).copied(),
                 log.new(o!("client" => "1")),
             )),
             std::sync::Mutex::new(DownstairsClient::new(
                 ClientId::new(2),
+                read_only,
                 ds_target.get(&ClientId::new(2)).copied(),
                 log.new(o!("client" => "2")),
             )),
@@ -5593,7 +5820,8 @@ impl Upstairs {
 
         info!(log, "Crucible stats registered with UUID: {}", uuid);
         let downstairs = Downstairs::new(log.clone());
-        let clients = DownstairsClients::new(&ds_target, &downstairs.log);
+        let clients =
+            DownstairsClients::new(&ds_target, opt.read_only, &downstairs.log);
         Arc::new(Upstairs {
             active: Mutex::new(UpstairsState::default()),
             uuid,
@@ -6483,218 +6711,16 @@ impl Upstairs {
         self.ds_transition_with_lock(&mut client, up_state, new_state);
     }
 
-    /*
-     * This is so we can call a state transition if we already have the
-     * ds lock.  Avoids problems with race conditions where dropping
-     * the lock and getting it allows for state to change.
-     */
     fn ds_transition_with_lock(
         &self,
         client: &mut DownstairsClient,
         up_state: UpState,
         new_state: DsStateData,
     ) {
-        // Try printing the state for all three clients, but don't deadlock if
-        // someone else happens to be holding the client lock.
-        let print_state = |cid| {
-            if client.client_id == cid {
-                client.state.to_string()
-            } else {
-                self.clients[cid]
-                    .try_lock()
-                    .map(|s| s.state.to_string())
-                    .unwrap_or_else(|_| "<locked>".to_owned())
-            }
-        };
-        info!(
-            client.log,
-            "{} ({}) {} {} {} ds_transition to {}",
-            self.uuid,
-            self.session_id,
-            print_state(ClientId::new(0)),
-            print_state(ClientId::new(1)),
-            print_state(ClientId::new(2)),
-            new_state
-        );
-
-        let old_state = client.state;
-
-        /*
-         * Check that this is a valid transition
-         */
-        match new_state {
-            DsStateData::Replacing => {
-                // A downstairs can be replaced at any time.
-            }
-            DsStateData::Replaced => {
-                assert_eq!(old_state, DsStateData::Replacing);
-            }
-            DsStateData::WaitActive => {
-                if old_state == DsStateData::Offline {
-                    if up_state == UpState::Active {
-                        panic!(
-                            "[{}] {} Bad up active state change {} -> {}",
-                            client.client_id, self.uuid, old_state, new_state,
-                        );
-                    }
-                } else if old_state != DsStateData::New
-                    && old_state != DsStateData::Faulted
-                    && old_state != DsStateData::Disconnected
-                {
-                    panic!(
-                        "[{}] {} {:#?} Negotiation failed, {:?} -> {:?}",
-                        client.client_id,
-                        self.uuid,
-                        up_state,
-                        old_state,
-                        new_state,
-                    );
-                }
-            }
-            DsStateData::WaitQuorum => {
-                assert_eq!(old_state, DsStateData::WaitActive);
-            }
-            DsStateData::FailedRepair => {
-                assert_eq!(old_state, DsStateData::Repair);
-            }
-            DsStateData::Faulted => {
-                match old_state {
-                    DsStateData::Active
-                    | DsStateData::Repair
-                    | DsStateData::LiveRepair { .. }
-                    | DsStateData::LiveRepairReady
-                    | DsStateData::Offline
-                    | DsStateData::Replay => {} /* Okay */
-                    _ => {
-                        panic!(
-                            "[{}] {} Invalid transition: {:?} -> {:?}",
-                            client.client_id, self.uuid, old_state, new_state
-                        );
-                    }
-                }
-            }
-            DsStateData::Repair => {
-                assert_ne!(up_state, UpState::Active);
-                assert_eq!(old_state, DsStateData::WaitQuorum);
-            }
-            DsStateData::Replay => {
-                assert_eq!(old_state, DsStateData::Offline);
-                assert_eq!(up_state, UpState::Active);
-            }
-            DsStateData::Active => {
-                match old_state {
-                    DsStateData::WaitQuorum
-                    | DsStateData::Replay
-                    | DsStateData::Repair
-                    | DsStateData::LiveRepair { .. } => {} // Okay
-
-                    DsStateData::LiveRepairReady if self.read_only => {} // Okay
-
-                    _ => {
-                        panic!(
-                            "[{}] {} Invalid transition: {:?} -> {:?}",
-                            client.client_id, self.uuid, old_state, new_state
-                        );
-                    }
-                }
-                /*
-                 * Make sure repair happened when the upstairs is inactive.
-                 */
-                if old_state == DsStateData::Repair {
-                    assert_ne!(up_state, UpState::Active);
-                }
-            }
-            DsStateData::Deactivated => {
-                // We only go deactivated if we were actually active, or
-                // somewhere past active.
-                // if deactivate is requested before active, the downstairs
-                // state should just go back to NEW and re-require an
-                // activation.
-                match old_state {
-                    DsStateData::Active
-                    | DsStateData::Replay
-                    | DsStateData::LiveRepair { .. }
-                    | DsStateData::LiveRepairReady
-                    | DsStateData::Repair => {} // Okay
-                    _ => {
-                        panic!(
-                            "[{}] {} Invalid transition: {:?} -> {:?}",
-                            client.client_id, self.uuid, old_state, new_state
-                        );
-                    }
-                }
-            }
-            DsStateData::LiveRepair { .. } => {
-                assert_eq!(old_state, DsStateData::LiveRepairReady);
-            }
-            DsStateData::LiveRepairReady => {
-                match old_state {
-                    DsStateData::Faulted | DsStateData::Replaced => {} // Okay
-                    _ => {
-                        panic!(
-                            "[{}] {} Invalid transition: {:?} -> {:?}",
-                            client.client_id, self.uuid, old_state, new_state
-                        );
-                    }
-                }
-            }
-            DsStateData::New => {
-                // Before new, we must have been in
-                // on of these states.
-                match old_state {
-                    DsStateData::Active
-                    | DsStateData::Deactivated
-                    | DsStateData::Faulted => {} // Okay
-                    _ => {
-                        panic!(
-                            "[{}] {} Invalid transition: {:?} -> {:?}",
-                            client.client_id, self.uuid, old_state, new_state
-                        );
-                    }
-                }
-            }
-            DsStateData::Offline => {
-                match old_state {
-                    DsStateData::Active | DsStateData::Replay => {} // Okay
-                    _ => {
-                        panic!(
-                            "[{}] {} Invalid transition: {:?} -> {:?}",
-                            client.client_id, self.uuid, old_state, new_state
-                        );
-                    }
-                }
-            }
-            DsStateData::Disabled => {
-                // A move to Disabled can happen at any time we are talking
-                // to a downstairs.
-            }
-            DsStateData::BadVersion => match old_state {
-                DsStateData::New | DsStateData::Disconnected => {}
-                _ => {
-                    panic!(
-                        "[{}] {} Invalid transition: {:?} -> {:?}",
-                        client.client_id, self.uuid, old_state, new_state
-                    );
-                }
-            },
-            _ => {
-                panic!(
-                    "[{}] Make a check for transition {} to {}",
-                    client.client_id, old_state, new_state
-                );
-            }
-        }
-
-        if old_state != new_state {
-            info!(
-                client.log,
-                "Transition from {} to {}", client.state, new_state,
-            );
-            client.state = new_state;
-        } else {
+        if let Err(e) = client.checked_state_transition(up_state, new_state) {
             panic!(
-                "[{}] transition to same state: {}",
-                client.client_id, new_state
+                "bad [{}] transition for upstairs {}: {e:?}",
+                client.client_id, self.uuid
             );
         }
     }
