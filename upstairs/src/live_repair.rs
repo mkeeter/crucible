@@ -1426,7 +1426,7 @@ pub mod repair_test {
     // Test function to create a downstairs.
     fn create_test_downstairs() -> (Downstairs, DownstairsClients) {
         let ds = Downstairs::new(csl());
-        let clients = DownstairsClients::new(&ClientMap::new(), &ds.log);
+        let clients = DownstairsClients::new(&ClientMap::new(), false, &ds.log);
         for cid in ClientId::iter() {
             clients[cid].lock().unwrap().repair_addr =
                 Some("127.0.0.1:1234".parse().unwrap());
