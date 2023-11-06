@@ -3828,21 +3828,23 @@ impl Downstairs {
         let mut notify_guest = false;
         let deactivate = up_state == UpState::Deactivating;
 
-        let mut client = clients[client_id].lock().unwrap();
-        if client.job_state[&ds_id].state == IOState::Skipped {
-            // This job was already marked as skipped, and at that time
-            // all required action was taken on it.  We can drop any more
-            // processing of it here and return.
-            warn!(client.log, "Dropping already skipped job {}", ds_id);
-            return Ok(true);
-        }
-
         let job = self
             .ds_active
             .get_mut(&ds_id)
             .ok_or_else(|| anyhow!("reqid {} is not active", ds_id))?;
-        let job_state_count = job.io_state.state_count();
-        let mut jobs_completed_ok = job_state_count.completed_ok();
+        if job
+            .io_state
+            .client_state_matches(client_id, &IOState::Skipped)
+        {
+            // This job was already marked as skipped, and at that time
+            // all required action was taken on it.  We can drop any more
+            // processing of it here and return.
+            warn!(
+                self.log,
+                "[{client_id}] Dropping already skipped job {ds_id}"
+            );
+            return Ok(true);
+        }
 
         // Validate integrity hashes and optionally authenticated decryption.
         //
@@ -3872,11 +3874,9 @@ impl Downstairs {
                 } else {
                     // The downstairs sent us this error
                     error!(
-                        client.log,
-                        "DS Reports error {:?} on job {}, {:?} EC",
-                        responses,
-                        ds_id,
-                        job,
+                        self.log,
+                        "[{client_id}] DS Reports error {responses:?} on job \
+                         {ds_id}, {job:?} EC",
                     );
                     // bad responses
                     responses
@@ -3903,11 +3903,9 @@ impl Downstairs {
                 } else {
                     // The downstairs sent us this error
                     error!(
-                        client.log,
-                        "DS Reports error {:?} on job {}, {:?}",
-                        responses,
-                        ds_id,
-                        job,
+                        self.log,
+                        "[{client_id}] DS Reports error {responses:?} on job \
+                         {ds_id}, {job:?}",
                     );
                     // bad responses
                     responses
@@ -3916,15 +3914,15 @@ impl Downstairs {
 
         let new_state = if let Err(ref e) = read_data {
             error!(
-                client.log,
-                "Reports error {:?} on job {}, {:?}", e, ds_id, job,
+                self.log,
+                "[{client_id}] Reports error {e:?} on job {ds_id}, {job:?}",
             );
             IOState::Error(e.clone())
         } else {
-            jobs_completed_ok += 1;
             IOState::Done
         };
 
+        let mut client = clients[client_id].lock().unwrap();
         let old_state = client.set_job_state(ds_id, new_state.clone());
 
         /*
@@ -3932,6 +3930,7 @@ impl Downstairs {
          */
         if old_state != IOState::InProgress {
             // This job is in an unexpected state.
+            // TODO should this be a panic?
             bail!(
                 "[{}] Job completed while not InProgress: {:?}",
                 client.client_id,
@@ -3940,358 +3939,39 @@ impl Downstairs {
         }
 
         if let IOState::Error(e) = new_state {
-            // Some errors can be returned without considering the Downstairs
-            // bad. For example, it's still an error if a snapshot exists
-            // already but we should not increment downstairs_errors and
-            // transition that Downstairs to Failed - that downstairs is still
-            // able to serve IO.
-            match e {
-                CrucibleError::SnapshotExistsAlready(_) => {
-                    // pass
-                }
-                _ => {
-                    match job.work {
-                        // Mark this downstairs as bad if this was a write or flush
-                        // XXX: reconcilation, retries?
-                        // XXX: Errors should be reported to nexus
-                        IOop::Write {
-                            dependencies: _,
-                            writes: _,
-                        }
-                        | IOop::WriteUnwritten {
-                            dependencies: _,
-                            writes: _,
-                        }
-                        | IOop::Flush {
-                            dependencies: _,
-                            flush_number: _,
-                            gen_number: _,
-                            snapshot_details: _,
-                            extent_limit: _,
-                        } => {
-                            client.downstairs_errors += 1;
-                        }
-
-                        // If a repair job errors, mark that downstairs as bad
-                        IOop::ExtentClose {
-                            dependencies: _,
-                            extent: _,
-                        }
-                        | IOop::ExtentFlushClose {
-                            dependencies: _,
-                            extent: _,
-                            flush_number: _,
-                            gen_number: _,
-                            source_downstairs: _,
-                            repair_downstairs: _,
-                        }
-                        | IOop::ExtentLiveRepair {
-                            dependencies: _,
-                            extent: _,
-                            source_downstairs: _,
-                            source_repair_address: _,
-                            repair_downstairs: _,
-                        }
-                        | IOop::ExtentLiveReopen {
-                            dependencies: _,
-                            extent: _,
-                        }
-                        | IOop::ExtentLiveNoOp { dependencies: _ } => {
-                            // TODO: Figure out a plan on how to handle
-                            // errors during repair.  We must invalidate
-                            // any jobs dependent on the repair success as
-                            // well as throw out the whole repair and start
-                            // over as we can no longer trust results from
-                            // the downstairs under repair.
-                            client.downstairs_errors += 1;
-                        }
-
-                        // If a read job fails, we sometimes need to panic.
-                        IOop::Read {
-                            dependencies: _,
-                            requests: _,
-                        } => {
-                            // It's possible we get a read error if the
-                            // downstairs disconnects. However XXX, someone
-                            // should be told about this error.
-                            //
-                            // Some errors, we need to panic on.
-                            match e {
-                                CrucibleError::HashMismatch => {
-                                    panic!(
-                                        "[{}] {} read hash mismatch {:?} {:?}",
-                                        client.client_id, ds_id, e, job
-                                    );
-                                }
-                                CrucibleError::DecryptionError => {
-                                    panic!(
-                                        "[{}] {} read decrypt error {:?} {:?}",
-                                        client.client_id, ds_id, e, job
-                                    );
-                                }
-                                _ => {
-                                    error!(
-                                        client.log,
-                                        "{} read error {:?} {:?}",
-                                        ds_id,
-                                        e,
-                                        job
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Err(e) = client.handle_error(job, e) {
+                panic!("unhandled error on {client_id} {job:?}: {e:?}");
             }
         } else if *self.ack_state.get(&job.ds_id).unwrap() == AckStatus::Acked {
             assert_eq!(new_state, IOState::Done);
-            /*
-             * If this job is already acked, then we don't have much
-             * more to do here.  If it's a flush, then we want to be
-             * sure to update the last flush for this client.
-             */
-            match &job.work {
-                IOop::Flush {
-                    dependencies: _dependencies,
-                    flush_number: _flush_number,
-                    gen_number: _gen_number,
-                    snapshot_details: _,
-                    extent_limit: _,
-                } => {
-                    client.last_flush = ds_id;
-                }
-                IOop::Read {
-                    dependencies: _dependencies,
-                    requests,
-                } => {
-                    /*
-                     * For a read, make sure the data from a previous read
-                     * has the same hash
-                     */
-                    let read_data: Vec<ReadResponse> = read_data.unwrap();
-                    assert!(!read_data.is_empty());
-                    if job.read_response_hashes != read_response_hashes {
-                        // XXX This error needs to go to Nexus
-                        // XXX This will become the "force all downstairs
-                        // to stop and refuse to restart" mode.
-                        let msg = format!(
-                            "[{}] read hash mismatch on id {}\n\
-                            Expected {:x?}\n\
-                            Computed {:x?}\n\
-                            guest_id:{} request:{:?}\n\
-                            job state:{:?}",
-                            client.client_id,
-                            ds_id,
-                            job.read_response_hashes,
-                            read_response_hashes,
-                            job.guest_id,
-                            requests,
-                            job_state_count,
-                        );
-                        if job.replay {
-                            info!(self.log, "REPLAY {}", msg);
-                        } else {
-                            panic!("{}", msg);
-                        }
-                    }
-                }
-                /*
-                 * Write and WriteUnwritten IOs have no action here
-                 * If this job was LiveRepair, we should never get here,
-                 * as those jobs should never be acked before all three
-                 * are done.
-                 */
-                IOop::Write { .. } | IOop::WriteUnwritten { .. } => {}
-                IOop::ExtentClose { .. }
-                | IOop::ExtentFlushClose { .. }
-                | IOop::ExtentLiveRepair { .. }
-                | IOop::ExtentLiveReopen { .. }
-                | IOop::ExtentLiveNoOp { .. } => {
-                    panic!(
-                        "[{}] Bad  job received in process_ds_completion: {:?}",
-                        client.client_id, job
-                    );
-                }
+            if let Err(e) = client.handle_acked_job(
+                job,
+                &read_data.unwrap(),
+                &read_response_hashes,
+            ) {
+                panic!(
+                    "failed to handle acked work for {client_id} {job:?}: {e:?}"
+                );
             }
         } else {
             assert_eq!(new_state, IOState::Done);
             let ack = self.ack_state.get_mut(&job.ds_id).unwrap();
             assert_ne!(*ack.ack_status, AckStatus::Acked);
-
-            let read_data: Vec<ReadResponse> = read_data.unwrap();
-
-            /*
-             * Transition this job from Done to AckReady if enough have
-             * returned ok.
-             */
-            match &job.work {
-                IOop::Read {
-                    dependencies: _dependencies,
-                    requests: _,
-                } => {
-                    assert!(!read_data.is_empty());
-                    assert!(extent_info.is_none());
-                    if jobs_completed_ok == 1 {
-                        assert!(job.data.is_none());
-                        assert!(job.read_response_hashes.is_empty());
-                        job.data = Some(read_data);
-                        job.read_response_hashes = read_response_hashes;
-                        notify_guest = true;
-                        assert_eq!(*ack.ack_status, AckStatus::NotAcked);
-                        *ack.ack_status = AckStatus::AckReady;
-                        debug!(client.log, "Read AckReady {}", job.ds_id);
-                        cdt::up__to__ds__read__done!(|| job.guest_id);
-                    } else {
-                        /*
-                         * If another job has finished already, we can
-                         * compare our read hash to
-                         * that and verify they are the same.
-                         */
-                        debug!(client.log, "Read already AckReady {ds_id}");
-                        if job.read_response_hashes != read_response_hashes {
-                            // XXX This error needs to go to Nexus
-                            // XXX This will become the "force all downstairs
-                            // to stop and refuse to restart" mode.
-                            panic!(
-                                "[{}] read hash mismatch on {} \n\
-                                Expected {:x?}\n\
-                                Computed {:x?}\n\
-                                job: {:?}",
-                                client.client_id,
-                                ds_id,
-                                job.read_response_hashes,
-                                read_response_hashes,
-                                job,
-                            );
-                        }
-                    }
-                }
-                IOop::Write {
-                    dependencies: _,
-                    writes: _,
-                } => {
-                    assert!(read_data.is_empty());
-                    assert!(extent_info.is_none());
-                    if jobs_completed_ok == 2 {
-                        notify_guest = true;
-                        *ack.ack_status = AckStatus::AckReady;
-                        cdt::up__to__ds__write__done!(|| job.guest_id);
-                    }
-                }
-                IOop::WriteUnwritten {
-                    dependencies: _,
-                    writes: _,
-                } => {
-                    assert!(read_data.is_empty());
-                    assert!(extent_info.is_none());
-                    if jobs_completed_ok == 2 {
-                        notify_guest = true;
-                        *ack.ack_status = AckStatus::AckReady;
-                        cdt::up__to__ds__write__unwritten__done!(
-                            || job.guest_id
-                        );
-                    }
-                }
-                IOop::Flush {
-                    dependencies: _dependencies,
-                    flush_number: _flush_number,
-                    gen_number: _gen_number,
-                    snapshot_details,
-                    extent_limit: _,
-                } => {
-                    assert!(read_data.is_empty());
-                    assert!(extent_info.is_none());
-                    /*
-                     * If we are deactivating or have requested a
-                     * snapshot, then we want an ACK from all three
-                     * downstairs, not the usual two.
-                     *
-                     * TODO here for handling the case where one (or two,
-                     * or three! gasp!) downstairs are Offline.
-                     */
-                    let ack_at_num_jobs =
-                        if deactivate || snapshot_details.is_some() {
-                            3
-                        } else {
-                            2
-                        };
-
-                    if jobs_completed_ok == ack_at_num_jobs {
-                        notify_guest = true;
-                        *ack.ack_status = AckStatus::AckReady;
-                        cdt::up__to__ds__flush__done!(|| job.guest_id);
-                        if deactivate {
-                            debug!(client.log, "deactivate flush {ds_id} done");
-                        }
-                    }
-                    client.last_flush = ds_id;
-                }
-                IOop::ExtentClose {
-                    dependencies: _,
-                    extent,
-                } => {
+            let r = client.handle_job(
+                job,
+                ack.ack_status,
+                read_data.unwrap(),
+                extent_info,
+                read_response_hashes,
+                deactivate,
+            );
+            match r {
+                Ok(c) => notify_guest = c,
+                Err(e) => {
                     panic!(
-                        "[{}] job: {:?} Received illegal IOop::ExtentClose {}",
-                        client.client_id, job, extent,
+                        "failed to handle unacked work for \
+                         {client_id} {job:?}: {e:?}"
                     );
-                }
-                IOop::ExtentFlushClose {
-                    dependencies: _,
-                    extent: _,
-                    flush_number: _,
-                    gen_number: _,
-                    source_downstairs: _,
-                    repair_downstairs: _,
-                } => {
-                    assert!(read_data.is_empty());
-                    assert!(extent_info.is_some());
-
-                    let ci = client.repair_info.replace(extent_info.unwrap());
-                    if ci.is_some() {
-                        panic!(
-                            "[{}] Unexpected repair found on insertion: {:?}",
-                            client.client_id, ci
-                        );
-                    }
-
-                    if jobs_completed_ok == 3 {
-                        notify_guest = true;
-                        *ack.ack_status = AckStatus::AckReady;
-                        debug!(client.log, "ExtentFlushClose {ds_id} AckReady");
-                    }
-                }
-                IOop::ExtentLiveRepair {
-                    dependencies: _,
-                    extent: _,
-                    source_downstairs: _,
-                    source_repair_address: _,
-                    repair_downstairs: _,
-                } => {
-                    assert!(read_data.is_empty());
-                    if jobs_completed_ok == 3 {
-                        notify_guest = true;
-                        debug!(client.log, "ExtentLiveRepair AckReady {ds_id}");
-                        *ack.ack_status = AckStatus::AckReady;
-                    }
-                }
-                IOop::ExtentLiveReopen {
-                    dependencies: _,
-                    extent: _,
-                } => {
-                    assert!(read_data.is_empty());
-                    if jobs_completed_ok == 3 {
-                        notify_guest = true;
-                        debug!(client.log, "ExtentLiveReopen AckReady {ds_id}");
-                        *ack.ack_status = AckStatus::AckReady;
-                    }
-                }
-                IOop::ExtentLiveNoOp { dependencies: _ } => {
-                    assert!(read_data.is_empty());
-                    if jobs_completed_ok == 3 {
-                        notify_guest = true;
-                        debug!(client.log, "ExtentLiveNoOp AckReady {ds_id}");
-                        *ack.ack_status = AckStatus::AckReady;
-                    }
                 }
             }
         }
@@ -5264,6 +4944,379 @@ impl DownstairsClient {
                 "transition to same state: {new_state}"
             )))
         }
+    }
+
+    fn handle_error(
+        &mut self,
+        job: &DownstairsIO,
+        e: CrucibleError,
+    ) -> Result<(), CrucibleError> {
+        // Some errors can be returned without considering the Downstairs
+        // bad. For example, it's still an error if a snapshot exists
+        // already but we should not increment downstairs_errors and
+        // transition that Downstairs to Failed - that downstairs is still
+        // able to serve IO.
+        match e {
+            CrucibleError::SnapshotExistsAlready(_) => {
+                // pass
+            }
+            _ => {
+                match job.work {
+                    // Mark this downstairs as bad if this was a write or flush
+                    // XXX: reconcilation, retries?
+                    // XXX: Errors should be reported to nexus
+                    IOop::Write {
+                        dependencies: _,
+                        writes: _,
+                    }
+                    | IOop::WriteUnwritten {
+                        dependencies: _,
+                        writes: _,
+                    }
+                    | IOop::Flush {
+                        dependencies: _,
+                        flush_number: _,
+                        gen_number: _,
+                        snapshot_details: _,
+                        extent_limit: _,
+                    } => {
+                        self.downstairs_errors += 1;
+                    }
+
+                    // If a repair job errors, mark that downstairs as bad
+                    IOop::ExtentClose {
+                        dependencies: _,
+                        extent: _,
+                    }
+                    | IOop::ExtentFlushClose {
+                        dependencies: _,
+                        extent: _,
+                        flush_number: _,
+                        gen_number: _,
+                        source_downstairs: _,
+                        repair_downstairs: _,
+                    }
+                    | IOop::ExtentLiveRepair {
+                        dependencies: _,
+                        extent: _,
+                        source_downstairs: _,
+                        source_repair_address: _,
+                        repair_downstairs: _,
+                    }
+                    | IOop::ExtentLiveReopen {
+                        dependencies: _,
+                        extent: _,
+                    }
+                    | IOop::ExtentLiveNoOp { dependencies: _ } => {
+                        // TODO: Figure out a plan on how to handle
+                        // errors during repair.  We must invalidate
+                        // any jobs dependent on the repair success as
+                        // well as throw out the whole repair and start
+                        // over as we can no longer trust results from
+                        // the downstairs under repair.
+                        self.downstairs_errors += 1;
+                    }
+
+                    // If a read job fails, we sometimes need to panic.
+                    IOop::Read {
+                        dependencies: _,
+                        requests: _,
+                    } => {
+                        // It's possible we get a read error if the
+                        // downstairs disconnects. However XXX, someone
+                        // should be told about this error.
+                        //
+                        // Some errors cannot be handled and must be passed up
+                        match e {
+                            CrucibleError::HashMismatch
+                            | CrucibleError::DecryptionError => {
+                                return Err(e);
+                            }
+                            _ => {
+                                error!(
+                                    self.log,
+                                    "{} read error {:?} {:?}",
+                                    job.ds_id,
+                                    e,
+                                    job
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Called to process a job which has already been acked to the upstairs
+    fn handle_acked_job(
+        &mut self,
+        job: &DownstairsIO,
+        read_data: &[ReadResponse],
+        read_response_hashes: &[Option<u64>],
+    ) -> Result<(), CrucibleError> {
+        /*
+         * If this job is already acked, then we don't have much
+         * more to do here.  If it's a flush, then we want to be
+         * sure to update the last flush for this client.
+         */
+        match &job.work {
+            IOop::Flush {
+                dependencies: _dependencies,
+                flush_number: _flush_number,
+                gen_number: _gen_number,
+                snapshot_details: _,
+                extent_limit: _,
+            } => {
+                self.last_flush = job.ds_id;
+            }
+            IOop::Read {
+                dependencies: _dependencies,
+                requests,
+            } => {
+                /*
+                 * For a read, make sure the data from a previous read
+                 * has the same hash
+                 */
+                assert!(!read_data.is_empty());
+                if job.read_response_hashes != read_response_hashes {
+                    // XXX This error needs to go to Nexus
+                    // XXX This will become the "force all downstairs
+                    // to stop and refuse to restart" mode.
+                    let msg = format!(
+                        "read hash mismatch on id {}\n\
+                         Expected {:x?}\n\
+                         Computed {:x?}\n\
+                         guest_id:{} request:{:?}",
+                        job.ds_id,
+                        job.read_response_hashes,
+                        read_response_hashes,
+                        job.guest_id,
+                        requests,
+                    );
+                    if job.replay {
+                        info!(self.log, "REPLAY {}", msg);
+                    } else {
+                        return Err(CrucibleError::GenericError(msg));
+                    }
+                }
+            }
+            /*
+             * Write and WriteUnwritten IOs have no action here
+             * If this job was LiveRepair, we should never get here,
+             * as those jobs should never be acked before all three
+             * are done.
+             */
+            IOop::Write { .. } | IOop::WriteUnwritten { .. } => {}
+            IOop::ExtentClose { .. }
+            | IOop::ExtentFlushClose { .. }
+            | IOop::ExtentLiveRepair { .. }
+            | IOop::ExtentLiveReopen { .. }
+            | IOop::ExtentLiveNoOp { .. } => {
+                return Err(CrucibleError::GenericError(format!(
+                    "bad job received in handle_acked_job: {job:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles a job that has not yet been acked
+    ///
+    /// Returns a boolean indication whether the guest should be notified, or an
+    /// error if things have gone wrong.
+    ///
+    /// # Panics
+    /// If anything has gone wrong
+    fn handle_job(
+        &mut self,
+        job: &mut DownstairsIO,
+        ack: &mut AckStatus,
+        read_data: Vec<ReadResponse>,
+        extent_info: Option<ExtentInfo>,
+        read_response_hashes: Vec<Option<u64>>,
+        deactivate: bool,
+    ) -> Result<bool, CrucibleError> {
+        /*
+         * Transition this job from Done to AckReady if enough have
+         * returned ok.
+         */
+        let mut notify_guest = false;
+        let job_state_count = job.io_state.state_count();
+        let jobs_completed_ok = job_state_count.completed_ok();
+        match &job.work {
+            IOop::Read {
+                dependencies: _dependencies,
+                requests: _,
+            } => {
+                assert!(!read_data.is_empty());
+                assert!(extent_info.is_none());
+                if jobs_completed_ok == 1 {
+                    assert!(job.data.is_none());
+                    assert!(job.read_response_hashes.is_empty());
+                    job.data = Some(read_data);
+                    job.read_response_hashes = read_response_hashes;
+                    notify_guest = true;
+                    assert_eq!(*ack, AckStatus::NotAcked);
+                    *ack = AckStatus::AckReady;
+                    debug!(self.log, "Read AckReady {}", job.ds_id);
+                    cdt::up__to__ds__read__done!(|| job.guest_id);
+                } else {
+                    /*
+                     * If another job has finished already, we can
+                     * compare our read hash to
+                     * that and verify they are the same.
+                     */
+                    debug!(self.log, "Read already AckReady {}", job.ds_id);
+                    if job.read_response_hashes != read_response_hashes {
+                        // XXX This error needs to go to Nexus
+                        // XXX This will become the "force all downstairs
+                        // to stop and refuse to restart" mode.
+                        error!(
+                            self.log,
+                            "read hash mismatch on id {}\n\
+                            Expected {:x?}\n\
+                            Computed {:x?}\n\
+                            guest_id:{}\n\
+                            job state:{:?}",
+                            job.ds_id,
+                            job.read_response_hashes,
+                            read_response_hashes,
+                            job.guest_id,
+                            job_state_count,
+                        );
+                        return Err(CrucibleError::HashMismatch);
+                    }
+                }
+            }
+            IOop::Write {
+                dependencies: _,
+                writes: _,
+            } => {
+                assert!(read_data.is_empty());
+                assert!(extent_info.is_none());
+                if jobs_completed_ok == 2 {
+                    notify_guest = true;
+                    *ack = AckStatus::AckReady;
+                    cdt::up__to__ds__write__done!(|| job.guest_id);
+                }
+            }
+            IOop::WriteUnwritten {
+                dependencies: _,
+                writes: _,
+            } => {
+                assert!(read_data.is_empty());
+                assert!(extent_info.is_none());
+                if jobs_completed_ok == 2 {
+                    notify_guest = true;
+                    *ack = AckStatus::AckReady;
+                    cdt::up__to__ds__write__unwritten__done!(|| job.guest_id);
+                }
+            }
+            IOop::Flush {
+                dependencies: _dependencies,
+                flush_number: _flush_number,
+                gen_number: _gen_number,
+                snapshot_details,
+                extent_limit: _,
+            } => {
+                assert!(read_data.is_empty());
+                assert!(extent_info.is_none());
+                /*
+                 * If we are deactivating or have requested a
+                 * snapshot, then we want an ACK from all three
+                 * downstairs, not the usual two.
+                 *
+                 * TODO here for handling the case where one (or two,
+                 * or three! gasp!) downstairs are Offline.
+                 */
+                let ack_at_num_jobs =
+                    if deactivate || snapshot_details.is_some() {
+                        3
+                    } else {
+                        2
+                    };
+
+                if jobs_completed_ok == ack_at_num_jobs {
+                    notify_guest = true;
+                    *ack = AckStatus::AckReady;
+                    cdt::up__to__ds__flush__done!(|| job.guest_id);
+                    if deactivate {
+                        debug!(self.log, "deactivate flush {} done", job.ds_id);
+                    }
+                }
+                self.last_flush = job.ds_id;
+            }
+            IOop::ExtentClose {
+                dependencies: _,
+                extent,
+            } => {
+                panic!(
+                    "[{}] job: {:?} Received illegal IOop::ExtentClose {}",
+                    self.client_id, job, extent,
+                );
+            }
+            IOop::ExtentFlushClose {
+                dependencies: _,
+                extent: _,
+                flush_number: _,
+                gen_number: _,
+                source_downstairs: _,
+                repair_downstairs: _,
+            } => {
+                assert!(read_data.is_empty());
+                assert!(extent_info.is_some());
+
+                let ci = self.repair_info.replace(extent_info.unwrap());
+                if ci.is_some() {
+                    panic!(
+                        "[{}] Unexpected repair found on insertion: {:?}",
+                        self.client_id, ci
+                    );
+                }
+
+                if jobs_completed_ok == 3 {
+                    notify_guest = true;
+                    *ack = AckStatus::AckReady;
+                    debug!(self.log, "ExtentFlushClose {} AckReady", job.ds_id);
+                }
+            }
+            IOop::ExtentLiveRepair {
+                dependencies: _,
+                extent: _,
+                source_downstairs: _,
+                source_repair_address: _,
+                repair_downstairs: _,
+            } => {
+                assert!(read_data.is_empty());
+                if jobs_completed_ok == 3 {
+                    notify_guest = true;
+                    debug!(self.log, "ExtentLiveRepair AckReady {}", job.ds_id);
+                    *ack = AckStatus::AckReady;
+                }
+            }
+            IOop::ExtentLiveReopen {
+                dependencies: _,
+                extent: _,
+            } => {
+                assert!(read_data.is_empty());
+                if jobs_completed_ok == 3 {
+                    notify_guest = true;
+                    debug!(self.log, "ExtentLiveReopen AckReady {}", job.ds_id);
+                    *ack = AckStatus::AckReady;
+                }
+            }
+            IOop::ExtentLiveNoOp { dependencies: _ } => {
+                assert!(read_data.is_empty());
+                if jobs_completed_ok == 3 {
+                    notify_guest = true;
+                    debug!(self.log, "ExtentLiveNoOp AckReady {}", job.ds_id);
+                    *ack = AckStatus::AckReady;
+                }
+            }
+        }
+        Ok(notify_guest)
     }
 }
 
@@ -8679,6 +8732,33 @@ impl AtomicIOState {
         }
         wc
     }
+
+    /// Checks whether the job state for the given client matches
+    ///
+    /// Note that errors are not precisely checked, because we only store a
+    /// single bit, not the full error.  In other words, if the job state is an
+    /// error for the given client, any `state` argument that's an
+    /// `IOState::Error(..)` will match it.
+    fn client_state_matches(
+        &self,
+        client_id: ClientId,
+        state: &IOState,
+    ) -> bool {
+        let i = Self::state_bit(state);
+        let v = self.data.load(Ordering::SeqCst);
+        let shift = client_id.get() * 5;
+        v & (1 << (i + shift)) != 0
+    }
+
+    fn state_bit(s: &IOState) -> u8 {
+        match s {
+            IOState::New => 0,
+            IOState::InProgress => 1,
+            IOState::Done => 2,
+            IOState::Skipped => 3,
+            IOState::Error(..) => 4,
+        }
+    }
 }
 
 impl AtomicIOStateWriter {
@@ -8686,13 +8766,7 @@ impl AtomicIOStateWriter {
         let prev = self.data.load(Ordering::SeqCst);
         let shift = self.client_id.get() * 5;
         let mask = 0b11111 << shift;
-        let i = match s {
-            IOState::New => 0,
-            IOState::InProgress => 1,
-            IOState::Done => 2,
-            IOState::Skipped => 3,
-            IOState::Error(..) => 4,
-        };
+        let i = AtomicIOState::state_bit(s);
         assert_eq!((prev & mask).count_ones(), 1);
         let x = (prev & mask) ^ (1 << (i + shift));
         self.data.fetch_xor(x, Ordering::SeqCst);
