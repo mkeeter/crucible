@@ -7475,18 +7475,15 @@ pub(crate) mod up_test {
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&read_id).unwrap();
 
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         drop(ds);
 
@@ -7528,18 +7525,15 @@ pub(crate) mod up_test {
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&read_id).unwrap();
 
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         assert_eq!(
             up.clients[ClientId::new(0)]
@@ -7634,18 +7628,15 @@ pub(crate) mod up_test {
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&read_id).unwrap();
 
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::InProgress
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::InProgress));
 
         assert_eq!(
             up.clients[ClientId::new(0)]
@@ -7719,9 +7710,9 @@ pub(crate) mod up_test {
         let ds = up.downstairs.lock().await;
         for cid in ClientId::iter() {
             let job = ds.ds_active.get(&read_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
             let job = ds.ds_active.get(&write_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
         }
         assert_eq!(
             up.clients[ClientId::new(0)]
@@ -7783,23 +7774,21 @@ pub(crate) mod up_test {
         let ds = up.downstairs.lock().await;
         for cid in ClientId::iter() {
             let job = ds.ds_active.get(&read_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
             let job = ds.ds_active.get(&write_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
         }
         let job = ds.ds_active.get(&write_fail).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Done
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Error(CrucibleError::GenericError("bad".to_string()))
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Done));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
+        assert!(job.io_state.client_state_matches(
+            ClientId::new(2),
+            &IOState::Error(CrucibleError::GenericError("bad".to_string()))
+        ));
 
         // A failed job does not change the skipped count.
         assert_eq!(
@@ -7877,9 +7866,9 @@ pub(crate) mod up_test {
         let ds = up.downstairs.lock().await;
         for cid in ClientId::iter() {
             let job = ds.ds_active.get(&read_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
             let job = ds.ds_active.get(&write_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
         }
         drop(ds);
 
@@ -7928,41 +7917,36 @@ pub(crate) mod up_test {
         for cid in ClientId::iter() {
             // First read, still Done
             let job = ds.ds_active.get(&read_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
             // First write, still Done
             let job = ds.ds_active.get(&write_one).unwrap();
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::Done);
+            assert!(job.io_state.client_state_matches(cid, &IOState::Done));
         }
         // The failing write, done on 0,1
         let job = ds.ds_active.get(&write_fail).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Done
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Done));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
         // The failing write, error on 2
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Error(CrucibleError::GenericError("bad".to_string()))
-        );
+        assert!(job.io_state.client_state_matches(
+            ClientId::new(2),
+            &IOState::Error(CrucibleError::GenericError("bad".to_string()))
+        ));
 
         // The reads that were in progress
         let job = ds.ds_active.get(&read_two).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
 
         assert_eq!(
             up.clients[ClientId::new(0)]
@@ -8025,46 +8009,37 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&write_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         let job = ds.ds_active.get(&read_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         let job = ds.ds_active.get(&flush_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         // Three skipped jobs for downstairs zero
         assert_eq!(
@@ -8129,46 +8104,44 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&write_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::InProgress
-        );
+        println!("{:b}", job.io_state.data.load(Ordering::SeqCst));
+        for cid in ClientId::iter() {
+            println!(
+                "{:?}",
+                up.clients[cid].lock().unwrap().job_state(job.ds_id)
+            );
+        }
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::InProgress));
 
         let job = ds.ds_active.get(&read_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::InProgress
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::InProgress));
 
         let job = ds.ds_active.get(&flush_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::InProgress
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::InProgress));
 
         // Three skipped jobs on downstairs client 0
         assert_eq!(
@@ -8230,32 +8203,26 @@ pub(crate) mod up_test {
         let mut ds = up.downstairs.lock().await;
 
         let job = ds.ds_active.get(&read_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Done));
         let job = ds.ds_active.get(&write_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Done));
         let job = ds.ds_active.get(&flush_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Done));
 
         ds.ack(read_one);
         ds.ack(write_one);
@@ -8324,46 +8291,37 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&write_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
 
         let job = ds.ds_active.get(&read_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
 
         let job = ds.ds_active.get(&flush_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::InProgress
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::InProgress));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
 
         // Skipped jobs added on downstairs client 0
         assert_eq!(
@@ -8416,20 +8374,17 @@ pub(crate) mod up_test {
         let mut ds = up.downstairs.lock().await;
 
         let job = ds.ds_active.get(&read_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
         let job = ds.ds_active.get(&write_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
         let job = ds.ds_active.get(&flush_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Done
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Done));
 
         ds.ack(read_one);
         ds.ack(write_one);
@@ -8504,18 +8459,15 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&read_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
 
         assert_eq!(
             up.clients[ClientId::new(0)]
@@ -8604,18 +8556,15 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&write_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
 
         assert_eq!(
             up.clients[ClientId::new(0)]
@@ -8704,18 +8653,15 @@ pub(crate) mod up_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&flush_one).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::Skipped
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::Skipped));
         for cid in ClientId::iter() {
             assert_eq!(up.clients[cid].lock().unwrap().skipped_jobs.len(), 1);
             assert!(up.clients[cid]

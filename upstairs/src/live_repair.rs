@@ -4131,7 +4131,7 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::New);
+            assert!(job.io_state.client_state_matches(cid, &IOState::New));
         }
         assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
@@ -4211,7 +4211,7 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::New);
+            assert!(job.io_state.client_state_matches(cid, &IOState::New));
         }
         assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
@@ -4283,7 +4283,7 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::New);
+            assert!(job.io_state.client_state_matches(cid, &IOState::New));
         }
         assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
@@ -4378,7 +4378,7 @@ pub mod repair_test {
             }
         }
         for cid in ClientId::iter() {
-            assert_eq!(up.clients.job_state(cid, job.ds_id), IOState::New);
+            assert!(job.io_state.client_state_matches(cid, &IOState::New));
         }
         assert_eq!(*ds.ack_state.get(&job.ds_id).unwrap(), AckStatus::NotAcked);
         assert!(!job.replay);
@@ -5536,18 +5536,15 @@ pub mod repair_test {
         assert!(jobs[1].work.deps().is_empty());
         assert_eq!(jobs[2].work.deps(), &[jobs[0].ds_id, jobs[1].ds_id]);
         // Check that the IOs were skipped on downstairs 1.
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[0].ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[1].ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[2].ds_id),
-            IOState::Skipped
-        );
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(jobs[2]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
     }
 
     #[tokio::test]
@@ -5883,18 +5880,15 @@ pub mod repair_test {
 
         assert_eq!(jobs.len(), 7);
         for job in jobs.iter().take(7) {
-            assert_eq!(
-                up.clients.job_state(ClientId::new(0), job.ds_id),
-                IOState::New
-            );
-            assert_eq!(
-                up.clients.job_state(ClientId::new(1), job.ds_id),
-                IOState::Skipped
-            );
-            assert_eq!(
-                up.clients.job_state(ClientId::new(2), job.ds_id),
-                IOState::New
-            );
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(0), &IOState::New));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(1), &IOState::Skipped));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(2), &IOState::New));
         }
 
         // Verify that the four jobs we added match what should have
@@ -6007,10 +6001,7 @@ pub mod repair_test {
                 up.clients[cid]
                     .lock()
                     .unwrap()
-                    .job_state
-                    .get_mut(&job_id)
-                    .unwrap()
-                    .state = IOState::Done;
+                    .set_job_state(job_id, IOState::Done);
             }
         }
         let repair_min_id = ds.peek_next_id();
@@ -6054,19 +6045,17 @@ pub mod repair_test {
             .unwrap()
             .dependencies_need_cleanup());
         for job_id in (1003..1006).map(JobId) {
+            let job = ds.ds_active.get(&job_id).unwrap();
             // jobs 3,4,5 will be skipped for our LiveRepair downstairs.
-            assert_eq!(
-                up.clients.job_state(ClientId::new(0), job_id),
-                IOState::New
-            );
-            assert_eq!(
-                up.clients.job_state(ClientId::new(1), job_id),
-                IOState::Skipped
-            );
-            assert_eq!(
-                up.clients.job_state(ClientId::new(2), job_id),
-                IOState::New
-            );
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(0), &IOState::New));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(1), &IOState::Skipped));
+            assert!(job
+                .io_state
+                .client_state_matches(ClientId::new(2), &IOState::New));
         }
 
         // Walk the three new jobs, verify that the dependencies will be
@@ -6129,10 +6118,7 @@ pub mod repair_test {
                 up.clients[cid]
                     .lock()
                     .unwrap()
-                    .job_state
-                    .get_mut(&job_id)
-                    .unwrap()
-                    .state = IOState::Done;
+                    .set_job_state(job_id, IOState::Done);
             }
         }
         let repair_min_id = ds.peek_next_id();
@@ -6273,10 +6259,7 @@ pub mod repair_test {
                 up.clients[cid]
                     .lock()
                     .unwrap()
-                    .job_state
-                    .get_mut(&job_id)
-                    .unwrap()
-                    .state = IOState::Done;
+                    .set_job_state(job_id, IOState::Done);
             }
         }
         let repair_min_id = ds.peek_next_id();
@@ -6348,18 +6331,15 @@ pub mod repair_test {
 
         let ds = up.downstairs.lock().await;
         let job = ds.ds_active.get(&JobId(1007)).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         let mut current_deps = job.work.deps().clone();
         assert_eq!(current_deps, &[JobId(1002)]);
@@ -6378,18 +6358,15 @@ pub mod repair_test {
         // the final job of the repair) on both the Active and LiveRepair
         // downstairs, since it masks job 0
         let job = ds.ds_active.get(&JobId(1008)).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         let mut current_deps = job.work.deps().clone();
         assert_eq!(current_deps, &[JobId(1006)]);
@@ -6404,18 +6381,15 @@ pub mod repair_test {
         // This final job depends on everything on Active downstairs, but
         // a smaller subset for the LiveRepair downstairs
         let job = ds.ds_active.get(&JobId(1013)).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         // The last write depends on
         // 1) the final operation on the repair of extent 0
@@ -6472,10 +6446,7 @@ pub mod repair_test {
             up.clients[cid]
                 .lock()
                 .unwrap()
-                .job_state
-                .get_mut(&JobId(1000))
-                .unwrap()
-                .state = IOState::Done;
+                .set_job_state(JobId(1000), IOState::Done);
         }
         let repair_min_id = ds.peek_next_id();
         drop(ds);
@@ -6586,18 +6557,15 @@ pub mod repair_test {
         // This second write after starting a repair should only require the
         // repair job on all downstairs
         let job = ds.ds_active.get(&JobId(1005)).unwrap();
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), job.ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), job.ds_id),
-            IOState::New
-        );
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(job
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         let mut current_deps = job.work.deps().clone();
         assert_eq!(&current_deps, &[JobId(1004)]);
@@ -6721,33 +6689,27 @@ pub mod repair_test {
         // The first job, should have the dependences for the new repair work
         assert_eq!(jobs[0].ds_id, JobId(1004));
         assert_eq!(jobs[0].work.deps(), &[JobId(1003)]);
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), jobs[0].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[0].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), jobs[0].ds_id),
-            IOState::New
-        );
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
-        // The 2nd job should aldo have the dependences for the new repair work
+        // The 2nd job should also have the dependences for the new repair work
         assert_eq!(jobs[1].work.deps(), &[JobId(1003)]);
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), jobs[1].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[1].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), jobs[1].ds_id),
-            IOState::New
-        );
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
     }
 
     #[tokio::test]
@@ -6856,47 +6818,38 @@ pub mod repair_test {
         // The first job should have no dependencies
         assert_eq!(jobs[0].ds_id, JobId(1000));
         assert!(jobs[0].work.deps().is_empty());
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), jobs[0].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[0].ds_id),
-            IOState::Skipped
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), jobs[0].ds_id),
-            IOState::New
-        );
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::Skipped));
+        assert!(jobs[0]
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         assert_eq!(jobs[1].ds_id, JobId(1005));
         assert_eq!(jobs[1].work.deps(), &[JobId(1004)]);
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), jobs[1].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[1].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), jobs[1].ds_id),
-            IOState::New
-        );
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(jobs[1]
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
 
         assert_eq!(jobs[2].ds_id, JobId(1010));
         assert_eq!(jobs[2].work.deps(), &[JobId(1004), JobId(1009)]);
-        assert_eq!(
-            up.clients.job_state(ClientId::new(0), jobs[2].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(1), jobs[2].ds_id),
-            IOState::New
-        );
-        assert_eq!(
-            up.clients.job_state(ClientId::new(2), jobs[2].ds_id),
-            IOState::New
-        );
+        assert!(jobs[2]
+            .io_state
+            .client_state_matches(ClientId::new(0), &IOState::New));
+        assert!(jobs[2]
+            .io_state
+            .client_state_matches(ClientId::new(1), &IOState::New));
+        assert!(jobs[2]
+            .io_state
+            .client_state_matches(ClientId::new(2), &IOState::New));
     }
 }

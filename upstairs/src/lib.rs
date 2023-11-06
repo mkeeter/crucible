@@ -4610,14 +4610,11 @@ impl DownstairsClient {
             return None;
         }
 
-        // Otherwise, switch state to InProgress and update counters
-        let new_state = IOState::InProgress;
-        self.io_state_count.decr(&job.state);
-        self.io_state_count.incr(&new_state);
-        job.state = new_state;
-
         // TODO remove this clone in favor of consuming the IOop?
         let mut out = job.io.clone();
+
+        // Switch state to InProgress and update counters
+        self.set_job_state(ds_id, IOState::InProgress);
 
         if self.dependencies_need_cleanup() {
             match &mut out {
@@ -5381,14 +5378,6 @@ impl DownstairsClients {
             self.0[ClientId::new(1)].lock().unwrap(),
             self.0[ClientId::new(2)].lock().unwrap(),
         ]))
-    }
-
-    /// Returns IO state counters for the given job
-    #[cfg(test)]
-    fn job_state(&self, client_id: ClientId, job_id: JobId) -> IOState {
-        self.0[client_id].lock().unwrap().job_state[&job_id]
-            .state
-            .clone()
     }
 }
 
@@ -8751,7 +8740,11 @@ impl AtomicIOState {
         let i = Self::state_bit(state);
         let v = self.data.load(Ordering::SeqCst);
         let shift = client_id.get() * 5;
-        v & (1 << (i + shift)) != 0
+        let out = v & (1 << (i + shift)) != 0;
+        if !out {
+            println!("got v: {v:b}, looking for {client_id} {state:?}");
+        }
+        out
     }
 
     fn state_bit(s: &IOState) -> u8 {
