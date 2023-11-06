@@ -3187,7 +3187,9 @@ impl Downstairs {
 
             // We don't need to send anything before our last good flush
             if *ds_id <= lf {
-                assert_eq!(IOState::Done, client.job_state[ds_id].state);
+                assert!(job
+                    .io_state
+                    .client_state_matches(client.client_id, &IOState::Done));
                 return;
             }
 
@@ -3198,7 +3200,10 @@ impl Downstairs {
              * to New and no extra work is required.
              * If it's Done, then we need to look further
              */
-            if IOState::Done == client.job_state[ds_id].state {
+            if job
+                .io_state
+                .client_state_matches(client.client_id, &IOState::Done)
+            {
                 /*
                  * If the job is acked, then we are good to go and
                  * we can re-send it downstairs and the upstairs ack
@@ -3401,8 +3406,8 @@ impl Downstairs {
                 io.ds_id,
                 JobState {
                     io: io.work.clone(),
-                    state: IOState::New,
-                    shared_state: io.io_state.claim_writer(cid),
+                    state: io.io_state.claim_writer(cid),
+                    err: None,
                 },
             );
             client.io_state_count.incr(&IOState::New);
@@ -4088,7 +4093,8 @@ impl Downstairs {
                 let client = &mut clients[cid];
                 for id in &retired {
                     let old_job = client.job_state.remove(id).unwrap();
-                    client.io_state_count.decr(&old_job.state);
+                    let old_state = old_job.take_state();
+                    client.io_state_count.decr(&old_state);
                 }
                 // Only keep track of skipped jobs at or above the flush.
                 client.skipped_jobs.retain(|&x| x >= ds_id);
@@ -4428,10 +4434,22 @@ struct DownstairsClient {
 #[derive(Debug)]
 struct JobState {
     io: IOop,
-    state: IOState,
 
-    /// Shared state, used for atomic lookups without locking
-    shared_state: AtomicIOStateWriter,
+    /// Most of the state is shared here
+    state: AtomicIOStateWriter,
+
+    /// If state indicates an error, it is stored here
+    err: Option<CrucibleError>,
+}
+
+impl JobState {
+    /// Consumes the `JobState`, returning an `IOState`
+    ///
+    /// # Panics
+    /// If `self.err` and `self.state` disagree, or `self.state` is invalid
+    fn take_state(mut self) -> IOState {
+        self.state.take(self.err.take())
+    }
 }
 
 impl DownstairsClient {
@@ -4517,7 +4535,7 @@ impl DownstairsClient {
     fn skip_in_progress_job(&mut self, ds_id: JobId) -> bool {
         let state = &self.job_state.get(&ds_id).unwrap().state;
 
-        if matches!(state, IOState::InProgress | IOState::New) {
+        if state.is_in_progress() {
             self.set_job_state(ds_id, IOState::Skipped);
             self.skipped_jobs.insert(ds_id);
             true
@@ -4539,8 +4557,8 @@ impl DownstairsClient {
             io.ds_id,
             JobState {
                 io: io.work.clone(),
-                state: IOState::New,
-                shared_state: io.io_state.claim_writer(self.client_id),
+                state: io.io_state.claim_writer(self.client_id),
+                err: None,
             },
         );
         self.io_state_count.incr(&IOState::New);
@@ -4601,7 +4619,11 @@ impl DownstairsClient {
             return None;
         };
         // If current state is Skipped, then we have nothing to do here.
-        if matches!(job.state, IOState::Skipped) {
+        if job
+            .state
+            .reader()
+            .client_state_matches(self.client_id, &IOState::Skipped)
+        {
             return None;
         }
 
@@ -4707,17 +4729,26 @@ impl DownstairsClient {
 
     /// Changes the state of the given job, returning the old state
     ///
-    /// This function correctly updates three things: `JobState::state`,
-    /// `JobState::shared_state`, and `self.io_state_count`.  It is unwise to
-    /// mutate them separately!
-    fn set_job_state(&mut self, ds_id: JobId, mut state: IOState) -> IOState {
+    /// This function updates three things: `JobState::state`, `JobState::err`,
+    /// and `self.io_state_count`.  It is unwise to mutate them separately!
+    fn set_job_state(&mut self, ds_id: JobId, state: IOState) -> IOState {
         let job = self.job_state.get_mut(&ds_id).unwrap();
-        // incr before decr, in case we're setting the state to the same value
+
+        // Remove the state, leaving it empty
+        let prev_state = job.state.take(job.err.take());
+
+        // Update statistics, being careful to incr before decr in case we're
+        // setting state to the same value as before.
         self.io_state_count.incr(&state);
-        self.io_state_count.decr(&job.state);
-        job.shared_state.set(&state);
-        std::mem::swap(&mut job.state, &mut state);
-        state
+        self.io_state_count.decr(&prev_state);
+
+        // Update our state, including storing the error locally
+        job.state.set(&state);
+        if let IOState::Error(err) = state {
+            job.err = Some(err);
+        }
+
+        prev_state
     }
 
     /// Performs a checked state transition
@@ -6182,7 +6213,7 @@ impl Upstairs {
              */
             for id in ds.ds_active.keys() {
                 let state = &client.job_state[id].state;
-                if state == &IOState::New || state == &IOState::InProgress {
+                if state.is_in_progress() {
                     info!(
                         self.log,
                         "[{}] deactivate job {} not {:?} flush, NO",
@@ -7655,7 +7686,7 @@ impl Upstairs {
             .unwrap_or(false)
         {
             let mut client = self.clients[client_id].lock().unwrap();
-            let IOState::Error(err) = &client.job_state[&ds_id].state else {
+            let Some(err) = &client.job_state[&ds_id].err else {
                 panic!("client IO error went missing");
             };
             if err == &CrucibleError::UpstairsInactive {
@@ -8661,7 +8692,7 @@ impl fmt::Display for IOState {
 /// this type is not `Clone`.
 #[derive(Debug)]
 struct AtomicIOStateWriter {
-    data: Arc<AtomicU32>,
+    data: AtomicIOState,
     client_id: ClientId,
 }
 
@@ -8690,7 +8721,7 @@ impl AtomicIOState {
             panic!("atomic IO writer claimed multiple times!");
         }
         AtomicIOStateWriter {
-            data: self.data.clone(),
+            data: self.clone(),
             client_id,
         }
     }
@@ -8726,36 +8757,103 @@ impl AtomicIOState {
         client_id: ClientId,
         state: &IOState,
     ) -> bool {
-        let i = Self::state_bit(state);
+        let i = Self::state_bit(client_id, state);
         let v = self.data.load(Ordering::SeqCst);
-        let shift = client_id.get() * 5;
-        let out = v & (1 << (i + shift)) != 0;
+        let out = v & (1 << i) != 0;
         if !out {
             println!("got v: {v:b}, looking for {client_id} {state:?}");
         }
         out
     }
 
-    fn state_bit(s: &IOState) -> u8 {
-        match s {
+    fn state_bit(client_id: ClientId, s: &IOState) -> u8 {
+        let b = match s {
             IOState::New => 0,
             IOState::InProgress => 1,
             IOState::Done => 2,
             IOState::Skipped => 3,
             IOState::Error(..) => 4,
-        }
+        };
+        b + client_id.get() * 5
     }
 }
 
 impl AtomicIOStateWriter {
+    /// Returns a mask covering this client's bits
+    fn mask(&self) -> u32 {
+        0b11111 << (self.client_id.get() * 5)
+    }
+
+    /// Sets the given state bit
+    ///
+    /// # Panics
+    /// If the client state is not zeroed before this is called
     fn set(&self, s: &IOState) {
-        let prev = self.data.load(Ordering::SeqCst);
+        let i = AtomicIOState::state_bit(self.client_id, s);
+        let x = 1 << i;
+        let prev = self.data.data.fetch_or(x, Ordering::SeqCst);
+        assert_eq!(prev & self.mask(), 0);
+    }
+
+    /// Takes the state for the given client, leaving it zeroed
+    ///
+    /// # Panics
+    /// If the client state has more than one bit set, `err` is `Some(..)`
+    /// but the state bit is not error, or vice versa
+    fn take(&self, err: Option<CrucibleError>) -> IOState {
         let shift = self.client_id.get() * 5;
         let mask = 0b11111 << shift;
-        let i = AtomicIOState::state_bit(s);
-        assert_eq!((prev & mask).count_ones(), 1);
-        let x = (prev & mask) ^ (1 << (i + shift));
-        self.data.fetch_xor(x, Ordering::SeqCst);
+        let prev = self.data.data.fetch_and(!mask, Ordering::SeqCst);
+        match (prev >> shift) & 0b11111 {
+            0b00001 => {
+                assert!(err.is_none());
+                IOState::New
+            }
+            0b00010 => {
+                assert!(err.is_none());
+                IOState::InProgress
+            }
+            0b00100 => {
+                assert!(err.is_none());
+                IOState::Done
+            }
+            0b01000 => {
+                assert!(err.is_none());
+                IOState::Skipped
+            }
+            0b10000 => IOState::Error(err.unwrap()),
+            i => panic!("invalid state bitfield: {i:05b}"),
+        }
+    }
+
+    fn reader(&self) -> &AtomicIOState {
+        &self.data
+    }
+
+    /// Returns a shifted 5-bit value for this client state
+    fn state(&self) -> u32 {
+        let v = self.data.data.load(Ordering::SeqCst);
+        let shift = self.client_id.get() * 5;
+        (v >> shift) & 0b11111
+    }
+
+    /// Returns true if the state for this client is `New` or `InProgress`
+    fn is_in_progress(&self) -> bool {
+        matches!(self.state(), 0b00001 | 0b00010)
+    }
+}
+
+impl fmt::Display for AtomicIOStateWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self.state() {
+            0b00001 => " New",
+            0b00010 => "Sent",
+            0b00100 => "Done",
+            0b01000 => "Skip",
+            0b10000 => " Err",
+            _ => "<??>",
+        };
+        write!(f, "{s}")
     }
 }
 
