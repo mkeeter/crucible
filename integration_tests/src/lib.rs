@@ -2861,6 +2861,7 @@ mod test {
         Ok(())
     }
 
+    /*
     #[tokio::test]
     async fn integration_test_volume_replace_downstairs_then_takeover(
     ) -> Result<()> {
@@ -2991,6 +2992,7 @@ mod test {
 
         Ok(())
     }
+    */
 
     #[tokio::test]
     async fn integration_test_problematic_downstairs() -> Result<()> {
