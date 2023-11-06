@@ -5402,6 +5402,7 @@ impl<'a> DownstairsClientsGuard<'a> {
     pub fn iter(&self) -> impl Iterator<Item = &DownstairsClient> {
         self.0.iter().map(|c| c as &DownstairsClient)
     }
+
     pub fn iter_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut std::sync::MutexGuard<'a, DownstairsClient>>
@@ -5409,6 +5410,7 @@ impl<'a> DownstairsClientsGuard<'a> {
         self.0.iter_mut()
     }
 
+    /// Maps a function across all three `DownstairsClient`s
     pub fn map_ref<U, F: Fn(&DownstairsClient) -> U>(
         &self,
         f: F,
@@ -5425,6 +5427,7 @@ impl<'a> DownstairsClientsGuard<'a> {
         ]
     }
 
+    /// Collects state counts for all three `DownstairsClient`s
     pub fn io_state_count(&self) -> IOStateCount {
         let d = self.collect_stats(|c| c.io_state_count);
         let f = |g: fn(ClientIOStateCount) -> u32| {
