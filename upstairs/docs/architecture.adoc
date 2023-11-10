@@ -1,0 +1,659 @@
+= Crucible Upstairs Architecture
+Matt Keeter <matt@oxide.computer>
+2023-11-08
+
+--
+
+The Crucible upstairs is implemented as a set of async tasks.  These tasks are
+mostly static, though a few may be spawned at runtime (notably live-repair).
+The tasks communicate through a mix of message-passing and shared data behind
+either synchronous or async locks.  Even when message-passing is used, it is
+often a "doorbell" that wakes a task and tells it to check some mutex-protected
+data structure.
+
+A `BlockOp` request ("job") normally passes through eight tasks:
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant up_listen
+    participant up_ds_listen
+    participant pm_task as pm_task (3×)
+    participant cmd_loop as cmd_loop (3×)
+    participant Downstairs as Downstairs (3×)
+    Guest->>up_listen: guest work
+    up_listen->>cmd_loop: ds_work_tx (doorbell)
+    cmd_loop-->>Downstairs: FramedWrite
+    Downstairs-->>cmd_loop: FramedRead
+    cmd_loop->>pm_task: pm_task_tx
+    pm_task->>up_ds_listen: ds_done_tx (doorbell)
+    up_ds_listen->>Guest: acking guest work, buffer transfers
+```
+
+(Dotted lines are a reminder that the "fast ack" optimization means that writes
+don't wait for the Downstairs; instead, those jobs are marked as ackable right
+away.  Of course, reads and flushes must go Downstairs)
+
+These tasks are mostly manipulating data stored in a single
+`tokio::sync::Mutex<Downstairs>`.  A single job locks that mutex many times:
+
+* 1× in `up_listen` in `process_new_io` -> `submit_*`
+* 3× + 3× in `cmd_loop` -> `io_send`
+  ** The first (3×) lock is amortized if multiple jobs are available at the same
+     time
+* 3× in `process_ds_operation` (called in `pm_task`)
+* 3× + 1× in `up_ds_listen` to ack work to the guest
+  ** The first (3×) lock is amortized if multiple jobs are ackable at the same
+     time
+
+In other words, we have to lock the mutex between 11 and 15 times to process a
+single job.  The locks in `io_send` are particularly troublesome, because
+they're highly contended: all 3× downstairs are trying to send data
+simultaneously, and the lock forces them to take turns.
+
+With this lock contention, splitting the downstairs client work between multiple
+jobs doesn't actually buy us anything.  Running all three `cmd_loop` tasks
+together using `FuturesUnordered` actually showed 1% faster performance in an
+quick (unscientific) benchmark!
+
+--
+== What data is in the system?
+The Crucible upstairs stores a bunch of state, which we can group into a few
+different categories:
+
+* Singleton data
+  ** Upstairs state (`UpstairsState`)
+  ** List of ackable jobs (stored separately, as an optimization to skip
+     iterating over every job and checking if it is ackable)
+  ** Guest work map
+  ** Global live-repair (e.g. assigned job IDs)
+* Per-client data
+  ** Client state (`DsState`)
+  ** Statistics (`IOStateCount`, `downstairs_errors`,
+     `live_repair_completed/aborted`, etc)
+  ** Last flush (as a `JobId`)
+  ** New and skipped jobs
+  ** Live-repair data (extents limit)
+* Per-job data
+  ** Various IDs
+  ** Actual job work (`IOop`)
+  ** Whether the job is ackable
+  ** Whether the job is a replay
+  ** Job data (read response, read response hashes)
+* Per-job + per-client data
+  ** IO state (`IOState`)
+
+I went through and hand-annotated which functions use which data, then wrote a
+Python script to convert it into a per-task table.  Since this table is
+hand-assembled, it may not be 100% correct, but it's at least _mostly_ right.
+
+Variables ending in a `[i]` indicate that only one client's data is being
+accessed; `[*]` indicates that multiple clients' data is used.
+
+[cols="1,1,1,1,1,1"]
+|===
+
+|
+| `up_listen`
+| `up_ds_listen`
+| `pm_task(i)`
+| `cmd_loop(i)`
+| `live_repair_main`
+
+| `Downstairs::ackable_work`
+| R/W
+| R/W
+| R/W
+| --
+| R/W
+
+| `Downstairs::completed`
+| R/W
+| R/W
+| R/W
+| --
+| R/W
+
+| `Downstairs::completed_jobs`
+| R/W
+| R/W
+| R/W
+| --
+| R/W
+
+| `Downstairs::downstairs_errors[i]`
+| --
+| --
+| R/W
+| --
+| --
+
+| `Downstairs::ds_active`
+| R/W
+| R/W
+| R/W
+| R/W
+| R/W
+
+| `Downstairs::ds_last_flush[i]`
+| --
+| --
+| W
+| --
+| --
+
+| `Downstairs::ds_new[*]`
+| R/W
+| --
+| --
+| --
+| R/W
+
+| `Downstairs::ds_new[i]`
+| --
+| --
+| R/W
+| R/W
+| --
+
+| `Downstairs::ds_skipped_jobs[*]`
+| R/W
+| R/W
+| R/W
+| --
+| R/W
+
+| `Downstairs::ds_skipped_jobs[i]`
+| --
+| --
+| --
+| R
+| --
+
+| `Downstairs::ds_state[*]`
+| R/W
+| --
+| R
+| R
+| R/W
+
+| `Downstairs::ds_state[i]`
+| --
+| --
+| R
+| R
+| --
+
+| `Downstairs::extent_limit`
+| --
+| --
+| --
+| --
+| R/W
+
+| `Downstairs::extent_limit[*]`
+| R/W
+| --
+| --
+| --
+| R/W
+
+| `Downstairs::extent_limit[i]`
+| --
+| --
+| R/W
+| --
+| --
+
+| `Downstairs::flow_control[i]`
+| --
+| --
+| --
+| R/W
+| --
+
+| `Downstairs::flush_info`
+| R/W
+| --
+| --
+| --
+| --
+
+| `Downstairs::io_state_count[*]`
+| R/W
+| R/W
+| R/W
+| --
+| R/W
+
+| `Downstairs::io_state_count[i]`
+| --
+| --
+| R/W
+| R/W
+| --
+
+| `Downstairs::live_repair_aborted[*]`
+| --
+| --
+| --
+| --
+| R/W
+
+| `Downstairs::live_repair_completed[*]`
+| --
+| --
+| --
+| --
+| R/W
+
+| `Downstairs::reconcile_current_work`
+| R/W
+| --
+| --
+| R/W
+| --
+
+| `Downstairs::reconcile_repaired`
+| R/W
+| --
+| --
+| --
+| --
+
+| `Downstairs::reconcile_task_list`
+| R/W
+| --
+| --
+| R
+| --
+
+| `Downstairs::region_metadata`
+| R
+| --
+| --
+| --
+| --
+
+| `Downstairs::repair_info[*]`
+| --
+| --
+| --
+| --
+| W
+
+| `Downstairs::repair_info[i]`
+| --
+| --
+| R/W
+| --
+| --
+
+| `Downstairs::repair_job_ids`
+| R/W
+| --
+| --
+| --
+| R/W
+
+| `Downstairs::repair_min_id`
+| R/W
+| --
+| --
+| R
+| R/W
+
+| `Downstairs::ro_lr_skipped`
+| R/W
+| --
+| --
+| --
+| --
+
+| `DownstairsIO::ack_status`
+| R/W
+| R/W
+| R/W
+| --
+| R/W
+
+| `DownstairsIO::data`
+| --
+| R/W
+| R/W
+| --
+| --
+
+| `DownstairsIO::read_response_hashes`
+| --
+| --
+| R/W
+| --
+| --
+
+| `DownstairsIO::replay`
+| --
+| --
+| R
+| --
+| --
+
+| `DownstairsIO::state[*]`
+| R/W
+| R
+| R
+| --
+| R/W
+
+| `DownstairsIO::state[i]`
+| --
+| --
+| R/W
+| R/W
+| --
+
+| `DownstairsIO::work`
+| R
+| R
+| R
+| R
+| R
+
+| `GuestWork::active`
+| R/W
+| R/W
+| --
+| --
+| R/W
+
+| `GuestWork::completed`
+| --
+| R/W
+| --
+| --
+| --
+
+| `ReconcileIO::state[i]`
+| --
+| --
+| --
+| R/W
+| --
+
+| `Upstairs::active`
+| R/W
+| --
+| R
+| R/W
+| R
+|===
+
+
+For details on how this table was made, see `data_usage_table.py` in this
+folder.
+
+== Inter-task signalling
+The diagram above is the happy path of job completion, but there are other
+possibilities!  Here's a map of every inter-task notification that I could find:
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant up_listen
+    participant up_ds_listen
+    participant pm_task as pm_task (3x)
+    participant cmd_loop as cmd_loop (3x)
+    participant live_repair
+    Guest->>up_listen: notify_one
+    up_listen->>up_ds_listen: ds_done_tx (doorbell)
+    up_listen->>cmd_loop: ds_work_tx (doorbell)
+    cmd_loop->>pm_task: pm_task_tx(Message)
+    pm_task->>up_ds_listen: ds_done_tx (doorbell)
+    up_ds_listen->>Guest: req.send_result (oneshot)
+    cmd_loop->>cmd_loop : ds_reconcile_work_tx (doorbell)
+    live_repair->>cmd_loop: ds_work_tx (doorbell)
+    cmd_loop->>up_listen: ds_status_tx(Condition)
+```
+
+== Proposal: Separate client locks
+As shown in the <<_what_data_is_in_the_system,list above>>,
+many pieces of data are per-client.
+
+I experimentally refactored the Upstairs to put that per-client data into a
+separate data structure, i.e. the set of locks became
+
+```rust
+downstairs: Mutex<Downstairs>, // pre-existing, but with much less data
+clients: [Mutex<DownstairsClient>; 3], // new!
+```
+
+Many existing functions can run using only a single client lock; most notably
+`io_send`.  Functions that require access to both the `Downstairs` and
+`DownstairsClient` data can lock both mutexes (taking either a single client
+lock or all three) and run as before.
+
+This is implemented in the
+https://github.com/mkeeter/crucible/tree/per-client-locks[`per_client_locks`]
+branch, and reflects a _significant_ refactoring (`+7039, -4425`).  It could be
+split into smaller PRs; indeed,
+https://github.com/oxidecomputer/crucible/pull/1014[`crucible#1014`] is a
+mechanical step in this direction.
+
+A good chunk of the changes are simply plumbing, e.g. updating `test.rs` to
+accomodate the rearranged data:
+```
+ integration_tests/src/lib.rs |    2 +
+ upstairs/src/ack_state.rs    |  140 +++
+ upstairs/src/active_jobs.rs  |  107 +--
+ upstairs/src/control.rs      |   36 +-
+ upstairs/src/lib.rs          | 4153 +++++++++++++++++++++++++++++++++++++++++++++------------------------------------
+ upstairs/src/live_repair.rs  | 2182 +++++++++++++++++++++++++++----------------
+ upstairs/src/test.rs         | 4844 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++---------------------------------
+```
+
+One of the few tricky parts is maintaining per-client, per-job state.  The
+`Downstairs` frequently checks the state of jobs on all three clients, e.g. to
+decide whether the job is ackable.  To avoid locking the `DownstairsClient` for
+each job state, I used an per-job atomic integer; each client sets a distinct
+set of bits to indicate the job's current state, and the `Downstairs` reads the
+entire value to check state across all three clients.
+
+I see a significant random write performance improvement on this branch for
+large writes:
+
+[cols="1,2,2"]
+|===
+
+|
+| `main` (`3927d8da`)
+| `per-client-locks` (`8c513bd6`)
+
+| 4K
+| 28.1 MiB/s
+| 27.6 MiB/s
+
+| 1M
+| 447 MiB/s
+| 518 MiB/s
+
+| 4M
+| 435 MiB/s
+| 553 MiB/s
+|===
+
+This is tested on a 128 GiB encrypted disk, with 64 KiB extents and 4K blocks,
+using the following `fio` script
+
+```toml
+[global]
+filename=/dev/nvme0n1
+iodepth=25
+ioengine=aio
+time_based
+runtime=60
+numjobs=1
+direct=1
+stonewall=1
+
+[randwrite-4K]
+bs=4K
+rw=randwrite
+
+[randwrite-1M]
+bs=1M
+rw=randwrite
+
+[randwrite-4M]
+bs=4M
+rw=randwrite
+```
+
+== Counter-proposal: One Big Task
+I started this exercise focused on performance, but have left it more concerned
+about correctness: the tangle of tasks interacting with data leaves me nervous
+about the possibility of weird corners cases.
+
+(For example, we often use the pattern of (1) lock `Upstairs::active`,
+(2) lock `Downstairs` (3) release `Upstairs::active`, but **not always**;
+is that a problem?  How do we know whether it's safe or not?)
+
+Many people have been chatting about the "synchronous state machine core, async
+at the edges" pattern for writing async code in Rust, e.g.
+<<_appendix_andrews_async_essay>>.  If we wanted to apply that to our system,
+the first step would be to consolidate into 4x tasks which **own their data**
+(instead of using shared locks):
+
+- `Upstairs::run`: owns the `Upstairs` (which owns the `Downstairs`), performs
+  the work currently done by `up_listen` and `up_ds_listen`
+- `Client::run`: thin wrapper around the TCP connection (to start), equivalent
+  to `pm_task` + `cmd_loop`, but probably doing less work because all the data
+  is over in `Upstairs::run`
+
+Live-repair would still be spawned as a separate task (running
+`live_repair_main`), but would no longer directly access the `Upstairs` or
+`Downstairs` data; instead, it would communicate with the `Upstairs` via
+message-passing.
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant upstairs as Upstairs::run
+    participant client as Client::run (3×)
+    participant Downstairs
+    participant live as live_repair_main
+    Guest->>upstairs: guest work
+    upstairs->>client: job_request_tx
+    client-->>Downstairs: FramedWrite
+    Downstairs-->>client: FramedRead
+    client->>upstairs: job_response_tx
+    upstairs->>Guest: acking guest work, buffer transfers
+    live->>upstairs: Request
+    upstairs->>live: Response
+```
+
+Over time, we could migrate more per-client work and data into `Client::run` as
+<<_proposal_per_client_locks,discussed above>>.  I also expect that we'd want to
+move encryption and decryption into separate tasks, e.g. as the boundaries of
+the system:
+
+```mermaid
+sequenceDiagram
+    participant Guest
+    participant encryption
+    participant upstairs as Upstairs::run
+    participant client as Client::run (3×)
+    participant decryption
+    participant Downstairs
+    Guest->>encryption: guest work
+    encryption->>upstairs: encrypted work
+    upstairs->>client: job_request_tx
+    client->>Downstairs: FramedWrite
+    Downstairs->>decryption: FramedRead
+    decryption->>client: decrypted data
+    client->>upstairs: job_response_tx
+    upstairs->>Guest: acking guest work, buffer transfers
+```
+
+I suspect that this would be an **even more significant refactoring**, because
+it changes basically everything about Crucible's architecture.  However, I'm
+beginning to believe that the advantages would be worth the cost: having a
+synchronous state machine at the core of the Upstairs would make system behavior
+much easier to reason about.
+
+== Appendix: Andrew's async essay
+
+(from
+https://matrix.to/#/!uMMSVUNAgMdoTtyJPR:oxide.computer/$0bgPwXX567N-1COFjHWwcj70ZDaberGJyQ4eSfHQKCo?via=oxide.computer&via=unix.house&via=matrix.org[#oxide-rust])
+
+I think async makes a lot of things easier, and I have introduced really dumb
+bugs with hand rolled state machines. It really depends on what type of code you
+are writing. Many distributed algorithms are designed and documented as state
+machines in the literature and do not flow linearly like contacting multiple
+microservices from a client in order. For those protocols, I think you still end
+up mostly with a hand written state machine and set of callbacks whether
+intentional or not at the beginning. If you think about it up front like that
+and sprinkle in the connection handling and I/O as async that lives around the
+borders of the core, deterministic, testable state machine that is sync and
+purely logic, you probably get the best of all worlds. This style also
+eliminates the temptation, mostly, to use cancel-unsafe parts of async libraries
+like tokio. Ry, myself, and many others have discovered that this way of writing
+code tends to be more straightforward and much easier to test, when the protocol
+fits this style, which it takes experience to recognize. The
+https://github.com/etcd-io/raft[etcd-raft]
+implementation does this to great effect by separating the protocol state
+machine from all I/O and Go has coroutines and async built in! Other highly
+lauded systems like FoundationDB and TigerBeetle also build in this style, with
+TigerBeetle being the most extreme I've seen by also not allocating in the core
+algorithm.
+
+However, because of Cliff's take on async-io being a state machine
+transformation, I tried to think of how you could write this type of code to be
+clearer and more testable, and that's why I experimented with
+https://github.com/oxidecomputer/bog/tree/main[bog] to see if
+having complete control over the async executor could make this easier and pure
+async. TBH, I don't think I succeeded, and that code is nothing more than a
+rough prototype. It also enforced cancellation and structured concurrency to
+help make async rust a touch bit more safe, but the conclusion I think I've come
+to is to pick your battles with async and use it judiciously.
+
+For distributed algorithms, write them to be deterministic and message/callback
+based with an explicit state machine and property based tests them, run them
+through kani, use some symbolic execution, fuzzing, whatever.. Then make all the
+IO async and make it as cancel safe as possible. Using the best executor we can,
+which is tokio currently, and having a library like Rain's cancel safe one is
+the best way to ensure that the async code we do write is as safe as it can be
+within the constraints of rust, which is not going to change. This also allows
+us to use async where it shines, which is I/O in the first place.
+
+On the other hand if you are hand writing clients or sequential/concurrent
+operations that don't require the complexity of a handwritten state machine,
+then just write your code that way. It will almost certainly be much shorter,
+more correct, and easier to read than the alternative.
+
+The hard part is when the case is in between, like LRTQ. I wrote it in callback
+style with async at the edges and all the bugs found after merge were in the
+async code, but I also didn't test that code nearly as much for various reasons.
+The core was rock solid, but it probably took me a lot longer to get there than
+if I had gone full async. The reason was that the protocol is just not that
+complex and is mostly clients pulling data after connection setup.
+
+One other point is that writing distributed algorithms with hand written
+sync/state machine code can be made easier with a good library. Ry and I have
+talked about collaborating on that. In fact I was going to write one, called
+`noio` for "No I/O" when I got distracted by Cliff's talk and wrote bog in that
+time instead. A few days ago I heard this design pattern actually has a cult
+followng called https://sans-io.readthedocs.io/[sans io]. And it's doable in any
+language.
+
+Of course, most of us aren't writing distributed algorithms most of the time,
+but thinking about when we should use async should still be paramount early on
+when designing something and we should think specifically about why. A think
+that can make this easier is to go ahead and lay out the data structures and
+state first and then see how it's manipulated. If it's mostly straight line
+manipulation, do it directly whether that's async or sync. If there are lots of
+events driving it you may want the callback based manual thingy with a large
+select over events / channels. Even if you didn't intend to do things this way,
+you may end up with it, and a bunch of async calls mixed in that don't really
+have to be there. I think the easiest way to end up in that scenario is using
+mutexes at all. That's kind of a digression, but if you don't use mutexes, your
+dependencies on who uses data becomes clearer.
