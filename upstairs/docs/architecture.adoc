@@ -578,7 +578,8 @@ I suspect that this would be an **even more significant refactoring**, because
 it changes basically everything about Crucible's architecture.  However, I'm
 beginning to believe that the advantages would be worth the cost: having a
 synchronous state machine at the core of the Upstairs would make system behavior
-much easier to reason about.
+much easier to reason about, and we could still push heavy workloads (like
+encryption) into separate tasks (either spawned or persistent).
 
 == Appendix: Andrew's async essay
 
