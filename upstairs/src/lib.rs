@@ -1790,6 +1790,65 @@ where
      * for a downstairs connection.
      */
     assert_eq!(negotiated, NegotiationState::Done);
+
+    let up_state = {
+        let active = up.active.lock().await;
+        active.up_state
+    };
+    {
+        let mut ds = up.downstairs.lock().await;
+        let state = ds.ds_state[up_coms.client_id];
+        match state {
+            DsState::Replay => {
+                info!(
+                    up.log,
+                    "[{}] {} Transition from Replay to Active",
+                    up_coms.client_id,
+                    up.uuid,
+                );
+                up.ds_transition_with_lock(
+                    &mut ds,
+                    up_state,
+                    up_coms.client_id,
+                    DsState::Active,
+                );
+            }
+            DsState::WaitQuorum | DsState::Repair => {
+                drop(ds);
+                do_reconcile_work(up, &mut fr, &mut fw, up_coms).await?;
+            }
+            DsState::Replacing => {
+                warn!(
+                    up.log,
+                    "[{}] exits cmd_loop, this downstairs is replacing",
+                    up_coms.client_id
+                );
+                bail!("[{}] exits negotiation, replacing", up_coms.client_id);
+            }
+            DsState::LiveRepairReady => {
+                drop(ds);
+                warn!(
+                    up.log,
+                    "[{}] {} Enter Ready for LiveRepair mode",
+                    up_coms.client_id,
+                    up.uuid
+                );
+            }
+            bad_state => {
+                error!(
+                    up.log,
+                    "[{}] Downstairs in invalid state: {}",
+                    up_coms.client_id,
+                    bad_state,
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                panic!(
+                    "[{}] {} Downstairs in invalid state: {}",
+                    up_coms.client_id, up.uuid, bad_state,
+                );
+            }
+        }
+    }
     cmd_loop(up, fr, fw, up_coms).await
 }
 
@@ -1837,67 +1896,7 @@ where
      * If we are LiveRepairReady, then we wait for the live repair task to
      * discover this and start repairing this downstairs.
      */
-
-    let mut more_work = false;
-    let up_state = {
-        let active = up.active.lock().await;
-        active.up_state
-    };
-    {
-        let mut ds = up.downstairs.lock().await;
-        let state = ds.ds_state[up_coms.client_id];
-        match state {
-            DsState::Replay => {
-                info!(
-                    up.log,
-                    "[{}] {} Transition from Replay to Active",
-                    up_coms.client_id,
-                    up.uuid,
-                );
-                up.ds_transition_with_lock(
-                    &mut ds,
-                    up_state,
-                    up_coms.client_id,
-                    DsState::Active,
-                );
-                more_work = true;
-            }
-            DsState::WaitQuorum | DsState::Repair => {
-                drop(ds);
-                do_reconcile_work(up, &mut fr, &mut fw, up_coms).await?;
-            }
-            DsState::Replacing => {
-                warn!(
-                    up.log,
-                    "[{}] exits cmd_loop, this downstairs is replacing",
-                    up_coms.client_id
-                );
-                bail!("[{}] exits negotiation, replacing", up_coms.client_id);
-            }
-            DsState::LiveRepairReady => {
-                drop(ds);
-                warn!(
-                    up.log,
-                    "[{}] {} Enter Ready for LiveRepair mode",
-                    up_coms.client_id,
-                    up.uuid
-                );
-            }
-            bad_state => {
-                error!(
-                    up.log,
-                    "[{}] Downstairs in invalid state: {}",
-                    up_coms.client_id,
-                    bad_state,
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                panic!(
-                    "[{}] {} Downstairs in invalid state: {}",
-                    up_coms.client_id, up.uuid, bad_state,
-                );
-            }
-        }
-    }
+    let mut more_work = true;
 
     /*
      * To keep things alive, initiate a ping any time we have been idle for
@@ -1910,94 +1909,25 @@ where
     let mut timeout_deadline = deadline_secs(50.0);
     let mut ping_count = 0;
 
-    /*
-     * We create a task that handles messages from the downstairs (usually
-     * a result of a message we sent).  This channel is how this task
-     * communicates that there is a message to handle.
-     */
-    let (pm_task_tx, mut pm_task_rx) =
-        mpsc::channel::<Message>(MAX_ACTIVE_COUNT + 50);
-
     info!(up.log, "[{}] Starts cmd_loop", up_coms.client_id);
-    let pm_task = {
-        let up_c = up.clone();
-        let ds_done_tx = up_coms.ds_done_tx.clone();
-        let client_id = up_coms.client_id;
-
-        tokio::spawn(async move {
-            while let Some(m) = pm_task_rx.recv().await {
-                /*
-                 * TODO: Add a check here to make sure we are
-                 * connected and in the proper state before we
-                 * accept any commands.
-                 *
-                 * XXX Check the return code here and do something
-                 * about it.  If we fail in process_message, we should
-                 * handle it.
-                 */
-                if let Err(e) =
-                    process_message(&up_c, &m, client_id, &ds_done_tx).await
-                {
-                    warn!(
-                        up_c.log,
-                        "[{}] Error processing message: {}", client_id, e
-                    );
-                }
-
-                /*
-                 * We may have faulted this downstairs (after processing
-                 * this IO) or we may have received a request to replace this
-                 * downstairs.  If we have, then we exit this task which will
-                 * tear down this connection and require the downstairs to
-                 * reconnect and eventually go into LiveRepair mode.
-                 */
-                let my_state = up_c.downstairs.lock().await.ds_state[client_id];
-                if my_state == DsState::Faulted
-                    || my_state == DsState::Replacing
-                {
-                    warn!(
-                        up_c.log,
-                        "[{}] will exit pm_task, this downstairs {}",
-                        client_id,
-                        my_state
-                    );
-                    bail!(
-                        "[{}] This downstairs now in {}",
-                        client_id,
-                        my_state
-                    );
-                }
-
-                if up_c.ds_deactivate(client_id).await {
-                    bail!("[{}] exits after deactivation", client_id);
-                }
-            }
-            warn!(up_c.log, "[{}] pm_task rx.recv() is None", client_id);
-            Ok(())
-        })
-    };
-
-    tokio::pin!(pm_task);
     loop {
         tokio::select! {
             /*
              * We set biased so the loop will:
              *
-             * 1. First make sure the pm task is still running.
-             *
-             * 2. Get and look at messages received from the downstairs. Some
+             * 1. Get and look at messages received from the downstairs. Some
              *    messages we can handle right here, but ACKs from messages we
              *    sent are passed on to the pm task.
              *
-             * 3. Send a ping if the timeout has been reached. If the downstairs
+             * 2. Send a ping if the timeout has been reached. If the downstairs
              *    responds, then the #2 select branch will bump the deadlines.
              *
-             * 4. Timeout the downstairs if it has been too long.
+             * 3. Timeout the downstairs if it has been too long.
              *
-             * 5. Check for changes to the work hashmap, and send messages to
+             * 4. Check for changes to the work hashmap, and send messages to
              *    the downstairs if new work is available.
              *
-             * 6. Check for (and possibly send) more work if #5 triggered flow
+             * 5. Check for (and possibly send) more work if #5 triggered flow
              *    control.
              *
              * By handling messages from the downstairs before sending new work,
@@ -2006,10 +1936,6 @@ where
              * new work would result in pings not being sent.
              */
             biased;
-            e = &mut pm_task => {
-                bail!("[{}] client work task ended, {:?}, so we end too",
-                    up_coms.client_id, e);
-            }
             f = fr.next() => {
                 // When the downstairs responds, push the deadlines
                 timeout_deadline = deadline_secs(50.0);
@@ -2040,8 +1966,10 @@ where
                             new_session_id,
                             new_gen,
                         );
-                        up.ds_transition(up_coms.client_id, DsState::Disabled).await;
-                        up.set_inactive(CrucibleError::NoLongerActive).await;
+                        up.ds_transition(up_coms.client_id, DsState::Disabled)
+                            .await;
+                        up.set_inactive(CrucibleError::NoLongerActive)
+                            .await;
 
                         // What if the newly active upstairs has the same UUID?
                         if up.uuid == new_upstairs_id {
@@ -2120,7 +2048,57 @@ where
                         );
                     }
                     Some(m) => {
-                        pm_task_tx.send(m).await?;
+                        /*
+                         * TODO: Add a check here to make sure we are
+                         * connected and in the proper state before we
+                         * accept any commands.
+                         *
+                         * XXX Check the return code here and do something
+                         * about it.  If we fail in process_message, we should
+                         * handle it.
+                         */
+                        if let Err(e) =
+                            process_message(up, &m, up_coms.client_id,
+                                            &up_coms.ds_done_tx).await
+                        {
+                            warn!(
+                                up.log,
+                                "[{}] Error processing message: {}",
+                                up_coms.client_id, e
+                            );
+                        }
+
+                        /*
+                         * We may have faulted this downstairs (after processing
+                         * this IO) or we may have received a request to replace this
+                         * downstairs.  If we have, then we exit this task which will
+                         * tear down this connection and require the downstairs to
+                         * reconnect and eventually go into LiveRepair mode.
+                         */
+                        let my_state = up.downstairs
+                            .lock()
+                            .await
+                            .ds_state[up_coms.client_id];
+                        if my_state == DsState::Faulted
+                            || my_state == DsState::Replacing
+                        {
+                            warn!(
+                                up.log,
+                                "[{}] will exit pm_task, this downstairs {}",
+                                up_coms.client_id,
+                                my_state
+                            );
+                            bail!(
+                                "[{}] This downstairs now in {}",
+                                up_coms.client_id,
+                                my_state
+                            );
+                        }
+
+                        if up.ds_deactivate(up_coms.client_id).await {
+                            bail!("[{}] exits after deactivation",
+                                   up_coms.client_id);
+                        }
                     }
                 }
             }
