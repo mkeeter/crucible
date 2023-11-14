@@ -9611,75 +9611,6 @@ fn send_active(t: &[Target], gen: u64) {
     }
 }
 
-/**
- * We listen on the ds_done channel to know when enough of the downstairs
- * requests for a downstairs work task have finished and it is time to
- * complete any buffer transfers (reads) and then notify the guest that
- * their work has been completed.
- */
-async fn up_ds_listen(up: &Arc<Upstairs>, mut ds_done_rx: mpsc::Receiver<()>) {
-    /*
-     * Accept _any_ ds_done message, but work on the whole list of ackable
-     * work.
-     */
-    while ds_done_rx.recv().await.is_some() {
-        debug!(up.log, "up_ds_listen was notified");
-        /*
-         * XXX Do we need to hold the lock while we process all the
-         * completed jobs?  We should be continuing to send message over
-         * the ds_done_tx channel, so if new things show up while we
-         * process the set of things we know are done now, then the
-         * ds_done_rx.recv() should trigger when we loop.
-         */
-        let ack_list = up.downstairs.lock().await.ackable_work();
-
-        let jobs_checked = ack_list.len();
-        let mut gw = up.guest.guest_work.lock().await;
-        for ds_id_done in ack_list.iter() {
-            let mut ds = up.downstairs.lock().await;
-            debug!(up.log, "up_ds_listen process {}", ds_id_done);
-
-            let mut handle = ds.ds_active.get_mut(ds_id_done).unwrap();
-            let done = handle.job();
-
-            /*
-             * Make sure the job state has not changed since we made the
-             * list.
-             */
-            if done.ack_status != AckStatus::AckReady {
-                info!(
-                    up.log,
-                    "Job {} no longer ready, skip for now", ds_id_done
-                );
-                continue;
-            }
-
-            let gw_id = done.guest_id;
-            let ds_id = done.ds_id;
-            assert_eq!(*ds_id_done, ds_id);
-
-            let io_size = done.io_size();
-            let data = done.data.take();
-            drop(handle);
-
-            ds.ack(ds_id);
-            debug!(ds.log, "[A] ack job {}:{}", ds_id, gw_id);
-
-            gw.gw_ds_complete(gw_id, ds_id, data, ds.result(ds_id), &up.log)
-                .await;
-
-            ds.cdt_gw_work_done(ds_id, gw_id, io_size, &up.stats);
-
-            ds.retire_check(ds_id);
-        }
-        debug!(
-            up.log,
-            "up_ds_listen checked {} jobs, back to waiting", jobs_checked
-        );
-    }
-    warn!(up.log, "up_ds_listen loop done");
-}
-
 /// Check outstanding IOops for each downstairs.
 ///
 /// If the number is too high, then mark that downstairs as failed, scrub
@@ -10089,6 +10020,7 @@ async fn up_listen(
     up: &Arc<Upstairs>,
     dst: Vec<Target>,
     mut ds_status_rx: mpsc::Receiver<Condition>,
+    mut ds_done_rx: mpsc::Receiver<()>,
     mut ds_reconcile_done_rx: mpsc::Receiver<Repair>,
     timeout: Option<f32>,
 ) {
@@ -10173,6 +10105,61 @@ async fn up_listen(
                 // Check how many outstanding downstairs jobs remain in the
                 // queue, and adjust fail any downstairs that's not responding
                 gone_too_long(up, dst[0].ds_done_tx.clone()).await;
+            }
+            _ = ds_done_rx.recv() => {
+                debug!(up.log, "up_ds_listen was notified");
+                /*
+                 * XXX Do we need to hold the lock while we process all the
+                 * completed jobs?  We should be continuing to send message over
+                 * the ds_done_tx channel, so if new things show up while we
+                 * process the set of things we know are done now, then the
+                 * ds_done_rx.recv() should trigger when we loop.
+                 */
+                let ack_list = up.downstairs.lock().await.ackable_work();
+
+                let jobs_checked = ack_list.len();
+                let mut gw = up.guest.guest_work.lock().await;
+                for ds_id_done in ack_list.iter() {
+                    let mut ds = up.downstairs.lock().await;
+                    debug!(up.log, "up_ds_listen process {}", ds_id_done);
+
+                    let mut handle = ds.ds_active.get_mut(ds_id_done).unwrap();
+                    let done = handle.job();
+
+                    /*
+                     * Make sure the job state has not changed since we made the
+                     * list.
+                     */
+                    if done.ack_status != AckStatus::AckReady {
+                        info!(
+                            up.log,
+                            "Job {} no longer ready, skip for now", ds_id_done
+                        );
+                        continue;
+                    }
+
+                    let gw_id = done.guest_id;
+                    let ds_id = done.ds_id;
+                    assert_eq!(*ds_id_done, ds_id);
+
+                    let io_size = done.io_size();
+                    let data = done.data.take();
+                    drop(handle);
+
+                    ds.ack(ds_id);
+                    debug!(ds.log, "[A] ack job {}:{}", ds_id, gw_id);
+
+                    gw.gw_ds_complete(gw_id, ds_id, data, ds.result(ds_id), &up.log)
+                        .await;
+
+                    ds.cdt_gw_work_done(ds_id, gw_id, io_size, &up.stats);
+
+                    ds.retire_check(ds_id);
+                }
+                debug!(
+                    up.log,
+                    "up_ds_listen checked {} jobs, back to waiting", jobs_checked
+                );
             }
             _ = sleep_until(repair_check_interval), if repair_check => {
                 match check_for_repair(up, &dst).await {
@@ -10293,15 +10280,6 @@ pub async fn up_main(
      */
     let (ds_done_tx, ds_done_rx) = mpsc::channel(MAX_ACTIVE_COUNT + 50);
 
-    /*
-     * spawn a task to listen for ds completed work which will then
-     * take care of transitioning guest work structs to done.
-     */
-    let upc = Arc::clone(&up);
-    tokio::spawn(async move {
-        up_ds_listen(&upc, ds_done_rx).await;
-    });
-
     if let Some(pr) = producer_registry {
         let up_oxc = Arc::clone(&up);
         let ups = up_oxc.stats.clone();
@@ -10390,8 +10368,15 @@ pub async fn up_main(
          * Once connected, we then take work requests from the guest and
          * submit them into the upstairs
          */
-        up_listen(&up, dst, ds_status_rx, ds_reconcile_done_rx, flush_timeout)
-            .await
+        up_listen(
+            &up,
+            dst,
+            ds_status_rx,
+            ds_done_rx,
+            ds_reconcile_done_rx,
+            flush_timeout,
+        )
+        .await
     });
 
     Ok(join_handle)
