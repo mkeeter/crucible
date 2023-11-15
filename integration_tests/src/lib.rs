@@ -2943,6 +2943,9 @@ mod test {
             }
         }
 
+        // Load-bearing sleep, see crucible#1037 :(
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
         // A new Upstairs arrives, with a newer gen number, and the updated
         // target list
         let mut opts = test_downstairs_set.opts();
