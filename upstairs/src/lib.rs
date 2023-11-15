@@ -945,7 +945,6 @@ async fn proc_stream(
     target: &SocketAddr,
     up: &Arc<Upstairs>,
     stream: WrappedStream,
-    connected: &mut bool,
     up_coms: &mut UpComs,
 ) -> Result<()> {
     match stream {
@@ -955,7 +954,7 @@ async fn proc_stream(
             let fr = FramedRead::new(read, CrucibleDecoder::new());
             let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            proc(target, up, fr, fw, connected, up_coms).await
+            proc(target, up, fr, fw, up_coms).await
         }
         WrappedStream::Https(stream) => {
             let (read, write) = tokio::io::split(stream);
@@ -963,7 +962,7 @@ async fn proc_stream(
             let fr = FramedRead::new(read, CrucibleDecoder::new());
             let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            proc(target, up, fr, fw, connected, up_coms).await
+            proc(target, up, fr, fw, up_coms).await
         }
     }
 }
@@ -981,7 +980,6 @@ async fn proc<RT, WT>(
     up: &Arc<Upstairs>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
-    connected: &mut bool,
     up_coms: &mut UpComs,
 ) -> Result<()>
 where
@@ -1173,7 +1171,7 @@ where
      *    upstairs. We set the downstairs to DsState::Replay and the while
      *    loop is exited.
      */
-    while !(*connected) {
+    while negotiated != NegotiationState::Done {
         tokio::select! {
             /*
              * Don't wait more than 50 seconds to hear from the other side.
@@ -1632,7 +1630,8 @@ where
                         negotiated = NegotiationState::Done;
                         drop(ds);
 
-                        *connected = true;
+                        // We're now donw with negotiation
+                        break;
                     },
                     Some(Message::ExtentVersions {
                             gen_numbers, flush_numbers, dirty_bits
@@ -1705,13 +1704,6 @@ where
                         );
                         negotiated = NegotiationState::Done;
                         drop(ds);
-
-                        /*
-                         * At this point, we have all we need in the upstairs
-                         * to make a decision on what to do next.  Go ahead
-                         * and move out of the negotiation phase.
-                         */
-                        *connected = true;
                     }
                     Some(Message::UuidMismatch { expected_id }) => {
                         /*
@@ -2594,173 +2586,154 @@ enum WrappedStream {
     Https(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
 }
 
-/*
- * This task is responsible for the connection to a specific downstairs
- * instance.  This task will run forever.
- */
-async fn looper(
-    tls_context: Arc<
-        tokio::sync::Mutex<Option<crucible_common::x509::TLSContext>>,
-    >,
+/// This task is responsible for a specific downstairs connection
+///
+/// It recycles the `up_coms` and `tls_context` arguments, because we'll need
+/// them again on the next invocation of the function.
+async fn ds_connection(
+    tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
     up: &Arc<Upstairs>,
     mut up_coms: UpComs,
+    target: SocketAddr,
+) -> (
+    UpComs,
+    Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
 ) {
-    let mut firstgo = true;
-    let mut connected = false;
-    let mut notify = 0;
+    let log = up
+        .log
+        .new(o!("ds_connection" => up_coms.client_id.to_string()));
 
-    let log = up.log.new(o!("looper" => up_coms.client_id.to_string()));
-    'outer: loop {
-        if firstgo {
-            firstgo = false;
-        } else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        // Get the specific information for the downstairs we will operate on.
-        let ds = up.downstairs.lock().await;
-        let target: SocketAddr = ds.ds_target[up_coms.client_id];
-        drop(ds);
+    /*
+     * Make connection to this downstairs.
+     */
+    let sock = if target.is_ipv4() {
+        TcpSocket::new_v4().unwrap()
+    } else {
+        TcpSocket::new_v6().unwrap()
+    };
 
-        /*
-         * Make connection to this downstairs.
-         */
-        let sock = if target.is_ipv4() {
-            TcpSocket::new_v4().unwrap()
-        } else {
-            TcpSocket::new_v6().unwrap()
-        };
+    /*
+     * Set a connect timeout, and connect to the target:
+     */
+    info!(log, "[{1}] connecting to {0}", target, up_coms.client_id);
+    let deadline = tokio::time::sleep_until(deadline_secs(10.0));
+    tokio::pin!(deadline);
+    let tcp = sock.connect(target);
 
-        /*
-         * Set a connect timeout, and connect to the target:
-         */
-        if notify == 0 {
-            info!(log, "[{1}] connecting to {0}", target, up_coms.client_id);
-        }
-        notify = (notify + 1) % 10;
-        let deadline = tokio::time::sleep_until(deadline_secs(10.0));
-        tokio::pin!(deadline);
-        let tcp = sock.connect(target);
+    tokio::pin!(tcp);
 
-        tokio::pin!(tcp);
-
-        let tcp: TcpStream = loop {
-            tokio::select! {
-                _ = &mut deadline => {
-                    info!(log, "connect timeout");
-                    continue 'outer;
-                }
-                tcp = &mut tcp => {
-                    match tcp {
-                        Ok(tcp) => {
-                            info!(
-                                log,
-                                "[{}] {} looper connected",
-                                up_coms.client_id,
-                                up.uuid,
-                            );
-                            break tcp;
-                        }
-                        Err(_e) => {
-                            /*
-                            warn!(
-                                up.log,
-                                "{0} looper connect to {0} failure: {1:?}",
-                                target, e);
-                            */
-                            continue 'outer;
-                        }
+    let tcp: TcpStream = loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                info!(log, "connect timeout");
+                return (up_coms, tls_context);
+            }
+            tcp = &mut tcp => {
+                match tcp {
+                    Ok(tcp) => {
+                        info!(
+                            log,
+                            "[{}] {} ds_connection connected",
+                            up_coms.client_id,
+                            up.uuid,
+                        );
+                        break tcp;
+                    }
+                    Err(e) => {
+                        warn!(
+                            up.log,
+                            "{0} ds_connection connect to {0} failure: {1:?}",
+                            target, e);
+                        return (up_coms, tls_context);
                     }
                 }
             }
-        };
+        }
+    };
 
-        /*
-         * We're connected; before we wrap it, set TCP_NODELAY to assure
-         * that we don't get Nagle'd.
-         */
-        tcp.set_nodelay(true).expect("could not set TCP_NODELAY");
+    /*
+     * We're connected; before we wrap it, set TCP_NODELAY to assure
+     * that we don't get Nagle'd.
+     */
+    tcp.set_nodelay(true).expect("could not set TCP_NODELAY");
 
-        let tcp = {
-            let tls_context = tls_context.lock().await;
-            if let Some(ref tls_context) = *tls_context {
-                // XXX these unwraps are bad!
-                let config = tls_context.get_client_config().unwrap();
+    let tcp = {
+        let tls_context = tls_context.lock().await;
+        if let Some(ref tls_context) = *tls_context {
+            // XXX these unwraps are bad!
+            let config = tls_context.get_client_config().unwrap();
 
-                let connector =
-                    tokio_rustls::TlsConnector::from(Arc::new(config));
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-                let server_name = tokio_rustls::rustls::ServerName::try_from(
-                    format!("downstairs{}", up_coms.client_id).as_str(),
-                )
-                .unwrap();
+            let server_name = tokio_rustls::rustls::ServerName::try_from(
+                format!("downstairs{}", up_coms.client_id).as_str(),
+            )
+            .unwrap();
 
-                WrappedStream::Https(
-                    connector.connect(server_name, tcp).await.unwrap(),
-                )
-            } else {
-                WrappedStream::Http(tcp)
-            }
-        };
+            WrappedStream::Https(
+                connector.connect(server_name, tcp).await.unwrap(),
+            )
+        } else {
+            WrappedStream::Http(tcp)
+        }
+    };
 
-        up.downstairs.lock().await.connected[up_coms.client_id] += 1;
+    up.downstairs.lock().await.connected[up_coms.client_id] += 1;
 
-        /*
-         * Once we have a connected downstairs, the proc task takes over and
-         * handles negotiation and work processing.
-         */
-        match proc_stream(&target, up, tcp, &mut connected, &mut up_coms).await
-        {
-            Ok(()) => {
-                // XXX figure out what to do here
-            }
-
-            Err(e) => {
-                error!(log, "{}: proc: {:?}", target, e);
-
-                // XXX proc can return fatal and non-fatal errors, figure out
-                // what to do here
-            }
+    /*
+     * Once we have a connected downstairs, the proc task takes over and
+     * handles negotiation and work processing.
+     */
+    match proc_stream(&target, up, tcp, &mut up_coms).await {
+        Ok(()) => {
+            // XXX figure out what to do here
         }
 
-        /*
-         * If the connection goes down here, we need to know what state we
-         * were in to decide what state to transition to.  The ds_missing
-         * method will do that for us.
-         *
-         */
-        up.ds_missing(up_coms.client_id).await;
+        Err(e) => {
+            error!(log, "{}: proc: {:?}", target, e);
 
-        /*
-         * If we are deactivating, then check and see if this downstairs
-         * is the final one required to deactivate and if so, switch
-         * the upstairs back to initializing.
-         */
-        up.deactivate_transition_check().await;
-
-        info!(
-            log,
-            "[{}] {} connection to {} closed",
-            up_coms.client_id,
-            up.uuid,
-            target
-        );
-        connected = false;
-        /*
-         * This can fail if we are shutting down and the other side of this
-         * task has already ended and we are still trying to message it.
-         */
-        if let Err(e) = up_coms
-            .ds_status_tx
-            .send(Condition {
-                target,
-                connected: false,
-                client_id: up_coms.client_id,
-            })
-            .await
-        {
-            error!(log, "{} Message to ds_status_tx failed: {:?}", target, e);
+            // XXX proc can return fatal and non-fatal errors, figure out
+            // what to do here
         }
     }
+
+    /*
+     * If the connection goes down here, we need to know what state we
+     * were in to decide what state to transition to.  The ds_missing
+     * method will do that for us.
+     *
+     */
+    up.ds_missing(up_coms.client_id).await;
+
+    /*
+     * If we are deactivating, then check and see if this downstairs
+     * is the final one required to deactivate and if so, switch
+     * the upstairs back to initializing.
+     */
+    up.deactivate_transition_check().await;
+
+    info!(
+        log,
+        "[{}] {} connection to {} closed", up_coms.client_id, up.uuid, target
+    );
+
+    /*
+     * This can fail if we are shutting down and the other side of this
+     * task has already ended and we are still trying to message it.
+     */
+    if let Err(e) = up_coms
+        .ds_status_tx
+        .send(Condition {
+            target,
+            connected: false,
+            client_id: up_coms.client_id,
+        })
+        .await
+    {
+        error!(log, "{} Message to ds_status_tx failed: {:?}", target, e);
+    }
+
+    (up_coms, tls_context)
 }
 
 /*
@@ -5089,8 +5062,8 @@ enum UpState {
      * Let in flight IO continue, but don't allow any new IO.  This state
      * also means that when a downstairs task has completed all the IO
      * it can, including the final flush, it should reset itself back to
-     * new and let the connection to the downstairs close and let the
-     * loop to reconnect (looper) happen.
+     * new, let the connection to the downstairs close, and let up_listen
+     * reconnect (using `Upstairs::restart_conn_task`)
      */
     Deactivating,
 }
@@ -7517,6 +7490,25 @@ impl Upstairs {
 
         Ok(ReplaceResult::Started)
     }
+
+    async fn restart_conn_task(
+        self: &Arc<Self>,
+        up_coms: UpComs,
+        tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+        client_id: ClientId,
+    ) -> (Target, TargetTask) {
+        let addr = self.downstairs.lock().await.ds_target[client_id];
+        info!(self.log, "restarting conn task for addr {addr}");
+        Target::start(
+            self.clone(),
+            client_id,
+            addr,
+            up_coms.ds_status_tx,
+            up_coms.ds_done_tx,
+            up_coms.ds_reconcile_done_tx,
+            tls_context,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -9534,6 +9526,9 @@ struct Repair {
  * Send a message there is new work.
  * Send a message there is an activation request from the guest.
  * Send a message there is repair work to do.
+ *
+ * It also holds the worker task for that downstairs, as a `JoinHandle` which
+ * resolves when the worker task finishes.
  */
 pub struct Target {
     /// Used to indicate that new work has arrived for a downstairs
@@ -9553,6 +9548,64 @@ pub struct Target {
     ///
     /// The value is unused
     ds_reconcile_work_tx: watch::Sender<u64>,
+}
+
+/// `JoinHandle` for the `ds_connection` task
+struct TargetTask {
+    conn_task: tokio::task::JoinHandle<(
+        UpComs,
+        Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+    )>,
+}
+
+impl Target {
+    fn start(
+        up: Arc<Upstairs>,
+        client_id: ClientId,
+        addr: SocketAddr,
+        ds_status_tx: mpsc::Sender<Condition>,
+        ds_done_tx: mpsc::Sender<()>,
+        ds_reconcile_done_tx: mpsc::Sender<Repair>,
+        tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+    ) -> (Self, TargetTask) {
+        /*
+         * Create the channel that we will use to request that the loop
+         * check for work to do in the central structure.
+         */
+        let (ds_work_tx, ds_work_rx) = mpsc::channel(500);
+        /*
+         * Create the channel used to submit reconcile work to each
+         * downstairs (when work is required).
+         */
+        let (ds_reconcile_work_tx, ds_reconcile_work_rx) = watch::channel(1);
+
+        // Notify when it's time to go active.
+        let (ds_active_tx, ds_active_rx) = watch::channel(0);
+
+        let up_coms = UpComs {
+            client_id,
+            ds_work_rx,
+            ds_status_tx,
+            ds_done_tx: ds_done_tx.clone(),
+            ds_active_rx,
+            ds_reconcile_work_rx,
+            ds_reconcile_done_tx,
+        };
+
+        let conn_task = tokio::spawn(async move {
+            ds_connection(tls_context, &up, up_coms, addr).await
+        });
+
+        (
+            Target {
+                ds_work_tx,
+                ds_done_tx,
+                ds_active_tx,
+                ds_reconcile_work_tx,
+            },
+            TargetTask { conn_task },
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -10018,7 +10071,8 @@ pub struct Arg {
  */
 async fn up_listen(
     up: &Arc<Upstairs>,
-    dst: Vec<Target>,
+    mut dst: Vec<Target>,
+    mut dst_task: Vec<TargetTask>,
     mut ds_status_rx: mpsc::Receiver<Condition>,
     mut ds_done_rx: mpsc::Receiver<()>,
     mut ds_reconcile_done_rx: mpsc::Receiver<Repair>,
@@ -10046,6 +10100,12 @@ async fn up_listen(
     let mut repair_check_interval = deadline_secs(60.0);
     let mut repair_check = false;
     loop {
+        // Split borrow of dst so that we can await all of them (which requires
+        // a mutable borrow)
+        let (d0, rst) = dst_task.split_first_mut().unwrap();
+        let (d1, rst) = rst.split_first_mut().unwrap();
+        let d2 = &mut rst[0];
+
         /*
          * Wait for all three downstairs to connect (for each region set).
          * Once we have all three, try to reconcile them.
@@ -10218,8 +10278,56 @@ async fn up_listen(
                 up.stat_update("loop").await;
                 stat_update_interval = deadline_secs(1.0);
             }
+            r = &mut d0.conn_task => {
+                on_conn_task_complete(
+                    ClientId::new(0),
+                    r,
+                    up,
+                    &mut dst,
+                    &mut dst_task).await
+            }
+            r = &mut d1.conn_task => {
+                on_conn_task_complete(
+                    ClientId::new(1),
+                    r,
+                    up,
+                    &mut dst,
+                    &mut dst_task).await
+            }
+            r = &mut d2.conn_task => {
+                on_conn_task_complete(
+                    ClientId::new(2),
+                    r,
+                    up,
+                    &mut dst,
+                    &mut dst_task).await
+            }
         }
     }
+}
+
+/// Helper type representing the join result of a `conn_task`
+type ConnTaskResult = Result<
+    (
+        UpComs,
+        Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+    ),
+    tokio::task::JoinError,
+>;
+
+/// Helper function to restart a `conn_task`
+async fn on_conn_task_complete(
+    client_id: ClientId,
+    r: ConnTaskResult,
+    up: &Arc<Upstairs>,
+    dst: &mut [Target],
+    dst_task: &mut [TargetTask],
+) {
+    let (up_coms, tls_context) = r.expect("conn_task did not exit cleanly!");
+    let (target, task) =
+        up.restart_conn_task(up_coms, tls_context, client_id).await;
+    dst[client_id.get() as usize] = target;
+    dst_task[client_id.get() as usize] = task;
 }
 
 /*
@@ -10309,42 +10417,19 @@ pub async fn up_main(
      * tasks.
      */
     let mut dst = Vec::new();
+    let mut dst_task = Vec::new();
     for client_id in ClientId::iter() {
-        /*
-         * Create the channel that we will use to request that the loop
-         * check for work to do in the central structure.
-         */
-        let (ds_work_tx, ds_work_rx) = mpsc::channel(500);
-        /*
-         * Create the channel used to submit reconcile work to each
-         * downstairs (when work is required).
-         */
-        let (ds_reconcile_work_tx, ds_reconcile_work_rx) = watch::channel(1);
-
-        // Notify when it's time to go active.
-        let (ds_active_tx, ds_active_rx) = watch::channel(0);
-
-        let up = Arc::clone(&up);
-        let up_coms = UpComs {
+        let (target, task) = Target::start(
+            up.clone(),
             client_id,
-            ds_work_rx,
-            ds_status_tx: ds_status_tx.clone(),
-            ds_done_tx: ds_done_tx.clone(),
-            ds_active_rx,
-            ds_reconcile_work_rx,
-            ds_reconcile_done_tx: ds_reconcile_done_tx.clone(),
-        };
-        let tls_context = tls_context.clone();
-        tokio::spawn(async move {
-            looper(tls_context, &up, up_coms).await;
-        });
-
-        dst.push(Target {
-            ds_work_tx,
-            ds_done_tx: ds_done_tx.clone(),
-            ds_active_tx,
-            ds_reconcile_work_tx,
-        });
+            opt.target[client_id.get() as usize],
+            ds_status_tx.clone(),
+            ds_done_tx.clone(),
+            ds_reconcile_done_tx.clone(),
+            tls_context.clone(),
+        );
+        dst.push(target);
+        dst_task.push(task);
     }
 
     // If requested, start the control http server on the given address:port
@@ -10355,7 +10440,7 @@ pub async fn up_main(
             info!(upi.log, "Control HTTP task finished with {:?}", r);
         });
     }
-    // Drop here, otherwise receivers will be kept waiting if looper quits
+    // Drop here, otherwise receivers will be kept waiting if conn_task quits
     drop(ds_done_tx);
     drop(ds_status_tx);
     drop(ds_reconcile_done_tx);
@@ -10371,6 +10456,7 @@ pub async fn up_main(
         up_listen(
             &up,
             dst,
+            dst_task,
             ds_status_rx,
             ds_done_rx,
             ds_reconcile_done_rx,
