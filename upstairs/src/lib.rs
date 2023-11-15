@@ -2595,9 +2595,6 @@ async fn ds_connection(
     up: &Arc<Upstairs>,
     mut up_coms: UpComs,
     target: SocketAddr,
-) -> (
-    UpComs,
-    Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
 ) {
     let log = up
         .log
@@ -2626,7 +2623,7 @@ async fn ds_connection(
         tokio::select! {
             _ = &mut deadline => {
                 info!(log, "connect timeout");
-                return (up_coms, tls_context);
+                return;
             }
             tcp = &mut tcp => {
                 match tcp {
@@ -2644,7 +2641,7 @@ async fn ds_connection(
                             up.log,
                             "{0} ds_connection connect to {0} failure: {1:?}",
                             target, e);
-                        return (up_coms, tls_context);
+                        return;
                     }
                 }
             }
@@ -2696,44 +2693,9 @@ async fn ds_connection(
             // what to do here
         }
     }
-
-    /*
-     * If the connection goes down here, we need to know what state we
-     * were in to decide what state to transition to.  The ds_missing
-     * method will do that for us.
-     *
-     */
-    up.ds_missing(up_coms.client_id).await;
-
-    /*
-     * If we are deactivating, then check and see if this downstairs
-     * is the final one required to deactivate and if so, switch
-     * the upstairs back to initializing.
-     */
-    up.deactivate_transition_check().await;
-
-    info!(
-        log,
-        "[{}] {} connection to {} closed", up_coms.client_id, up.uuid, target
-    );
-
-    /*
-     * This can fail if we are shutting down and the other side of this
-     * task has already ended and we are still trying to message it.
-     */
-    if let Err(e) = up_coms
-        .ds_status_tx
-        .send(Condition {
-            target,
-            connected: false,
-            client_id: up_coms.client_id,
-        })
-        .await
-    {
-        error!(log, "{} Message to ds_status_tx failed: {:?}", target, e);
-    }
-
-    (up_coms, tls_context)
+    // When this function returns, the join handle will notice and switch the
+    // Downstairs to missing, then try to reconnect by spawning another
+    // call to ds_connection.
 }
 
 /*
@@ -7493,21 +7455,52 @@ impl Upstairs {
 
     async fn restart_conn_task(
         self: &Arc<Self>,
-        up_coms: UpComs,
-        tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+        data: ConnTaskData,
         client_id: ClientId,
     ) -> (Target, TargetTask) {
+        /*
+         * If the connection goes down here, we need to know what state we
+         * were in to decide what state to transition to.  The ds_missing
+         * method will do that for us.
+         *
+         */
+        self.ds_missing(client_id).await;
+
+        /*
+         * If we are deactivating, then check and see if this downstairs
+         * is the final one required to deactivate and if so, switch
+         * the upstairs back to initializing.
+         */
+        self.deactivate_transition_check().await;
+
+        info!(
+            self.log,
+            "[{}] {} connection to {} closed", client_id, self.uuid, data.addr
+        );
+
+        /*
+         * This can fail if we are shutting down and the other side of this
+         * task has already ended and we are still trying to message it.
+         */
+        if let Err(e) = data
+            .ds_status_tx
+            .send(Condition {
+                target: data.addr,
+                connected: false,
+                client_id,
+            })
+            .await
+        {
+            error!(
+                self.log,
+                "{} Message to ds_status_tx failed: {:?}", data.addr, e
+            );
+        }
+
         let addr = self.downstairs.lock().await.ds_target[client_id];
+
         info!(self.log, "restarting conn task for addr {addr}");
-        Target::start(
-            self.clone(),
-            client_id,
-            addr,
-            up_coms.ds_status_tx,
-            up_coms.ds_done_tx,
-            up_coms.ds_reconcile_done_tx,
-            tls_context,
-        )
+        Target::start(self.clone(), client_id, data, true)
     }
 }
 
@@ -9552,21 +9545,24 @@ pub struct Target {
 
 /// `JoinHandle` for the `ds_connection` task
 struct TargetTask {
-    conn_task: tokio::task::JoinHandle<(
-        UpComs,
-        Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
-    )>,
+    conn_task: tokio::task::JoinHandle<ConnTaskData>,
+}
+
+#[derive(Clone)]
+struct ConnTaskData {
+    ds_status_tx: mpsc::Sender<Condition>,
+    ds_done_tx: mpsc::Sender<()>,
+    ds_reconcile_done_tx: mpsc::Sender<Repair>,
+    tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+    addr: SocketAddr,
 }
 
 impl Target {
     fn start(
         up: Arc<Upstairs>,
         client_id: ClientId,
-        addr: SocketAddr,
-        ds_status_tx: mpsc::Sender<Condition>,
-        ds_done_tx: mpsc::Sender<()>,
-        ds_reconcile_done_tx: mpsc::Sender<Repair>,
-        tls_context: Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
+        data: ConnTaskData,
+        delay: bool,
     ) -> (Self, TargetTask) {
         /*
          * Create the channel that we will use to request that the loop
@@ -9585,15 +9581,23 @@ impl Target {
         let up_coms = UpComs {
             client_id,
             ds_work_rx,
-            ds_status_tx,
-            ds_done_tx: ds_done_tx.clone(),
+            ds_status_tx: data.ds_status_tx.clone(),
+            ds_done_tx: data.ds_done_tx.clone(),
             ds_active_rx,
             ds_reconcile_work_rx,
-            ds_reconcile_done_tx,
+            ds_reconcile_done_tx: data.ds_reconcile_done_tx.clone(),
         };
 
+        let ds_done_tx = data.ds_done_tx.clone(); // needed for Target
+
         let conn_task = tokio::spawn(async move {
-            ds_connection(tls_context, &up, up_coms, addr).await
+            // If this is a restart, then delay before connecting
+            if delay {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            ds_connection(data.tls_context.clone(), &up, up_coms, data.addr)
+                .await;
+            data
         });
 
         (
@@ -10306,26 +10310,16 @@ async fn up_listen(
     }
 }
 
-/// Helper type representing the join result of a `conn_task`
-type ConnTaskResult = Result<
-    (
-        UpComs,
-        Arc<Mutex<Option<crucible_common::x509::TLSContext>>>,
-    ),
-    tokio::task::JoinError,
->;
-
 /// Helper function to restart a `conn_task`
 async fn on_conn_task_complete(
     client_id: ClientId,
-    r: ConnTaskResult,
+    r: Result<ConnTaskData, tokio::task::JoinError>,
     up: &Arc<Upstairs>,
     dst: &mut [Target],
     dst_task: &mut [TargetTask],
 ) {
-    let (up_coms, tls_context) = r.expect("conn_task did not exit cleanly!");
-    let (target, task) =
-        up.restart_conn_task(up_coms, tls_context, client_id).await;
+    let data = r.expect("conn_task did not exit cleanly!");
+    let (target, task) = up.restart_conn_task(data, client_id).await;
     dst[client_id.get() as usize] = target;
     dst_task[client_id.get() as usize] = task;
 }
@@ -10419,14 +10413,18 @@ pub async fn up_main(
     let mut dst = Vec::new();
     let mut dst_task = Vec::new();
     for client_id in ClientId::iter() {
+        let data = ConnTaskData {
+            addr: opt.target[client_id.get() as usize],
+            ds_status_tx: ds_status_tx.clone(),
+            ds_done_tx: ds_done_tx.clone(),
+            ds_reconcile_done_tx: ds_reconcile_done_tx.clone(),
+            tls_context: tls_context.clone(),
+        };
         let (target, task) = Target::start(
             up.clone(),
             client_id,
-            opt.target[client_id.get() as usize],
-            ds_status_tx.clone(),
-            ds_done_tx.clone(),
-            ds_reconcile_done_tx.clone(),
-            tls_context.clone(),
+            data,
+            false, // start right away
         );
         dst.push(target);
         dst_task.push(task);
