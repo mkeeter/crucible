@@ -2185,11 +2185,25 @@ pub struct Guest {
 struct BackpressureConfig {
     /// When should backpressure start (in bytes)?
     bytes_start: u64,
+
     /// Scale for byte-based quadratic backpressure
     bytes_scale: f64,
 
+    /// Maximum delay for byte-based quadratic backpressure
+    ///
+    /// This value should be chosen in conjunction with `bytes_chunk_size`; a
+    /// write of `bytes_chunk_size` should never take longer than
+    /// `bytes_max_delay` to complete.
+    bytes_max_delay: Duration,
+
+    /// Maximum size for an individual write operation
+    ///
+    /// Larger operations are split into chunks of this size
+    bytes_chunk_size: u64,
+
     /// When should queue-based backpressure start?
     queue_start: f64,
+
     /// Maximum queue-based delay
     queue_max_delay: Duration,
 }
@@ -2229,9 +2243,12 @@ impl Guest {
 
             backpressure_us: AtomicU64::new(0),
             backpressure_config: BackpressureConfig {
-                bytes_start: 1024u64.pow(3), // Start at 1 GiB
-                bytes_scale: 9.3e-8,         // Delay of 10ms at 2 GiB in-flight
-                queue_start: 0.5,
+                bytes_start: 100 * 1024u64.pow(2), // Start at 100 MiB
+                bytes_scale: 2.3e-7, // Delay of 10ms at 512 MiB in-flight
+                bytes_max_delay: Duration::from_millis(15),
+                bytes_chunk_size: 32 * 1024u64.pow(2), // 32 MiB
+
+                queue_start: 0.1,
                 queue_max_delay: Duration::from_millis(5),
             },
             backpressure_lock: Mutex::new(()),
@@ -2289,10 +2306,11 @@ impl Guest {
         // the upstairs and downstairs) is particularly high.  If so,
         // apply some backpressure by delaying host operations, with a
         // quadratically-increasing delay.
-        let d1 = (bytes.saturating_sub(self.backpressure_config.bytes_start)
+        let d1 = ((bytes.saturating_sub(self.backpressure_config.bytes_start)
             as f64
             * self.backpressure_config.bytes_scale)
-            .powf(2.0) as u64;
+            .powf(2.0) as u64)
+            .max(self.backpressure_config.bytes_max_delay.as_micros() as u64);
 
         // Compute an alternate delay based on queue length
         let d2 = self
@@ -2584,10 +2602,24 @@ impl BlockIO for Guest {
         if data.is_empty() {
             return Ok(());
         }
-        let wio = BlockOp::Write { offset, data };
-
-        self.backpressure_sleep().await;
-        Ok(self.send(wio).await.wait().await?)
+        // Break the write into  chunks.  This ensures that even huge (GiB)
+        // writes will have appropriate backpressure, since it applies on a
+        // per-chunk basis.
+        let max_write_size = self.backpressure_config.bytes_chunk_size;
+        for i in 0..(data.len() as u64).div_ceil(max_write_size) {
+            let start = (i * max_write_size) as usize;
+            let end = (start + max_write_size as usize).min(data.len());
+            let wio = BlockOp::Write {
+                offset: Block {
+                    value: offset.value + (start as u64 >> offset.shift),
+                    shift: offset.shift,
+                },
+                data: data.slice(start..end),
+            };
+            self.backpressure_sleep().await;
+            self.send(wio).await.wait().await?
+        }
+        Ok(())
     }
 
     async fn write_unwritten(
@@ -2610,7 +2642,6 @@ impl BlockIO for Guest {
         }
         let wio = BlockOp::WriteUnwritten { offset, data };
 
-        self.backpressure_sleep().await;
         Ok(self.send(wio).await.wait().await?)
     }
 
