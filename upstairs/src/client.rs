@@ -2588,17 +2588,27 @@ where
                 .sum::<usize>()
                 .try_into()
                 .unwrap();
+            let len_bytes = len.to_le_bytes();
 
-            fw.write_all(&len.to_le_bytes()).await?;
+            let mut iovecs = vec![];
+            iovecs.push(std::io::IoSlice::new(&len_bytes));
             for s in slices {
-                fw.write_all(s).await?;
+                iovecs.push(std::io::IoSlice::new(s));
             }
+            let n = fw.write_vectored(&iovecs).await?;
+            assert_eq!(n, len as usize + 4);
         }
         m => {
             let v = bincode::serialize(&m).unwrap();
-            let n: u32 = v.len().try_into().unwrap();
-            fw.write_all(&n.to_le_bytes()).await?;
-            fw.write_all(&v).await?;
+            let len: u32 = v.len().try_into().unwrap();
+            let len_bytes = len.to_le_bytes();
+
+            let iovecs = vec![
+                std::io::IoSlice::new(&len_bytes),
+                std::io::IoSlice::new(&v),
+            ];
+            let n = fw.write_vectored(&iovecs).await?;
+            assert_eq!(n, len as usize + 4);
         }
     }
     Ok(())
