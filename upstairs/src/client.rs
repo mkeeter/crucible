@@ -1,8 +1,8 @@
 use crate::{
     cdt, deadline_secs, integrity_hash, live_repair::ExtentInfo,
     upstairs::UpstairsConfig, upstairs::UpstairsState, ClientIOStateCount,
-    ClientId, CrucibleDecoder, CrucibleEncoder, CrucibleError, DownstairsIO,
-    DsState, EncryptionContext, IOState, IOop, JobId, Message, ReadResponse,
+    ClientId, CrucibleDecoder, CrucibleError, DownstairsIO, DsState,
+    EncryptionContext, IOState, IOop, JobId, Message, ReadResponse,
     ReconcileIO, RegionDefinitionStatus, RegionMetadata, WrappedStream,
     MAX_ACTIVE_COUNT,
 };
@@ -10,14 +10,14 @@ use crucible_protocol::{ReconciliationId, CRUCIBLE_MESSAGE_VERSION};
 
 use std::{collections::BTreeSet, net::SocketAddr, sync::Arc};
 
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use slog::{debug, error, info, o, warn, Logger};
 use tokio::{
     net::{TcpSocket, TcpStream},
     sync::{mpsc, oneshot},
     time::{sleep_until, Instant},
 };
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::FramedRead;
 use uuid::Uuid;
 
 const TIMEOUT_SECS: f32 = 50.0;
@@ -2455,17 +2455,15 @@ async fn proc_stream(
             let (read, write) = sock.into_split();
 
             let fr = FramedRead::new(read, CrucibleDecoder::new());
-            let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            cmd_loop(rx, stop, tx, fr, fw, log).await
+            cmd_loop(rx, stop, tx, fr, write, log).await
         }
         WrappedStream::Https(stream) => {
             let (read, write) = tokio::io::split(stream);
 
             let fr = FramedRead::new(read, CrucibleDecoder::new());
-            let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            cmd_loop(rx, stop, tx, fr, fw, log).await
+            cmd_loop(rx, stop, tx, fr, write, log).await
         }
     }
 }
@@ -2475,7 +2473,7 @@ async fn cmd_loop<R, W>(
     stop: &mut oneshot::Receiver<ClientStopReason>,
     tx: &mpsc::Sender<ClientResponse>,
     mut fr: FramedRead<R, crucible_protocol::CrucibleDecoder>,
-    mut fw: FramedWrite<W, crucible_protocol::CrucibleEncoder>,
+    mut fw: W,
     log: &Logger,
 ) -> ClientRunResult
 where
@@ -2509,8 +2507,8 @@ where
                 let Some(m) = m else {
                     panic!("client_request_tx closed unexpectedly");
                 };
-                if let Err(e) = fw.send(m).await {
-                    break ClientRunResult::WriteFailed(e);
+                if let Err(e) = write_message_to(m, &mut fw).await {
+                    break ClientRunResult::WriteFailed(e.into());
                 }
             }
             s = &mut *stop => {
@@ -2525,6 +2523,85 @@ where
             }
         }
     }
+}
+
+async fn write_message_to<W>(
+    m: Message,
+    fw: &mut W,
+) -> Result<(), CrucibleError>
+where
+    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let discriminant = m.discriminant() as u32;
+    match m {
+        Message::Write {
+            upstairs_id,
+            session_id,
+            job_id,
+            dependencies,
+            writes,
+        }
+        | Message::WriteUnwritten {
+            upstairs_id,
+            session_id,
+            job_id,
+            dependencies,
+            writes,
+        } => {
+            let mut slices: Vec<&[u8]> = vec![];
+            let base = bincode::serialize(&(
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                writes.len(),
+            ))
+            .unwrap();
+
+            let discriminant = discriminant.to_le_bytes();
+            slices.push(&discriminant);
+            slices.push(base.as_slice());
+
+            let mut chunks = Vec::with_capacity(writes.len() * 2);
+            for write in &writes {
+                chunks.push(
+                    bincode::serialize(&(
+                        write.eid,
+                        write.offset,
+                        write.data.len(),
+                    ))
+                    .unwrap(),
+                );
+                chunks.push(bincode::serialize(&write.block_context).unwrap());
+            }
+            for (cs, write) in chunks.chunks(2).zip(writes.iter()) {
+                slices.push(&cs[0]);
+                slices.push(&write.data);
+                slices.push(&cs[1]);
+            }
+
+            let len: u32 = slices
+                .iter()
+                .map(|v| v.len())
+                .sum::<usize>()
+                .try_into()
+                .unwrap();
+
+            fw.write_all(&len.to_le_bytes()).await?;
+            for s in slices {
+                fw.write_all(s).await?;
+            }
+        }
+        m => {
+            let v = bincode::serialize(&m).unwrap();
+            let n: u32 = v.len().try_into().unwrap();
+            fw.write_all(&n.to_le_bytes()).await?;
+            fw.write_all(&v).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Returns:

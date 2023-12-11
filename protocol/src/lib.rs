@@ -664,6 +664,16 @@ impl Message {
             Message::WriteUnwrittenAck { result, .. } => result.as_ref().err(),
         }
     }
+
+    pub fn discriminant(&self) -> u16 {
+        // SAFETY: Because `Self` is marked `repr(u16)`, its layout is a
+        // `repr(C)` `union` between `repr(C)` structs, each of which has the
+        // `u16` discriminant as its first field, so we can read the
+        // discriminant without offsetting the pointer.
+        //
+        // See https://doc.rust-lang.org/std/mem/fn.discriminant.html
+        unsafe { *<*const _>::from(self).cast::<u16>() }
+    }
 }
 
 #[derive(Debug)]
