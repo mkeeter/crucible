@@ -2564,9 +2564,7 @@ where
             slices.push(base.as_slice());
 
             // Write data is pre-serialized to avoid unnecessary memcpy
-            for write in &writes {
-                slices.push(&write.data);
-            }
+            slices.push(&writes.last().unwrap().data);
 
             let len: u32 = slices
                 .iter()

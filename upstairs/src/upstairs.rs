@@ -1160,17 +1160,20 @@ impl Upstairs {
             Vec::with_capacity(impacted_blocks.len(&ddef));
 
         let mut cur_offset: usize = 0;
+        let byte_len: usize = ddef.block_size() as usize;
+        let mut serialized = {
+            let block_count = impacted_blocks.blocks(&ddef).len();
+            let bytes_per_block =
+                byte_len + std::mem::size_of::<crucible_protocol::Write>();
+            bytes::BytesMut::with_capacity(block_count * bytes_per_block)
+        };
         for (eid, offset) in impacted_blocks.blocks(&ddef) {
-            let byte_len: usize = ddef.block_size() as usize;
 
-            let mut sub_data = bytes::BytesMut::with_capacity(
-                byte_len + std::mem::size_of::<crucible_protocol::Write>(),
-            );
             let header = bincode::serialize(&(eid, offset, byte_len)).unwrap();
-            sub_data.extend_from_slice(&header);
+            serialized.extend_from_slice(&header);
 
-            let pos = sub_data.len();
-            sub_data.extend_from_slice(
+            let pos = serialized.len();
+            serialized.extend_from_slice(
                 &data.slice(cur_offset..(cur_offset + byte_len)),
             );
 
@@ -1178,7 +1181,7 @@ impl Upstairs {
                 &self.cfg.encryption_context
             {
                 // Encrypt here
-                let mut_data = &mut sub_data[pos..];
+                let mut_data = &mut serialized[pos..];
 
                 let (nonce, tag, hash) =
                     match context.encrypt_in_place(mut_data) {
@@ -1203,7 +1206,7 @@ impl Upstairs {
                 )
             } else {
                 // Unencrypted
-                let hash = integrity_hash(&[&sub_data[..]]);
+                let hash = integrity_hash(&[&serialized[pos..]]);
 
                 (None, hash)
             };
@@ -1213,12 +1216,12 @@ impl Upstairs {
                 encryption_context,
             })
             .unwrap();
-            sub_data.extend_from_slice(&tailer);
+            serialized.extend_from_slice(&tailer);
 
             writes.push(crucible_protocol::Write {
                 eid,
                 offset,
-                data: sub_data.freeze(),
+                data: bytes::Bytes::new(),
                 block_context: BlockContext {
                     hash,
                     encryption_context,
@@ -1227,6 +1230,7 @@ impl Upstairs {
 
             cur_offset += byte_len;
         }
+        writes.last_mut().unwrap().data = serialized.freeze();
 
         /*
          * Get the next ID for the guest work struct we will make at the
