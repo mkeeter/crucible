@@ -1167,10 +1167,12 @@ impl Upstairs {
                 byte_len + std::mem::size_of::<crucible_protocol::Write>(),
             );
             let header = bincode::serialize(&(eid, offset, byte_len)).unwrap();
-            sub_data.extend(&header);
+            sub_data.extend_from_slice(&header);
 
             let pos = sub_data.len();
-            sub_data.extend(data.slice(cur_offset..(cur_offset + byte_len)));
+            sub_data.extend_from_slice(
+                &data.slice(cur_offset..(cur_offset + byte_len)),
+            );
 
             let (encryption_context, hash) = if let Some(context) =
                 &self.cfg.encryption_context
@@ -1211,7 +1213,7 @@ impl Upstairs {
                 encryption_context,
             })
             .unwrap();
-            sub_data.extend(&tailer);
+            sub_data.extend_from_slice(&tailer);
 
             writes.push(crucible_protocol::Write {
                 eid,
