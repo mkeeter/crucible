@@ -2563,23 +2563,30 @@ where
             slices.push(&discriminant);
             slices.push(base.as_slice());
 
-            let mut chunks = Vec::with_capacity(writes.len() * 2);
+            let mut meta = Vec::with_capacity(writes.len() + 1);
+            meta.push(vec![]); // dummy empty block context
             for write in &writes {
-                chunks.push(
-                    bincode::serialize(&(
-                        write.eid,
-                        write.offset,
-                        write.data.len(),
-                    ))
-                    .unwrap(),
-                );
-                chunks.push(bincode::serialize(&write.block_context).unwrap());
+                // Writes are serialized as
+                // - eid, offset, data len
+                // - data
+                // - block context
+                // (then repeat that for each write)
+                //
+                // When we have many writes, we'll squish the "eid, offset, data
+                // len" onto the previous write's block context.
+                let header = (write.eid, write.offset, write.data.len());
+                let Some(mut prev) = meta.last_mut() else {
+                    unreachable!();
+                };
+                bincode::serialize_into(&mut prev, &header).unwrap();
+                meta.push(bincode::serialize(&write.block_context).unwrap());
             }
-            for (cs, write) in chunks.chunks(2).zip(writes.iter()) {
-                slices.push(&cs[0]);
+            assert_eq!(meta.len(), writes.len() + 1);
+            for (meta, write) in meta.iter().zip(writes.iter()) {
+                slices.push(meta);
                 slices.push(&write.data);
-                slices.push(&cs[1]);
             }
+            slices.push(meta.last().unwrap());
 
             let len: u32 = slices
                 .iter()
