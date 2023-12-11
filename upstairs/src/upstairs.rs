@@ -1163,16 +1163,23 @@ impl Upstairs {
         for (eid, offset) in impacted_blocks.blocks(&ddef) {
             let byte_len: usize = ddef.block_size() as usize;
 
-            let (sub_data, encryption_context, hash) = if let Some(context) =
+            let mut sub_data = bytes::BytesMut::with_capacity(
+                byte_len + std::mem::size_of::<crucible_protocol::Write>(),
+            );
+            let header = bincode::serialize(&(eid, offset, byte_len)).unwrap();
+            sub_data.extend(&header);
+
+            let pos = sub_data.len();
+            sub_data.extend(data.slice(cur_offset..(cur_offset + byte_len)));
+
+            let (encryption_context, hash) = if let Some(context) =
                 &self.cfg.encryption_context
             {
                 // Encrypt here
-                let mut mut_data = bytes::BytesMut::from(
-                    &*data.slice(cur_offset..(cur_offset + byte_len)),
-                );
+                let mut_data = &mut sub_data[pos..];
 
                 let (nonce, tag, hash) =
-                    match context.encrypt_in_place(&mut mut_data[..]) {
+                    match context.encrypt_in_place(mut_data) {
                         Err(e) => {
                             if let Some(req) = req {
                                 req.send_err(CrucibleError::EncryptionError(
@@ -1186,7 +1193,6 @@ impl Upstairs {
                     };
 
                 (
-                    mut_data.freeze(),
                     Some(crucible_protocol::EncryptionContext {
                         nonce: nonce.into(),
                         tag: tag.into(),
@@ -1195,16 +1201,22 @@ impl Upstairs {
                 )
             } else {
                 // Unencrypted
-                let sub_data = data.slice(cur_offset..(cur_offset + byte_len));
                 let hash = integrity_hash(&[&sub_data[..]]);
 
-                (sub_data, None, hash)
+                (None, hash)
             };
+
+            let tailer = bincode::serialize(&BlockContext {
+                hash,
+                encryption_context,
+            })
+            .unwrap();
+            sub_data.extend(&tailer);
 
             writes.push(crucible_protocol::Write {
                 eid,
                 offset,
-                data: sub_data,
+                data: sub_data.freeze(),
                 block_context: BlockContext {
                     hash,
                     encryption_context,
