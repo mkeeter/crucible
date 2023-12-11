@@ -1167,8 +1167,9 @@ impl Upstairs {
                 &self.cfg.encryption_context
             {
                 // Encrypt here
-                let mut mut_data =
-                    data.slice(cur_offset..(cur_offset + byte_len)).to_vec();
+                let mut mut_data = bytes::BytesMut::from(
+                    &*data.slice(cur_offset..(cur_offset + byte_len)),
+                );
 
                 let (nonce, tag, hash) =
                     match context.encrypt_in_place(&mut mut_data[..]) {
@@ -1185,7 +1186,7 @@ impl Upstairs {
                     };
 
                 (
-                    Bytes::copy_from_slice(&mut_data),
+                    mut_data.freeze(),
                     Some(crucible_protocol::EncryptionContext {
                         nonce: nonce.into(),
                         tag: tag.into(),
