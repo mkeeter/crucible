@@ -2532,8 +2532,6 @@ async fn write_message_to<W>(
 where
     W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
 {
-    use tokio::io::AsyncWriteExt;
-
     let discriminant = m.discriminant() as u32;
     match m {
         Message::Write {
@@ -2550,7 +2548,9 @@ where
             dependencies,
             writes,
         } => {
-            let mut slices: Vec<&[u8]> = vec![];
+            // Start with a dummy length
+            let mut slices: Vec<&[u8]> = vec![&[0, 0, 0, 0]];
+            let discriminant = discriminant.to_le_bytes();
             let base = bincode::serialize(&(
                 upstairs_id,
                 session_id,
@@ -2560,7 +2560,6 @@ where
             ))
             .unwrap();
 
-            let discriminant = discriminant.to_le_bytes();
             slices.push(&discriminant);
             slices.push(base.as_slice());
 
@@ -2590,25 +2589,59 @@ where
                 .unwrap();
             let len_bytes = len.to_le_bytes();
 
-            let mut iovecs = vec![];
-            iovecs.push(std::io::IoSlice::new(&len_bytes));
-            for s in slices {
-                iovecs.push(std::io::IoSlice::new(s));
-            }
-            let n = fw.write_vectored(&iovecs).await?;
-            assert_eq!(n, len as usize + 4);
+            slices[0] = &len_bytes;
+
+            write_all_vectored(fw, &slices).await?;
         }
         m => {
             let v = bincode::serialize(&m).unwrap();
-            let len: u32 = v.len().try_into().unwrap();
+            let mut len: u32 = v.len().try_into().unwrap();
+            len += 4;
             let len_bytes = len.to_le_bytes();
 
-            let iovecs = vec![
-                std::io::IoSlice::new(&len_bytes),
-                std::io::IoSlice::new(&v),
-            ];
-            let n = fw.write_vectored(&iovecs).await?;
-            assert_eq!(n, len as usize + 4);
+            let slices = [len_bytes.as_slice(), &v];
+
+            write_all_vectored(fw, &slices).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_all_vectored<W>(
+    w: &mut W,
+    bytes: &[&[u8]],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+    let mut bufs = bytes
+        .iter()
+        .map(|b| std::io::IoSlice::new(b))
+        .collect::<Vec<_>>();
+    let mut i = 0; // active subset of bytes
+    let mut j = 0; // offset within bytes[i]
+    while i < bufs.len() {
+        match w.write_vectored(&bufs[i..]).await {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                j += n;
+                while i < bufs.len() && j >= bytes[i].len() {
+                    j -= bytes[i].len();
+                    i += 1;
+                }
+                if i == bufs.len() {
+                    break;
+                }
+                bufs[i] = std::io::IoSlice::new(&bytes[i][j..]);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
