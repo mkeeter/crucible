@@ -69,7 +69,9 @@ impl ActiveJobs {
         match &io.work {
             IOop::Flush { .. }
             | IOop::Write { .. }
+            | IOop::SerializedWrite { .. }
             | IOop::WriteUnwritten { .. }
+            | IOop::SerializedWriteUnwritten { .. }
             | IOop::Read { .. }
             | IOop::ExtentLiveReopen { .. } => {
                 assert!(self.block_to_active.job_to_range.contains_key(&job_id))

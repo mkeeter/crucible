@@ -282,7 +282,15 @@ pub const CRUCIBLE_MESSAGE_VERSION: u32 = 5;
  * go do that right now before you forget.
  */
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    PartialEq,
+    Clone,
+    Serialize,
+    Deserialize,
+    strum_macros::EnumDiscriminants,
+)]
+#[strum_discriminants(derive(Serialize))]
 #[repr(u16)]
 pub enum Message {
     /**
@@ -531,6 +539,8 @@ pub enum Message {
     /*
      * IO related
      */
+    // Message::Write must contain the same fields in the same order as
+    // RawMessage::Write which is used for zero-copy serialization.
     Write {
         upstairs_id: Uuid,
         session_id: Uuid,
@@ -580,6 +590,8 @@ pub enum Message {
         responses: Result<Vec<ReadResponse>, CrucibleError>,
     },
 
+    // Message::WriteUnwritten must contain the same fields in the same order as
+    // RawMessage::WriteUnwritten, which is used for zero-copy serialization.
     WriteUnwritten {
         upstairs_id: Uuid,
         session_id: Uuid,

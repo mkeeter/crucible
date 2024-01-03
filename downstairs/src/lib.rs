@@ -315,6 +315,10 @@ pub async fn show_work(ds: &mut Downstairs) {
                     IOop::ExtentLiveNoOp { dependencies } => {
                         ("NoOp", dependencies)
                     }
+                    IOop::SerializedWrite { .. }
+                    | IOop::SerializedWriteUnwritten { .. } => {
+                        panic!("invalid IOop for Downstairs");
+                    }
                 };
                 println!(
                     "DSW:[{:04}] {:>07} {:>05} deps:{:?}",
@@ -1935,6 +1939,10 @@ impl Downstairs {
                 | IOop::ExtentLiveReopen { .. }
                 | IOop::ExtentLiveNoOp { .. } => true,
                 IOop::Read { .. } | IOop::Flush { .. } => false,
+                IOop::SerializedWrite { .. }
+                | IOop::SerializedWriteUnwritten { .. } => {
+                    panic!("invalid IOop for Downstairs");
+                }
             };
 
             if is_write {
@@ -2300,6 +2308,10 @@ impl Downstairs {
                     job_id,
                     result,
                 }))
+            }
+            IOop::SerializedWrite { .. }
+            | IOop::SerializedWriteUnwritten { .. } => {
+                panic!("invalid IOop for Downstairs");
             }
         }
     }
@@ -2850,6 +2862,10 @@ impl Work {
                                 IOop::ExtentLiveRepair { .. } => "ELiveRepair",
                                 IOop::ExtentLiveReopen { .. } => "ELiveReopen",
                                 IOop::ExtentLiveNoOp { .. } => "NoOp",
+                                IOop::SerializedWrite { .. }
+                                | IOop::SerializedWriteUnwritten { .. } => {
+                                    panic!("invalid IOop for Downstairs");
+                                }
                             },
                             job.upstairs_connection,
                             deps_outstanding.len(),

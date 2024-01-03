@@ -912,6 +912,8 @@ impl DownstairsIO {
             | IOop::WriteUnwritten { writes, .. } => {
                 writes.iter().map(|w| w.data.len()).sum()
             }
+            IOop::SerializedWrite { data, .. }
+            | IOop::SerializedWriteUnwritten { data, .. } => data.io_size_bytes,
             IOop::Read { .. } => {
                 if self.data.is_some() {
                     let rrs = self.data.as_ref().unwrap();
@@ -1005,6 +1007,8 @@ impl DownstairsIO {
             IOop::Read { .. } => wc.error == 3,
             IOop::Write { .. }
             | IOop::WriteUnwritten { .. }
+            | IOop::SerializedWrite { .. }
+            | IOop::SerializedWriteUnwritten { .. }
             | IOop::Flush { .. } => wc.skipped + wc.error > 1,
             IOop::ExtentClose {
                 dependencies: _,
@@ -1059,6 +1063,89 @@ impl ReconcileIO {
         }
     }
 }
+
+/// Pre-serialized write, to avoid extra memory copies / allocation
+///
+/// The actual data to be written on the wire is in `self.data`; everything else
+/// is metadata used for logging, etc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SerializedWrite {
+    /// Number of blocks written (used for logging)
+    num_blocks: usize,
+
+    /// Extents to be written
+    eids: Vec<u64>,
+
+    /// Number of bytes written
+    io_size_bytes: usize,
+
+    /// Pre-serialized write data, to avoid extra memcpys
+    data: bytes::Bytes,
+}
+
+impl SerializedWrite {
+    /// Helper function to build a `SerializedWrite` from a list of `Writes`
+    ///
+    /// This is only used during unit tests; normally, the conversion is
+    /// performed during the handling of the write request.
+    #[cfg(test)]
+    fn from_writes(writes: Vec<Write>) -> Self {
+        use bytes::BufMut;
+
+        let out = BytesMut::new();
+        let mut w = out.writer();
+        bincode::serialize_into(&mut w, &writes).unwrap();
+
+        let mut eids: Vec<_> = writes.iter().map(|w| w.eid).collect();
+        eids.dedup();
+
+        let num_blocks = writes.len();
+        let io_size_bytes = writes.iter().map(|w| w.data.len()).sum();
+
+        Self {
+            num_blocks,
+            io_size_bytes,
+            eids,
+            data: w.into_inner().freeze(),
+        }
+    }
+}
+
+/// Raw message header, which is used for zero-copy serialization
+///
+/// These variants must contain the same fields as their `Message` equivalents
+/// in the same order.
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[repr(u16)]
+enum RawMessage {
+    Write {
+        upstairs_id: Uuid,
+        session_id: Uuid,
+        job_id: JobId,
+        dependencies: Vec<JobId>,
+    },
+    WriteUnwritten {
+        upstairs_id: Uuid,
+        session_id: Uuid,
+        job_id: JobId,
+        dependencies: Vec<JobId>,
+    },
+}
+
+impl RawMessage {
+    /// Returns the discriminant used by the equivalent `Message`
+    ///
+    /// This is hard-coded and exhaustively checked by a unit test.
+    fn discriminant(&self) -> MessageDiscriminants {
+        match self {
+            RawMessage::Write { .. } => MessageDiscriminants::Write,
+            RawMessage::WriteUnwritten { .. } => {
+                MessageDiscriminants::WriteUnwritten
+            }
+        }
+    }
+}
+
 /*
  * Crucible to storage IO operations.
  */
@@ -1072,6 +1159,14 @@ pub enum IOop {
     WriteUnwritten {
         dependencies: Vec<JobId>, // Jobs that must finish before this
         writes: Vec<crucible_protocol::Write>,
+    },
+    SerializedWrite {
+        dependencies: Vec<JobId>, // Jobs that must finish before this
+        data: SerializedWrite,
+    },
+    SerializedWriteUnwritten {
+        dependencies: Vec<JobId>, // Jobs that must finish before this
+        data: SerializedWrite,
     },
     Read {
         dependencies: Vec<JobId>, // Jobs that must finish before this
@@ -1119,9 +1214,11 @@ impl IOop {
     pub fn deps(&self) -> &Vec<JobId> {
         match &self {
             IOop::Write { dependencies, .. }
+            | IOop::SerializedWrite { dependencies, .. }
             | IOop::Flush { dependencies, .. }
             | IOop::Read { dependencies, .. }
             | IOop::WriteUnwritten { dependencies, .. }
+            | IOop::SerializedWriteUnwritten { dependencies, .. }
             | IOop::ExtentClose { dependencies, .. }
             | IOop::ExtentFlushClose { dependencies, .. }
             | IOop::ExtentLiveRepair { dependencies, .. }
@@ -1135,7 +1232,13 @@ impl IOop {
     }
 
     pub fn is_write(&self) -> bool {
-        matches!(self, IOop::Write { .. } | IOop::WriteUnwritten { .. })
+        matches!(
+            self,
+            IOop::Write { .. }
+                | IOop::WriteUnwritten { .. }
+                | IOop::SerializedWrite { .. }
+                | IOop::SerializedWriteUnwritten { .. }
+        )
     }
 
     pub fn is_flush(&self) -> bool {
@@ -1197,6 +1300,14 @@ impl IOop {
                     num_blocks += write.data.len() / block_size as usize;
                 }
                 (job_type, num_blocks, dependencies.clone())
+            }
+            IOop::SerializedWrite { dependencies, data } => {
+                let job_type = "Write".to_string();
+                (job_type, data.num_blocks, dependencies.clone())
+            }
+            IOop::SerializedWriteUnwritten { dependencies, data } => {
+                let job_type = "WriteU".to_string();
+                (job_type, data.num_blocks, dependencies.clone())
             }
             IOop::Flush {
                 dependencies,
@@ -1269,6 +1380,10 @@ impl IOop {
                 IOop::Write { writes, .. }
                 | IOop::WriteUnwritten { writes, .. } => {
                     writes.iter().any(|write| write.eid <= extent_limit)
+                }
+                IOop::SerializedWrite { data, .. }
+                | IOop::SerializedWriteUnwritten { data, .. } => {
+                    data.eids.iter().any(|eid| *eid <= extent_limit)
                 }
                 IOop::Flush { .. } => {
                     // If we have set extent limit, then we go ahead and
