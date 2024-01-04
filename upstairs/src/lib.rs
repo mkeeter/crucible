@@ -1008,7 +1008,6 @@ impl DownstairsIO {
             IOop::Write { .. }
             | IOop::WriteUnwritten { .. }
             | IOop::SerializedWrite { .. }
-            | IOop::WriteUnwritten { .. }
             | IOop::SerializedWriteUnwritten { .. }
             | IOop::Flush { .. } => wc.skipped + wc.error > 1,
             IOop::ExtentClose {
