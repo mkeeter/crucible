@@ -3068,10 +3068,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3112,10 +3111,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3148,9 +3146,8 @@ mod test {
         let opts = tds.opts();
 
         let log = csl();
-        let guest = Arc::new(Guest::new(Some(log.clone())));
-        let gc = guest.clone();
-        let _jh = up_main(opts, 1, None, gc, None)?;
+        let (guest, io) = Guest::new(Some(log.clone()));
+        let _jh = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
 
@@ -3222,11 +3219,10 @@ mod test {
         let tds = TestDownstairsSet::small(true).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
         // Read-only Upstairs should return errors if writes are attempted.
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
 
@@ -3256,9 +3252,8 @@ mod test {
         let opts = tds.opts();
 
         let log = csl();
-        let guest = Arc::new(Guest::new(Some(log.clone())));
-        let gc = guest.clone();
-        let _jh = up_main(opts, 1, None, gc, None)?;
+        let (guest, io) = Guest::new(Some(log.clone()));
+        let _jh = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
 
@@ -3303,10 +3298,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3376,10 +3370,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3434,10 +3427,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3493,10 +3485,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3550,10 +3541,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3607,10 +3597,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await?;
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None)?;
+        let _join_handle = up_main(opts, 1, None, io, None)?;
 
         guest.activate().await?;
         guest.query_work_queue().await?;
@@ -3662,10 +3651,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await.unwrap();
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None).unwrap();
+        let _join_handle = up_main(opts, 1, None, io, None).unwrap();
 
         guest.activate().await.unwrap();
 
@@ -3698,10 +3686,9 @@ mod test {
         let tds = TestDownstairsSet::small(false).await.unwrap();
         let opts = tds.opts();
 
-        let guest = Arc::new(Guest::new(None));
-        let gc = guest.clone();
+        let (guest, io) = Guest::new(None);
 
-        let _join_handle = up_main(opts, 1, None, gc, None).unwrap();
+        let _join_handle = up_main(opts, 1, None, io, None).unwrap();
 
         guest.activate().await.unwrap();
 

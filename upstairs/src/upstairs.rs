@@ -12,17 +12,14 @@ use crate::{
     extent_from_offset,
     stats::UpStatOuter,
     Block, BlockOp, BlockReq, BlockRes, Buffer, Bytes, ClientId, ClientMap,
-    CrucibleOpts, DsState, EncryptionContext, GtoS, Guest, Message,
+    CrucibleOpts, DsState, EncryptionContext, GtoS, GuestIoHandle, Message,
     RegionDefinition, RegionDefinitionStatus, SnapshotDetails, WQCounts,
 };
 use crucible_common::CrucibleError;
 
-use std::{
-    ops::DerefMut,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
 use futures::future::{pending, ready, Either};
@@ -66,8 +63,8 @@ pub(crate) enum UpstairsState {
 /// Crucible upstairs state
 ///
 /// This `struct` has exclusive ownership over (almost) everything that's needed
-/// to run the Crucible upstairs, and a shared handle to the [`Guest`] data
-/// structure (which is our main source of operations).
+/// to run the Crucible upstairs, and a handle to the incoming `Guest` queues
+/// (which is our main source of operations).
 ///
 /// In normal operation, the `Upstairs` expects to run a simple loop forever in
 /// an async task:
@@ -138,7 +135,7 @@ pub(crate) struct Upstairs {
     /// The guest struct keeps track of jobs accepted from the Guest
     ///
     /// A single job submitted can produce multiple downstairs requests.
-    pub(crate) guest: Arc<Guest>,
+    pub(crate) guest: GuestIoHandle,
 
     /// Region definition
     ///
@@ -258,7 +255,7 @@ impl Upstairs {
         opt: &CrucibleOpts,
         gen: u64,
         expected_region_def: Option<RegionDefinition>,
-        guest: Arc<Guest>,
+        guest: GuestIoHandle,
         tls_context: Option<Arc<crucible_common::x509::TLSContext>>,
     ) -> Self {
         /*
@@ -360,14 +357,9 @@ impl Upstairs {
         };
 
         let log = crucible_common::build_logger();
+        let (_guest, io) = crate::Guest::new(Some(log.clone()));
 
-        Self::new(
-            &opts,
-            0,
-            ddef,
-            Arc::new(Guest::new(Some(log.clone()))),
-            None,
-        )
+        Self::new(&opts, 0, ddef, io, None)
     }
 
     /// Runs the upstairs (forever)
@@ -449,12 +441,12 @@ impl Upstairs {
                 const LEAK_MS: usize = 1000;
                 let leak_tick =
                     tokio::time::Duration::from_millis(LEAK_MS as u64);
-                if let Some(iop_limit) = self.guest.get_iop_limit() {
-                    let tokens = iop_limit / (1000 / LEAK_MS);
+                if let Some(iop_limit_cfg) = &self.guest.iop_limit_cfg {
+                    let tokens = iop_limit_cfg.iop_limit / (1000 / LEAK_MS);
                     self.guest.leak_iop_tokens(tokens);
                 }
 
-                if let Some(bw_limit) = self.guest.get_bw_limit() {
+                if let Some(bw_limit) = self.guest.bw_limit {
                     let tokens = bw_limit / (1000 / LEAK_MS);
                     self.guest.leak_bw_tokens(tokens);
                 }
@@ -490,9 +482,11 @@ impl Upstairs {
         // This must be called before acking jobs, because it looks in
         // `Downstairs::ackable_jobs` to see which jobs are done.
         if let Some(job_id) = self.downstairs.check_live_repair() {
-            let mut gw = self.guest.guest_work.lock().await;
-            self.downstairs
-                .continue_live_repair(job_id, &mut gw, &self.state);
+            self.downstairs.continue_live_repair(
+                job_id,
+                &mut self.guest.guest_work,
+                &self.state,
+            );
         }
 
         // Send jobs downstairs as they become available.  This must be called
@@ -505,8 +499,9 @@ impl Upstairs {
 
         // Handle any jobs that have become ready for acks
         if self.downstairs.has_ackable_jobs() {
-            let mut gw = self.guest.guest_work.lock().await;
-            self.downstairs.ack_jobs(&mut gw, &self.stats).await;
+            self.downstairs
+                .ack_jobs(&mut self.guest.guest_work, &self.stats)
+                .await;
         }
 
         // Check for client-side deactivation
@@ -591,7 +586,7 @@ impl Upstairs {
 
     /// Fires the `up-status` DTrace probe
     async fn on_stat_update(&self) {
-        let up_count = self.guest.guest_work.lock().await.active.len() as u32;
+        let up_count = self.guest.guest_work.active.len() as u32;
         let ds_count = self.downstairs.active_count() as u32;
         let ds_state = self.downstairs.collect_stats(|c| c.state());
 
@@ -649,7 +644,7 @@ impl Upstairs {
         match c {
             ControlRequest::UpstairsStats(tx) => {
                 let ds_state = self.downstairs.collect_stats(|c| c.state());
-                let up_jobs = self.guest.guest_work.lock().await.active.len();
+                let up_jobs = self.guest.guest_work.active.len();
                 let ds_jobs = self.downstairs.active_count();
                 let repair_done = self.downstairs.reconcile_repaired();
                 let repair_needed = self.downstairs.reconcile_repair_needed();
@@ -769,7 +764,7 @@ impl Upstairs {
             info!(self.log, "No Live Repair required at this time");
         } else if !self.downstairs.start_live_repair(
             &self.state,
-            self.guest.guest_work.lock().await.deref_mut(),
+            &mut self.guest.guest_work,
             self.ddef.get_def().unwrap().extent_count().into(),
         ) {
             // It's hard to hit this condition; we need a Downstairs to be in
@@ -930,7 +925,7 @@ impl Upstairs {
                     .filter(|c| c.state() == DsState::Active)
                     .count();
                 *data.lock().await = WQCounts {
-                    up_count: self.guest.guest_work.lock().await.active.len(),
+                    up_count: self.guest.guest_work.active.len(),
                     ds_count: self.downstairs.active_count(),
                     active_count,
                 };
@@ -975,12 +970,18 @@ impl Upstairs {
                 }
                 Err(e) => res.send_err(e),
             },
+            BlockOp::SetBwLimit(v) => {
+                self.guest.bw_limit = Some(v);
+            }
+            BlockOp::SetIopLimit(v) => {
+                self.guest.iop_limit_cfg = Some(v);
+            }
         }
     }
 
     pub(crate) async fn show_all_work(&self) -> WQCounts {
         let gior = self.guest_io_ready();
-        let up_count = self.guest.guest_work.lock().await.active.len();
+        let up_count = self.guest.guest_work.active.len();
 
         let ds_count = self.downstairs.active_count();
 
@@ -996,7 +997,7 @@ impl Upstairs {
         );
         if ds_count == 0 {
             if up_count != 0 {
-                crate::show_guest_work(&self.guest).await;
+                crate::show_guest_work(&self.guest);
             }
         } else {
             self.downstairs.show_all_work()
@@ -1015,7 +1016,7 @@ impl Upstairs {
 
         // TODO this is a ringbuffer, why are we turning it to a Vec to look at
         // the last five items?
-        let up_done = self.guest.guest_work.lock().await.completed.to_vec();
+        let up_done = self.guest.guest_work.completed.to_vec();
         print!("Upstairs last five completed:  ");
         for j in up_done.iter().rev().take(5) {
             print!(" {:4}", j);
@@ -1119,8 +1120,7 @@ impl Upstairs {
          * ID and the next_id are connected here, in that all future writes
          * should be flushed at the next flush ID.
          */
-        let mut gw = self.guest.guest_work.lock().await;
-        let gw_id = gw.next_gw_id();
+        let gw_id = self.guest.guest_work.next_gw_id();
         cdt::gw__flush__start!(|| (gw_id.0));
 
         if snapshot_details.is_some() {
@@ -1130,7 +1130,7 @@ impl Upstairs {
         let next_id = self.downstairs.submit_flush(gw_id, snapshot_details);
 
         let new_gtos = GtoS::new(next_id, None, res);
-        gw.active.insert(gw_id, new_gtos);
+        self.guest.guest_work.active.insert(gw_id, new_gtos);
 
         cdt::up__to__ds__flush__start!(|| (gw_id.0));
     }
@@ -1180,7 +1180,6 @@ impl Upstairs {
          * end. This ID is also put into the IO struct we create that
          * handles the operation(s) on the storage side.
          */
-        let mut gw = self.guest.guest_work.lock().await;
         let ddef = self.ddef.get_def().unwrap();
 
         /*
@@ -1210,7 +1209,7 @@ impl Upstairs {
          * Grab this ID after extent_from_offset: in case of Err we don't
          * want to create a gap in the IDs.
          */
-        let gw_id = gw.next_gw_id();
+        let gw_id = self.guest.guest_work.next_gw_id();
         cdt::gw__read__start!(|| (gw_id.0));
 
         let next_id = self.downstairs.submit_read(gw_id, impacted_blocks, ddef);
@@ -1220,7 +1219,7 @@ impl Upstairs {
         // modifying the Upstairs right now; even if the job finishes
         // instantaneously, it can't interrupt this function.
         let new_gtos = GtoS::new(next_id, Some(data), res);
-        gw.active.insert(gw_id, new_gtos);
+        self.guest.guest_work.active.insert(gw_id, new_gtos);
 
         cdt::up__to__ds__read__start!(|| (gw_id.0));
     }
@@ -1351,14 +1350,13 @@ impl Upstairs {
          * end. This ID is also put into the IO struct we create that
          * handles the operation(s) on the storage side.
          */
-        let mut gw = self.guest.guest_work.lock().await;
         self.need_flush = true;
 
         /*
          * Grab this ID after extent_from_offset: in case of Err we don't
          * want to create a gap in the IDs.
          */
-        let gw_id = gw.next_gw_id();
+        let gw_id = self.guest.guest_work.next_gw_id();
         if write.is_write_unwritten {
             cdt::gw__write__unwritten__start!(|| (gw_id.0));
         } else {
@@ -1374,7 +1372,7 @@ impl Upstairs {
 
         // New work created, add to the guest_work HM
         let new_gtos = GtoS::new(next_id, None, write.res);
-        gw.active.insert(gw_id, new_gtos);
+        self.guest.guest_work.active.insert(gw_id, new_gtos);
 
         if write.is_write_unwritten {
             cdt::up__to__ds__write__unwritten__start!(|| (gw_id.0));

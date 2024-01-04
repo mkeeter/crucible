@@ -1,7 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -101,19 +100,17 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }));
 
-    let mut guest = Guest::new(None);
+    let (guest, io) = Guest::new(None);
 
     if let Some(iop_limit) = opt.iop_limit {
-        guest.set_iop_limit(16 * 1024 * 1024, iop_limit);
+        guest.set_iop_limit(16 * 1024 * 1024, iop_limit).await;
     }
 
     if let Some(bw_limit) = opt.bw_limit_in_bytes {
-        guest.set_bw_limit(bw_limit);
+        guest.set_bw_limit(bw_limit).await;
     }
 
-    let guest = Arc::new(guest);
-    let _join_handle =
-        up_main(crucible_opts, opt.gen, None, guest.clone(), None)?;
+    let _join_handle = up_main(crucible_opts, opt.gen, None, io, None)?;
     println!("Crucible runtime is spawned");
 
     guest.activate().await?;

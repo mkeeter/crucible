@@ -5,7 +5,6 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::FromRawFd;
-use std::sync::Arc;
 use std::{cmp, io};
 
 use anyhow::{bail, Result};
@@ -104,7 +103,7 @@ pub fn opts() -> Result<Opt> {
 
 async fn cmd_read<T: BlockIO>(
     opt: &Opt,
-    crucible: Arc<T>,
+    crucible: &T,
     mut early_shutdown: oneshot::Receiver<()>,
 ) -> Result<usize> {
     let volume_size = crucible.total_size().await?;
@@ -275,7 +274,7 @@ async fn cmd_read<T: BlockIO>(
 // - issue a flush
 // - block on all futures
 async fn write_remainder_and_finalize<'a, T: BlockIO>(
-    crucible: &Arc<T>,
+    crucible: &T,
     mut w_buf: BytesMut,
     offset: Block,
     n_read: usize,
@@ -336,7 +335,7 @@ async fn write_remainder_and_finalize<'a, T: BlockIO>(
 /// Returns the number of bytes written
 async fn cmd_write<T: BlockIO>(
     opt: &Opt,
-    crucible: Arc<T>,
+    crucible: &T,
     mut early_shutdown: oneshot::Receiver<()>,
 ) -> Result<usize> {
     let mut total_bytes_written = 0;
@@ -463,7 +462,7 @@ async fn cmd_write<T: BlockIO>(
         if n_read < w_buf.capacity() {
             eprintln!("n_read was {}, returning early", n_read);
             write_remainder_and_finalize(
-                &crucible,
+                crucible,
                 w_buf,
                 offset,
                 n_read,
@@ -514,7 +513,7 @@ async fn cmd_write<T: BlockIO>(
         total_bytes_written += n_read;
 
         write_remainder_and_finalize(
-            &crucible,
+            crucible,
             w_buf,
             offset,
             n_read,
@@ -563,10 +562,9 @@ async fn main() -> Result<()> {
     };
 
     // TODO: volumes?
-    let guest = Arc::new(Guest::new(None));
+    let (guest, io) = Guest::new(None);
 
-    let _join_handle =
-        up_main(crucible_opts, opt.gen, None, guest.clone(), None)?;
+    let _join_handle = up_main(crucible_opts, opt.gen, None, io, None)?;
     eprintln!("Crucible runtime is spawned");
 
     // IO time
@@ -582,11 +580,9 @@ async fn main() -> Result<()> {
 
     let act_result = match opt.subcommand {
         CruddAct::Write => {
-            cmd_write(&opt, guest.clone(), early_shutdown_receiver).await
+            cmd_write(&opt, &guest, early_shutdown_receiver).await
         }
-        CruddAct::Read => {
-            cmd_read(&opt, guest.clone(), early_shutdown_receiver).await
-        }
+        CruddAct::Read => cmd_read(&opt, &guest, early_shutdown_receiver).await,
     };
     match act_result {
         Ok(total_bytes_processed) => {

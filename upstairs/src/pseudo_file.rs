@@ -69,7 +69,7 @@ impl IOSpan {
     #[instrument(skip(block_io))]
     pub async fn read_affected_blocks_from_volume<T: BlockIO>(
         &mut self,
-        block_io: &Arc<T>,
+        block_io: &T,
     ) -> Result<(), CrucibleError> {
         block_io
             .read(
@@ -85,7 +85,7 @@ impl IOSpan {
     #[instrument(skip(block_io))]
     pub async fn write_affected_blocks_to_volume<T: BlockIO>(
         &self,
-        block_io: &Arc<T>,
+        block_io: &T,
     ) -> Result<(), CrucibleError> {
         let bytes = Bytes::from(self.buffer.as_vec().await.clone());
 
@@ -124,7 +124,7 @@ impl IOSpan {
  */
 pub struct CruciblePseudoFile<T: BlockIO> {
     active: bool,
-    block_io: Arc<T>,
+    block_io: T,
     offset: u64,
     sz: u64,
     block_size: u64,
@@ -133,7 +133,7 @@ pub struct CruciblePseudoFile<T: BlockIO> {
 }
 
 impl<T: BlockIO> CruciblePseudoFile<T> {
-    pub fn from(block_io: Arc<T>) -> Result<Self, CrucibleError> {
+    pub fn from(block_io: T) -> Result<Self, CrucibleError> {
         Ok(CruciblePseudoFile {
             active: false,
             block_io,

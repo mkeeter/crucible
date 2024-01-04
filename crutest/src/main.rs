@@ -2,7 +2,6 @@
 use std::fs::File;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
@@ -281,9 +280,7 @@ pub struct RegionInfo {
 /*
  * All the tests need this basic set of information about the region.
  */
-async fn get_region_info(
-    guest: &Arc<Guest>,
-) -> Result<RegionInfo, CrucibleError> {
+async fn get_region_info(guest: &Guest) -> Result<RegionInfo, CrucibleError> {
     /*
      * These query requests have the side effect of preventing the test from
      * starting before the upstairs is ready.
@@ -519,7 +516,7 @@ impl WriteLog {
 }
 
 async fn load_write_log(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     vi: PathBuf,
     verify: bool,
@@ -668,7 +665,7 @@ async fn main() -> Result<()> {
      * We create this here instead of inside up_main() so we can use
      * the methods provided by guest to interact with Crucible.
      */
-    let guest = Arc::new(Guest::new(None));
+    let (guest, io) = Guest::new(None);
 
     let pr;
     if opt.metrics {
@@ -698,8 +695,7 @@ async fn main() -> Result<()> {
         pr = None;
     }
 
-    let _join_handle =
-        up_main(crucible_opts, opt.gen, None, guest.clone(), pr)?;
+    let _join_handle = up_main(crucible_opts, opt.gen, None, io, pr)?;
     println!("Crucible runtime is spawned");
 
     if let Workload::CliServer { listen, port } = opt.workload {
@@ -1087,7 +1083,7 @@ async fn main() -> Result<()> {
  * value for a block since the last commit was called.
  */
 async fn verify_volume(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     range: bool,
 ) -> Result<()> {
@@ -1329,10 +1325,7 @@ fn validate_vec(
  * I named it balloon because each loop on a block "balloons" from the
  * minimum IO size to the largest possible IO size.
  */
-async fn balloon_workload(
-    guest: &Arc<Guest>,
-    ri: &mut RegionInfo,
-) -> Result<()> {
+async fn balloon_workload(guest: &Guest, ri: &mut RegionInfo) -> Result<()> {
     for block_index in 0..ri.total_blocks {
         /*
          * Loop over all the IO sizes (in blocks) that an IO can
@@ -1386,7 +1379,7 @@ async fn balloon_workload(
  * Write then read (and verify) to every possible block.
  */
 async fn fill_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     skip_verify: bool,
 ) -> Result<()> {
@@ -1439,7 +1432,7 @@ async fn fill_workload(
  * touched without having to write to every block.
  */
 async fn fill_sparse_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
 ) -> Result<()> {
     let mut rng = rand_chacha::ChaCha8Rng::from_entropy();
@@ -1476,7 +1469,7 @@ async fn fill_sparse_workload(
  * Read data is verified.
  */
 async fn generic_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     wtq: &mut WhenToQuit,
     ri: &mut RegionInfo,
     quiet: bool,
@@ -1650,7 +1643,7 @@ async fn generic_workload(
 // be below the threshold of gone_too_long() so we don't end up faulting the
 // downstairs and doing a live repair
 async fn replay_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     wtq: &mut WhenToQuit,
     ri: &mut RegionInfo,
     dsc_client: Client,
@@ -1725,7 +1718,7 @@ async fn replay_workload(
 // bunch more IO.  Wait for all IO to finish (on all three downstairs) before
 // we continue.
 async fn replace_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     wtq: &mut WhenToQuit,
     ri: &mut RegionInfo,
     full_targets: Vec<SocketAddr>,
@@ -1818,7 +1811,7 @@ async fn replace_workload(
  * automatic flush can come through and sync our data.
  */
 async fn dirty_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     count: usize,
 ) -> Result<()> {
@@ -2034,7 +2027,7 @@ struct Record {
  */
 #[allow(clippy::too_many_arguments)]
 async fn perf_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     wtr: &mut Option<&mut csv::Writer<File>>,
     count: usize,
@@ -2181,7 +2174,7 @@ async fn perf_workload(
  * Generate a random offset and length, and write to then read from
  * that offset/length.  Verify the data is what we expect.
  */
-async fn one_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
+async fn one_workload(guest: &Guest, ri: &mut RegionInfo) -> Result<()> {
     /*
      * TODO: Allow the user to specify a seed here.
      */
@@ -2241,7 +2234,7 @@ async fn one_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
  * for the IO parts of this.
  */
 async fn deactivate_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     count: usize,
     ri: &mut RegionInfo,
     mut gen: u64,
@@ -2314,7 +2307,7 @@ async fn deactivate_workload(
  * that offset/length.  Verify the data is what we expect.
  */
 async fn write_flush_read_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     count: usize,
     ri: &mut RegionInfo,
 ) -> Result<()> {
@@ -2394,7 +2387,7 @@ async fn write_flush_read_workload(
  * Wait for each burst to finish, pause, then loop.
  */
 async fn burst_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     count: usize,
     demo_count: usize,
     ri: &mut RegionInfo,
@@ -2444,7 +2437,7 @@ async fn burst_workload(
  * We try to exit this test and leave jobs outstanding.
  */
 async fn repair_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     count: usize,
     ri: &mut RegionInfo,
 ) -> Result<()> {
@@ -2555,7 +2548,7 @@ async fn repair_workload(
  * then watch them complete.
  */
 async fn demo_workload(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     count: usize,
     ri: &mut RegionInfo,
 ) -> Result<()> {
@@ -2647,7 +2640,7 @@ async fn demo_workload(
  * This is a test workload that generates a single write spanning an extent
  * then will try to read the same.
  */
-async fn span_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
+async fn span_workload(guest: &Guest, ri: &mut RegionInfo) -> Result<()> {
     /*
      * Pick the last block in the first extent
      */
@@ -2690,7 +2683,7 @@ async fn span_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
  * Write, flush, then read every block in the volume.
  * We wait for each op to finish, so this is all sequential.
  */
-async fn big_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
+async fn big_workload(guest: &Guest, ri: &mut RegionInfo) -> Result<()> {
     for block_index in 0..ri.total_blocks {
         /*
          * Update the write count for all blocks we plan to write to.
@@ -2734,10 +2727,7 @@ async fn big_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
     Ok(())
 }
 
-async fn biggest_io_workload(
-    guest: &Arc<Guest>,
-    ri: &mut RegionInfo,
-) -> Result<()> {
+async fn biggest_io_workload(guest: &Guest, ri: &mut RegionInfo) -> Result<()> {
     /*
      * Based on our protocol, send the biggest IO we can.
      */
@@ -2805,7 +2795,7 @@ async fn biggest_io_workload(
  *
  * TODO: Make this test use the global write count, but remember, async.
  */
-async fn dep_workload(guest: &Arc<Guest>, ri: &mut RegionInfo) -> Result<()> {
+async fn dep_workload(guest: &Guest, ri: &mut RegionInfo) -> Result<()> {
     let final_offset = ri.total_size - ri.block_size;
 
     let mut my_offset: u64 = 0;

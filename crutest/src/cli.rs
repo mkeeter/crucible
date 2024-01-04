@@ -213,7 +213,7 @@ enum CliCommand {
  * the cli server can send it back to the client for display.
  */
 async fn cli_read(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     block_index: usize,
     size: usize,
@@ -256,7 +256,7 @@ async fn cli_read(
  * A wrapper around write that just picks a random offset.
  */
 async fn rand_write(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
 ) -> Result<(), CrucibleError> {
     /*
@@ -282,7 +282,7 @@ async fn rand_write(
  * Update the internal write counter so we have something to compare to.
  */
 async fn cli_write(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     block_index: usize,
     size: usize,
@@ -326,7 +326,7 @@ async fn cli_write(
  * internal counter and we don't expect our write to change the contents.
  */
 async fn cli_write_unwritten(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     ri: &mut RegionInfo,
     block_index: usize,
 ) -> Result<(), CrucibleError> {
@@ -738,7 +738,7 @@ pub async fn start_cli_client(attach: SocketAddr) -> Result<()> {
  * Process a CLI command from the client, we are the server side.
  */
 async fn process_cli_command(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     fw: &mut FramedWrite<tokio::net::tcp::OwnedWriteHalf, CliEncoder>,
     cmd: protocol::CliMessage,
     ri: &mut RegionInfo,
@@ -1024,7 +1024,7 @@ async fn process_cli_command(
  * Wait here if you want.
  */
 pub async fn start_cli_server(
-    guest: &Arc<Guest>,
+    guest: &Guest,
     address: IpAddr,
     port: u16,
     verify_input: Option<PathBuf>,
