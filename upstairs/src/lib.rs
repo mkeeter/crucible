@@ -1633,8 +1633,6 @@ pub enum BlockOp {
     ShowWork {
         data: Arc<Mutex<WQCounts>>,
     },
-    SetIopLimit(IopLimit),
-    SetBwLimit(usize),
 }
 
 macro_rules! ceiling_div {
@@ -2054,6 +2052,9 @@ pub struct Guest {
     /// New requests from outside go into this queue
     req_tx: mpsc::Sender<BlockReq>,
 
+    /// Guest IO and bandwidth limits, shared with the `GuestIoHandle`
+    limits: Arc<std::sync::Mutex<GuestLimits>>,
+
     /// Local cache for block size
     ///
     /// This is 0 when unpopulated, and non-zero otherwise; storing it locally
@@ -2111,10 +2112,15 @@ impl Guest {
         let log = log.unwrap_or_else(build_logger);
         let (req_tx, req_rx) = mpsc::channel(500);
         let backpressure_us = Arc::new(AtomicU64::new(0));
+        let limits = Arc::new(std::sync::Mutex::new(GuestLimits {
+            iop_limit: None,
+            bw_limit: None,
+        }));
         let io = GuestIoHandle {
             req_rx,
             req_head: None,
             req_limited: false,
+            limits: limits.clone(),
 
             guest_work: GuestWork {
                 active: HashMap::new(), // GtoS
@@ -2123,9 +2129,7 @@ impl Guest {
             },
 
             iop_tokens: 0,
-            iop_limit_cfg: None,
             bw_tokens: 0,
-            bw_limit: None,
             backpressure_us: backpressure_us.clone(),
             backpressure_config: BackpressureConfig {
                 bytes_start: 1024u64.pow(3), // Start at 1 GiB
@@ -2137,6 +2141,7 @@ impl Guest {
         };
         let guest = Guest {
             req_tx,
+            limits: limits.clone(),
 
             block_size: AtomicU64::new(0),
 
@@ -2147,19 +2152,15 @@ impl Guest {
         (guest, io)
     }
 
-    pub async fn set_iop_limit(&self, bytes_per_iop: usize, limit: usize) {
-        // Fire and forget, since this is infallible on the other side
-        let _ = self
-            .send(BlockOp::SetIopLimit(IopLimit {
-                bytes_per_iop,
-                iop_limit: limit,
-            }))
-            .await;
+    pub fn set_iop_limit(&self, bytes_per_iop: usize, limit: usize) {
+        self.limits.lock().unwrap().iop_limit = Some(IopLimit {
+            bytes_per_iop,
+            iop_limit: limit,
+        });
     }
 
-    pub async fn set_bw_limit(&self, bytes_per_second: usize) {
-        // Fire and forget, since this is infallible on the other side
-        let _ = self.send(BlockOp::SetBwLimit(bytes_per_second)).await;
+    pub fn set_bw_limit(&self, bytes_per_second: usize) {
+        self.limits.lock().unwrap().bw_limit = Some(bytes_per_second);
     }
 
     /*
@@ -2411,15 +2412,25 @@ impl BlockIO for Guest {
 }
 
 /// Configuration for iops-per-second limiting
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct IopLimit {
     bytes_per_iop: usize,
     iop_limit: usize,
 }
 
+/// Configuration for guest limits
+#[derive(Copy, Clone, Debug)]
+pub struct GuestLimits {
+    iop_limit: Option<IopLimit>,
+    bw_limit: Option<usize>,
+}
+
 pub struct GuestIoHandle {
     /// Queue to receive new blockreqs
     req_rx: mpsc::Receiver<BlockReq>,
+
+    /// Guest IO and bandwidth limits
+    limits: Arc<std::sync::Mutex<GuestLimits>>,
 
     /// `BlockReq` that is at the head of the queue
     ///
@@ -2436,14 +2447,6 @@ pub struct GuestIoHandle {
     /// Current number of IOP tokens
     iop_tokens: usize,
 
-    /// Configuration for IOP limiting
-    ///
-    ///
-    /// Setting an IOP limit means that the rate at which block reqs are
-    /// pulled off will be limited. No setting means they are sent right
-    /// away.
-    iop_limit_cfg: Option<IopLimit>,
-
     /// Current backpressure (shared with the `Guest`)
     backpressure_us: Arc<AtomicU64>,
 
@@ -2452,12 +2455,6 @@ pub struct GuestIoHandle {
 
     /// Bandwidth tokens (in bytes)
     bw_tokens: usize,
-
-    /// Bandwidth limit (in bytes/sec)
-    ///
-    /// Setting a bandwidth limit will also limit the rate at which block reqs
-    /// are pulled off the queue.
-    bw_limit: Option<usize>,
 
     /// Active work from the guest
     ///
@@ -2509,9 +2506,11 @@ impl GuestIoHandle {
         };
 
         // Check if we can consume right away
+        let limits = *self.limits.lock().unwrap();
         let iop_limit_applies =
-            self.iop_limit_cfg.is_some() && req.op.consumes_iops();
-        let bw_limit_applies = self.bw_limit.is_some() && req.op.sz().is_some();
+            limits.iop_limit.is_some() && req.op.consumes_iops();
+        let bw_limit_applies =
+            limits.bw_limit.is_some() && req.op.sz().is_some();
 
         if !iop_limit_applies && !bw_limit_applies {
             return req;
@@ -2529,13 +2528,13 @@ impl GuestIoHandle {
         // test_impossible_io). Instead, check if the limits are already
         // reached.
 
-        if let Some(bw_limit) = self.bw_limit {
+        if let Some(bw_limit) = limits.bw_limit {
             if req.op.sz().is_some() && self.bw_tokens >= bw_limit {
                 bw_check_ok = false;
             }
         }
 
-        if let Some(iop_limit_cfg) = &self.iop_limit_cfg {
+        if let Some(iop_limit_cfg) = &limits.iop_limit {
             let bytes_per_iops = iop_limit_cfg.bytes_per_iop;
             if req.op.iops(bytes_per_iops).is_some()
                 && self.iop_tokens >= iop_limit_cfg.iop_limit
@@ -2547,13 +2546,13 @@ impl GuestIoHandle {
         // If both checks pass, consume appropriate resources and return the
         // block req
         if bw_check_ok && iop_check_ok {
-            if self.bw_limit.is_some() {
+            if limits.bw_limit.is_some() {
                 if let Some(sz) = req.op.sz() {
                     self.bw_tokens += sz;
                 }
             }
 
-            if let Some(cfg) = &self.iop_limit_cfg {
+            if let Some(cfg) = &limits.iop_limit {
                 if let Some(req_iops) = req.op.iops(cfg.bytes_per_iop) {
                     self.iop_tokens += req_iops;
                 }

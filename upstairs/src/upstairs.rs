@@ -441,12 +441,13 @@ impl Upstairs {
                 const LEAK_MS: usize = 1000;
                 let leak_tick =
                     tokio::time::Duration::from_millis(LEAK_MS as u64);
-                if let Some(iop_limit_cfg) = &self.guest.iop_limit_cfg {
+                let limits = *self.guest.limits.lock().unwrap();
+                if let Some(iop_limit_cfg) = &limits.iop_limit {
                     let tokens = iop_limit_cfg.iop_limit / (1000 / LEAK_MS);
                     self.guest.leak_iop_tokens(tokens);
                 }
 
-                if let Some(bw_limit) = self.guest.bw_limit {
+                if let Some(bw_limit) = limits.bw_limit {
                     let tokens = bw_limit / (1000 / LEAK_MS);
                     self.guest.leak_bw_tokens(tokens);
                 }
@@ -970,12 +971,6 @@ impl Upstairs {
                 }
                 Err(e) => res.send_err(e),
             },
-            BlockOp::SetBwLimit(v) => {
-                self.guest.bw_limit = Some(v);
-            }
-            BlockOp::SetIopLimit(v) => {
-                self.guest.iop_limit_cfg = Some(v);
-            }
         }
     }
 

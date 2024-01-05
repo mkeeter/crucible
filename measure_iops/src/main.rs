@@ -103,11 +103,11 @@ async fn main() -> Result<()> {
     let (guest, io) = Guest::new(None);
 
     if let Some(iop_limit) = opt.iop_limit {
-        guest.set_iop_limit(16 * 1024 * 1024, iop_limit).await;
+        guest.set_iop_limit(16 * 1024 * 1024, iop_limit);
     }
 
     if let Some(bw_limit) = opt.bw_limit_in_bytes {
-        guest.set_bw_limit(bw_limit).await;
+        guest.set_bw_limit(bw_limit);
     }
 
     let _join_handle = up_main(crucible_opts, opt.gen, None, io, None)?;

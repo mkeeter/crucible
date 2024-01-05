@@ -764,12 +764,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn test_set_iop_limit() -> Result<()> {
         let (guest, mut io) = Guest::new(None);
-        io.iop_limit_cfg = Some(IopLimit {
-            bytes_per_iop: 16000,
-            iop_limit: 2,
-        });
-        // Don't use `guest.set_iop_limit`, because that requires a running
-        // event loop to handle the `BlockReq::SetIopLimit`.
+        guest.set_iop_limit(16000, 2);
 
         assert_none_consumed(&mut io).await;
 
@@ -829,10 +824,7 @@ pub(crate) mod up_test {
         let (guest, mut io) = Guest::new(None);
 
         // Set 0 as IOP limit
-        io.iop_limit_cfg = Some(IopLimit {
-            bytes_per_iop: 16000,
-            iop_limit: 0,
-        });
+        guest.set_iop_limit(16000, 0);
         assert_none_consumed(&mut io).await;
 
         let _ = guest
@@ -863,7 +855,7 @@ pub(crate) mod up_test {
     #[tokio::test]
     async fn test_set_bw_limit() -> Result<()> {
         let (guest, mut io) = Guest::new(None);
-        io.bw_limit = Some(1024 * 1024); // 1 KiB
+        guest.set_bw_limit(1024 * 1024); // 1 KiB
 
         assert_none_consumed(&mut io).await;
 
@@ -922,7 +914,7 @@ pub(crate) mod up_test {
         let (guest, mut io) = Guest::new(None);
 
         // Set 0 as bandwidth limit
-        io.bw_limit = Some(0);
+        guest.set_bw_limit(0);
         assert_none_consumed(&mut io).await;
 
         let _ = guest
@@ -954,11 +946,8 @@ pub(crate) mod up_test {
     async fn test_iop_and_bw_limit() -> Result<()> {
         let (guest, mut io) = Guest::new(None);
 
-        io.iop_limit_cfg = Some(IopLimit {
-            bytes_per_iop: 16384, // 1 IOP is 16 KiB
-            iop_limit: 500,
-        });
-        io.bw_limit = Some(6400 * 1024); // 16384 B * 400 = 6400 KiB/s
+        guest.set_iop_limit(16384, 500); // 1 IOP is 16 KiB
+        guest.set_bw_limit(6400 * 1024); // 16384 B * 400 = 6400 KiB/s
         assert_none_consumed(&mut io).await;
 
         // Don't use guest.read, that will send a block size query that will
@@ -1074,11 +1063,8 @@ pub(crate) mod up_test {
     async fn test_impossible_io() -> Result<()> {
         let (guest, mut io) = Guest::new(None);
 
-        io.iop_limit_cfg = Some(IopLimit {
-            bytes_per_iop: 1024 * 1024 / 2, // 1 IOP is half a KiB
-            iop_limit: 10,
-        });
-        io.bw_limit = Some(1024 * 1024); // 1 KiB
+        guest.set_iop_limit(1024 * 1024 / 2, 10); // 1 IOP is half a KiB
+        guest.set_bw_limit(1024 * 1024); // 1 KiB
         assert_none_consumed(&mut io).await;
 
         // Sending an IO of 10 KiB is larger than the bandwidth limit and
