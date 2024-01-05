@@ -1095,8 +1095,8 @@ pub mod repair_test {
         }
     }
 
-    #[tokio::test]
-    async fn test_reserve_extent_repair_ids() {
+    #[test]
+    fn test_reserve_extent_repair_ids() {
         // Verify that we can reserve extent IDs for repair work, and they
         // are allocated as expected.
         let mut up = create_test_upstairs();
@@ -1110,10 +1110,8 @@ pub mod repair_test {
         let client = &mut up.downstairs.clients[ClientId::new(1)];
         client.checked_state_transition(&up.state, DsState::Faulted);
         client.checked_state_transition(&up.state, DsState::LiveRepairReady);
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.downstairs.live_repair_in_progress());
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(up.downstairs.last_repair_extent(), Some(0));
 
         // We should have reserved ids 1000 -> 1003
@@ -1172,8 +1170,7 @@ pub mod repair_test {
         )
         .await;
 
-        up.submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        up.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // WriteUnwritten
         up.submit_dummy_write(
@@ -1210,8 +1207,7 @@ pub mod repair_test {
         )
         .await;
 
-        up.submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        up.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // WriteUnwritten
         up.submit_dummy_write(
@@ -1244,8 +1240,7 @@ pub mod repair_test {
         )
         .await;
 
-        up.submit_dummy_read(Block::new_512(3), Buffer::new(512))
-            .await;
+        up.submit_dummy_read(Block::new_512(3), Buffer::new(512));
 
         // WriteUnwritten
         up.submit_dummy_write(
@@ -1329,8 +1324,7 @@ pub mod repair_test {
         )
         .await;
 
-        up.submit_dummy_read(Block::new_512(0), Buffer::new(512 * 9))
-            .await;
+        up.submit_dummy_read(Block::new_512(0), Buffer::new(512 * 9));
 
         // WriteUnwritten
         up.submit_dummy_write(
@@ -1392,11 +1386,10 @@ pub mod repair_test {
         finish_live_repair(&mut up, 1000).await;
 
         // Our default extent size is 3, so 9 blocks will span 3 extents
-        up.submit_dummy_read(Block::new_512(0), Buffer::new(512 * 9))
-            .await;
+        up.submit_dummy_read(Block::new_512(0), Buffer::new(512 * 9));
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        up.show_all_work().await;
+        up.show_all_work();
 
         // All clients should send the jobs (no skipped)
         // The future repair we had to reserve for extent 2 will have

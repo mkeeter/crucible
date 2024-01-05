@@ -456,19 +456,19 @@ impl Upstairs {
             }
             UpstairsAction::FlushCheck => {
                 if self.need_flush {
-                    self.submit_flush(None, None).await;
+                    self.submit_flush(None, None);
                 }
                 self.flush_deadline = deadline_secs(self.flush_timeout_secs);
             }
             UpstairsAction::StatUpdate => {
-                self.on_stat_update().await;
+                self.on_stat_update();
                 self.stat_deadline = deadline_secs(STAT_INTERVAL_SECS);
             }
             UpstairsAction::RepairCheck => {
-                self.on_repair_check().await;
+                self.on_repair_check();
             }
             UpstairsAction::Control(c) => {
-                self.on_control_req(c).await;
+                self.on_control_req(c);
             }
             UpstairsAction::NoOp => (),
         }
@@ -585,7 +585,7 @@ impl Upstairs {
     }
 
     /// Fires the `up-status` DTrace probe
-    async fn on_stat_update(&self) {
+    fn on_stat_update(&self) {
         let up_count = self.guest.guest_work.active.len() as u32;
         let ds_count = self.downstairs.active_count() as u32;
         let ds_state = self.downstairs.collect_stats(|c| c.state());
@@ -640,7 +640,7 @@ impl Upstairs {
     }
 
     /// Handles a request from the (optional) control server
-    async fn on_control_req(&self, c: ControlRequest) {
+    fn on_control_req(&self, c: ControlRequest) {
         match c {
             ControlRequest::UpstairsStats(tx) => {
                 let ds_state = self.downstairs.collect_stats(|c| c.state());
@@ -721,7 +721,7 @@ impl Upstairs {
     /// If this Upstairs is [UpstairsConfig::read_only], this function will move
     /// any Downstairs from [DsState::LiveRepairReady] back to [DsState::Active]
     /// without actually performing any repair.
-    pub(crate) async fn on_repair_check(&mut self) {
+    pub(crate) fn on_repair_check(&mut self) {
         info!(self.log, "Checking if live repair is needed");
         if !matches!(self.state, UpstairsState::Active) {
             info!(self.log, "inactive, no live repair needed");
@@ -820,7 +820,7 @@ impl Upstairs {
     /// and report an error.
     async fn apply_guest_request(&mut self, req: DeferredBlockReq) {
         match req {
-            DeferredBlockReq::Write(req) => self.submit_write(req).await,
+            DeferredBlockReq::Write(req) => self.submit_write(req),
             DeferredBlockReq::Other(req) => {
                 self.apply_guest_request_inner(req).await
             }
@@ -856,7 +856,7 @@ impl Upstairs {
                 res.send_ok();
             }
             BlockOp::Deactivate => {
-                self.set_deactivate(res).await;
+                self.set_deactivate(res);
             }
 
             // Query ops
@@ -934,12 +934,12 @@ impl Upstairs {
 
             BlockOp::ShowWork { data } => {
                 // TODO should this first check if the Upstairs is active?
-                *data.lock().await = self.show_all_work().await;
+                *data.lock().await = self.show_all_work();
                 res.send_ok();
             }
 
             BlockOp::Read { offset, data } => {
-                self.submit_read(offset, data, res).await
+                self.submit_read(offset, data, res)
             }
             BlockOp::Write { .. } | BlockOp::WriteUnwritten { .. } => {
                 panic!("writes must always be deferred")
@@ -956,7 +956,7 @@ impl Upstairs {
                     res.send_err(CrucibleError::UpstairsInactive);
                     return;
                 }
-                self.submit_flush(Some(res), snapshot_details).await;
+                self.submit_flush(Some(res), snapshot_details);
             }
             BlockOp::ReplaceDownstairs {
                 id,
@@ -979,7 +979,7 @@ impl Upstairs {
         }
     }
 
-    pub(crate) async fn show_all_work(&self) -> WQCounts {
+    pub(crate) fn show_all_work(&self) -> WQCounts {
         let gior = self.guest_io_ready();
         let up_count = self.guest.guest_work.active.len();
 
@@ -1078,7 +1078,7 @@ impl Upstairs {
     /// when complete.
     ///
     /// In either case, `self.state` is set to `UpstairsState::Deactivating`
-    async fn set_deactivate(&mut self, res: BlockRes) {
+    fn set_deactivate(&mut self, res: BlockRes) {
         info!(self.log, "Request to deactivate this guest");
         match &self.state {
             UpstairsState::Initializing | UpstairsState::GoActive(..) => {
@@ -1093,7 +1093,7 @@ impl Upstairs {
         }
         if !self.downstairs.can_deactivate_immediately() {
             debug!(self.log, "not ready to deactivate; submitting final flush");
-            self.submit_flush(None, None).await;
+            self.submit_flush(None, None);
         } else {
             debug!(self.log, "ready to deactivate right away");
             // Deactivation is handled in the invariant-checking portion of
@@ -1103,7 +1103,7 @@ impl Upstairs {
         self.state = UpstairsState::Deactivating(res);
     }
 
-    pub(crate) async fn submit_flush(
+    pub(crate) fn submit_flush(
         &mut self,
         res: Option<BlockRes>,
         snapshot_details: Option<SnapshotDetails>,
@@ -1136,30 +1136,21 @@ impl Upstairs {
     }
 
     /// Submits a read job to the downstairs
-    async fn submit_read(
-        &mut self,
-        offset: Block,
-        data: Buffer,
-        res: BlockRes,
-    ) {
-        self.submit_read_inner(offset, data, Some(res)).await
+    fn submit_read(&mut self, offset: Block, data: Buffer, res: BlockRes) {
+        self.submit_read_inner(offset, data, Some(res))
     }
 
     /// Submits a dummy read (without associated `BlockReq`)
     #[cfg(test)]
-    pub(crate) async fn submit_dummy_read(
-        &mut self,
-        offset: Block,
-        data: Buffer,
-    ) {
-        self.submit_read_inner(offset, data, None).await
+    pub(crate) fn submit_dummy_read(&mut self, offset: Block, data: Buffer) {
+        self.submit_read_inner(offset, data, None)
     }
 
     /// Submit a read job to the downstairs, optionally without a `BlockReq`
     ///
     /// # Panics
     /// If `res` is `None` and this isn't the test suite
-    async fn submit_read_inner(
+    fn submit_read_inner(
         &mut self,
         offset: Block,
         data: Buffer,
@@ -1344,7 +1335,7 @@ impl Upstairs {
         })
     }
 
-    async fn submit_write(&mut self, write: EncryptedWrite) {
+    fn submit_write(&mut self, write: EncryptedWrite) {
         /*
          * Get the next ID for the guest work struct we will make at the
          * end. This ID is also put into the IO struct we create that
@@ -1946,7 +1937,7 @@ pub(crate) mod test {
         up.apply(UpstairsAction::RepairCheck).await;
 
         // Assert that the repair started
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(up.downstairs.live_repair_in_progress());
 
@@ -2204,7 +2195,7 @@ pub(crate) mod test {
             .await;
 
         // op 1
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         // op 2
         upstairs
@@ -2253,7 +2244,7 @@ pub(crate) mod test {
         }
 
         // op 3
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         // ops 4 to 6
         for i in 3..6 {
@@ -2471,9 +2462,7 @@ pub(crate) mod test {
             .await;
 
         // op 1
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 2);
@@ -2509,9 +2498,7 @@ pub(crate) mod test {
         }
 
         // op 3
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512 * 2))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512 * 2));
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 4);
@@ -2542,14 +2529,10 @@ pub(crate) mod test {
         upstairs.force_active().unwrap();
 
         // op 0
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // op 1
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 2);
@@ -2582,14 +2565,10 @@ pub(crate) mod test {
             .await;
 
         // op 1
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // op 2
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 3);
@@ -2623,12 +2602,10 @@ pub(crate) mod test {
             .await;
 
         // op 1
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         // op 2
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512 * 2))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512 * 2));
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 3);
@@ -2652,11 +2629,11 @@ pub(crate) mod test {
         let mut upstairs = make_upstairs();
         upstairs.force_active().unwrap();
 
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 3);
@@ -2686,7 +2663,7 @@ pub(crate) mod test {
         upstairs.force_active().unwrap();
 
         // op 0
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         // ops 1 to 2
         for i in 0..2 {
@@ -2700,7 +2677,7 @@ pub(crate) mod test {
         }
 
         // op 3
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         // ops 4 to 6
         for i in 0..3 {
@@ -2714,7 +2691,7 @@ pub(crate) mod test {
         }
 
         // op 7
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 8);
@@ -2753,9 +2730,7 @@ pub(crate) mod test {
         upstairs.force_active().unwrap();
 
         // op 0
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // op 1
         upstairs
@@ -2788,9 +2763,7 @@ pub(crate) mod test {
         upstairs.force_active().unwrap();
 
         // op 0
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // op 1
         upstairs
@@ -2802,9 +2775,7 @@ pub(crate) mod test {
             .await;
 
         // op 2
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         let jobs = upstairs.downstairs.get_all_jobs();
         assert_eq!(jobs.len(), 3);
@@ -2832,9 +2803,7 @@ pub(crate) mod test {
         upstairs.force_active().unwrap();
 
         // op 0
-        upstairs
-            .submit_dummy_read(Block::new_512(0), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(0), Buffer::new(512));
 
         // op 1
         upstairs
@@ -2846,9 +2815,7 @@ pub(crate) mod test {
             .await;
 
         // op 2
-        upstairs
-            .submit_dummy_read(Block::new_512(1), Buffer::new(512 * 2))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(1), Buffer::new(512 * 2));
 
         // op 3
         upstairs
@@ -2860,9 +2827,7 @@ pub(crate) mod test {
             .await;
 
         // op 4
-        upstairs
-            .submit_dummy_read(Block::new_512(3), Buffer::new(512 * 2))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(3), Buffer::new(512 * 2));
 
         // op 5
         upstairs
@@ -3121,9 +3086,7 @@ pub(crate) mod test {
             .await;
 
         // op 4
-        upstairs
-            .submit_dummy_read(Block::new_512(99), Buffer::new(512))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(99), Buffer::new(512));
 
         let ds = &upstairs.downstairs;
         let jobs = ds.get_all_jobs();
@@ -3218,12 +3181,10 @@ pub(crate) mod test {
         upstairs.force_active().unwrap();
 
         // op 0
-        upstairs
-            .submit_dummy_read(Block::new_512(95), Buffer::new(512 * 2))
-            .await;
+        upstairs.submit_dummy_read(Block::new_512(95), Buffer::new(512 * 2));
 
         // op 1
-        upstairs.submit_flush(None, None).await;
+        upstairs.submit_flush(None, None);
 
         // op 2
         upstairs
@@ -3298,8 +3259,8 @@ pub(crate) mod test {
         }
     }
 
-    #[tokio::test]
-    async fn test_check_for_repair_normal() {
+    #[test]
+    fn test_check_for_repair_normal() {
         // No repair needed here.
         // Verify we can't repair when the upstairs is not active.
         // Verify we wont try to repair if it's not needed.
@@ -3312,7 +3273,7 @@ pub(crate) mod test {
 
         // Before we are active, we have no need to repair or check for future
         // repairs.
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(!up.downstairs.live_repair_in_progress());
 
@@ -3320,7 +3281,7 @@ pub(crate) mod test {
         set_all_active(&mut up.downstairs);
 
         // No need to repair or check for future repairs here either
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(!up.downstairs.live_repair_in_progress());
 
@@ -3331,8 +3292,8 @@ pub(crate) mod test {
         assert!(up.downstairs.repair().is_none());
     }
 
-    #[tokio::test]
-    async fn test_check_for_repair_do_repair() {
+    #[test]
+    fn test_check_for_repair_do_repair() {
         // No repair needed here.
         let mut ddef = RegionDefinition::default();
         ddef.set_block_size(512);
@@ -3346,15 +3307,15 @@ pub(crate) mod test {
         // Force client 1 into LiveRepairReady
         up.ds_transition(ClientId::new(1), DsState::Faulted);
         up.ds_transition(ClientId::new(1), DsState::LiveRepairReady);
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(up.downstairs.live_repair_in_progress());
         assert_eq!(up.ds_state(ClientId::new(1)), DsState::LiveRepair);
         assert!(up.downstairs.repair().is_some());
     }
 
-    #[tokio::test]
-    async fn test_check_for_repair_do_two_repair() {
+    #[test]
+    fn test_check_for_repair_do_two_repair() {
         // No repair needed here.
         let mut ddef = RegionDefinition::default();
         ddef.set_block_size(512);
@@ -3370,7 +3331,7 @@ pub(crate) mod test {
             up.ds_transition(i, DsState::Faulted);
             up.ds_transition(i, DsState::LiveRepairReady);
         }
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(up.downstairs.live_repair_in_progress());
 
@@ -3380,8 +3341,8 @@ pub(crate) mod test {
         assert!(up.downstairs.repair().is_some())
     }
 
-    #[tokio::test]
-    async fn test_check_for_repair_already_repair() {
+    #[test]
+    fn test_check_for_repair_already_repair() {
         // No repair needed here.
         let mut ddef = RegionDefinition::default();
         ddef.set_block_size(512);
@@ -3396,7 +3357,7 @@ pub(crate) mod test {
         up.ds_transition(ClientId::new(1), DsState::LiveRepair);
 
         // Start the live-repair
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.downstairs.live_repair_in_progress());
         assert!(up.repair_check_interval.is_none());
 
@@ -3406,13 +3367,13 @@ pub(crate) mod test {
         up.ds_transition(ClientId::new(0), DsState::Faulted);
         up.ds_transition(ClientId::new(0), DsState::LiveRepairReady);
 
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.downstairs.live_repair_in_progress());
         assert!(up.repair_check_interval.is_some());
     }
 
-    #[tokio::test]
-    async fn test_check_for_repair_task_running() {
+    #[test]
+    fn test_check_for_repair_task_running() {
         let mut ddef = RegionDefinition::default();
         ddef.set_block_size(512);
         ddef.set_extent_size(Block::new_512(3));
@@ -3424,12 +3385,12 @@ pub(crate) mod test {
         up.ds_transition(ClientId::new(1), DsState::Faulted);
         up.ds_transition(ClientId::new(1), DsState::LiveRepairReady);
 
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(up.downstairs.live_repair_in_progress());
 
         // Checking again is idempotent
-        up.on_repair_check().await;
+        up.on_repair_check();
         assert!(up.repair_check_interval.is_none());
         assert!(up.downstairs.live_repair_in_progress());
     }
