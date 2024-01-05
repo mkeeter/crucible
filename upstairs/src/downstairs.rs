@@ -472,7 +472,10 @@ impl Downstairs {
                     dependencies,
                     writes,
                 } => {
-                    cdt::ds__write__io__start!(|| (new_id.0, client_id.get()));
+                    cdt::ds__write__io__unwritten__start!(|| (
+                        new_id.0,
+                        client_id.get()
+                    ));
                     ClientRequest::Message(Message::WriteUnwritten {
                         upstairs_id: self.cfg.upstairs_id,
                         session_id: self.cfg.session_id,
