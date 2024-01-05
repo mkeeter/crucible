@@ -6,6 +6,7 @@ use anyhow::bail;
 use bytes::{Buf, BufMut, BytesMut};
 use num_enum::IntoPrimitive;
 use serde::{Deserialize, Serialize};
+use strum_macros::EnumDiscriminants;
 use tokio_util::codec::{Decoder, Encoder};
 use uuid::Uuid;
 
@@ -283,12 +284,7 @@ pub const CRUCIBLE_MESSAGE_VERSION: u32 = 5;
  */
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(
-    Debug,
-    PartialEq,
-    Clone,
-    Serialize,
-    Deserialize,
-    strum_macros::EnumDiscriminants,
+    Debug, PartialEq, Clone, Serialize, Deserialize, EnumDiscriminants,
 )]
 #[strum_discriminants(derive(Serialize))]
 #[repr(u16)]
