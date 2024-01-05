@@ -2641,9 +2641,43 @@ where
             bincode::serialize_into(&mut header[4..8], &m.discriminant())
                 .unwrap();
 
-            // write_all_vectored would save a syscall, but is nightly-only
-            fw.write_all(&header).await?;
-            fw.write_all(&data).await?;
+            write_all_vectored(fw, [&header, &data]).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_all_vectored<W, const N: usize>(
+    w: &mut W,
+    bytes: [&[u8]; N],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    let mut bufs = bytes.map(std::io::IoSlice::new);
+    let mut i = 0; // active subset of bytes
+    let mut j = 0; // offset within bytes[i]
+    while i < bufs.len() {
+        match w.write_vectored(&bufs[i..]).await {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                j += n;
+                while i < bufs.len() && j >= bytes[i].len() {
+                    j -= bytes[i].len();
+                    i += 1;
+                }
+                if i == bufs.len() {
+                    break;
+                }
+                bufs[i] = std::io::IoSlice::new(&bytes[i][j..]);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
