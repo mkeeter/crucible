@@ -14,9 +14,29 @@ pub(crate) struct BlockReq {
     pub res: BlockRes,
 }
 
+impl BlockReq {
+    pub fn new(
+        op: BlockOp,
+        mut res: BlockRes,
+        bp: Arc<BackpressureCounters>,
+    ) -> Self {
+        res.bind(&op, bp);
+        Self { op, res }
+    }
+}
+
 #[must_use]
 #[derive(Debug)]
-pub(crate) struct BlockRes(Option<oneshot::Sender<Result<(), CrucibleError>>>);
+pub(crate) struct BlockRes {
+    tx: Option<oneshot::Sender<Result<(), CrucibleError>>>,
+
+    /// Handle to track IO and jobs in flight for upstairs backpressure
+    ///
+    /// Each job counts as 1 job in `BackpressureCounters::io_jobs`, and may
+    /// additionally have write bytes as the second member of the tuple
+    bp: Option<(Arc<BackpressureCounters>, u64)>,
+}
+
 impl BlockRes {
     /// Consume this BlockRes and send Ok to the receiver
     pub fn send_ok(self) {
@@ -28,18 +48,45 @@ impl BlockRes {
         self.send_result(Err(e))
     }
 
+    /// Add this job to the given backpressure counters
+    ///
+    /// The backpressure counters are stored locally and decremented when this
+    /// `BlockRes` is dropped, so we automatically keep track of outstanding
+    /// work without human intervention.
+    fn bind(&mut self, op: &BlockOp, bp: Arc<BackpressureCounters>) {
+        // Count this job as 1 job and some number of bytes
+        //
+        // (we only count write bytes because only writes return immediately)
+        assert!(self.bp.is_none());
+        let bytes = match op {
+            BlockOp::Write { data, .. } => data.len() as u64,
+            _ => 0,
+        };
+        bp.io_jobs.fetch_add(1, Ordering::Relaxed);
+        bp.write_bytes_outstanding
+            .fetch_add(bytes, Ordering::Relaxed);
+
+        self.bp = Some((bp, bytes));
+    }
+
     /// Consume this BlockRes and send a Result to the receiver
     fn send_result(mut self, r: Result<(), CrucibleError>) {
         // XXX this eats the result!
-        let _ = self.0.take().expect("sender was populated").send(r);
+        let _ = self.tx.take().expect("sender was populated").send(r);
     }
 }
 impl Drop for BlockRes {
     fn drop(&mut self) {
-        if self.0.is_some() {
+        if self.tx.is_some() {
             // During normal operation, we expect to reply to every BlockReq, so
             // we'll fire a DTrace probe here.
             cdt::up__block__req__dropped!();
+        }
+        // Update backpressure counters (if present)
+        if let Some((bp, bytes)) = self.bp.take() {
+            bp.write_bytes_outstanding
+                .fetch_sub(bytes, Ordering::Relaxed);
+            bp.io_jobs.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -59,7 +106,13 @@ impl BlockReqWaiter {
     /// Create associated `BlockReqWaiter`/`BlockRes` pair
     pub fn pair() -> (BlockReqWaiter, BlockRes) {
         let (send, recv) = oneshot::channel();
-        (Self { recv }, BlockRes(Some(send)))
+        (
+            Self { recv },
+            BlockRes {
+                tx: Some(send),
+                bp: None,
+            },
+        )
     }
 
     /// Consume this BlockReqWaiter and wait on the message

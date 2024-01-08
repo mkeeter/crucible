@@ -2080,8 +2080,11 @@ pub struct Guest {
     /// it can be read from a `&self` reference.
     block_size: AtomicU64,
 
-    /// Backpressure is implemented as a delay on host write operations
-    backpressure_us: AtomicU64,
+    /// Current values for backpressure
+    ///
+    /// This is an `Arc` within the `Arc<Guest>` because every `BlockReq` gets a
+    /// handle (and decrements in their `Drop` implementation)
+    backpressure_counters: Arc<BackpressureCounters>,
 
     /// Backpressure configuration, as a starting point and max delay
     backpressure_config: BackpressureConfig,
@@ -2122,6 +2125,25 @@ struct BackpressureConfig {
     queue_max_delay: Duration,
 }
 
+#[derive(Debug, Default)]
+struct BackpressureCounters {
+    /// The number of write bytes that haven't finished yet
+    ///
+    /// This is used to configure backpressure to the host, because writes
+    /// (uniquely) will return before actually being completed by a Downstairs
+    /// and can clog up the queues.
+    write_bytes_outstanding: AtomicU64,
+
+    /// Number of IO jobs in the downstairs queue
+    io_jobs: AtomicU64,
+}
+
+impl BackpressureCounters {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
 /*
  * These methods are how to add or checking for new work on the Guest struct
  */
@@ -2134,6 +2156,7 @@ impl Guest {
              */
             reqs: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
+
             /*
              * The active hashmap is for in-flight I/O operations
              * that we have taken off the incoming queue, but we have not
@@ -2156,7 +2179,7 @@ impl Guest {
 
             block_size: AtomicU64::new(0),
 
-            backpressure_us: AtomicU64::new(0),
+            backpressure_counters: BackpressureCounters::new(),
             backpressure_config: BackpressureConfig {
                 bytes_start: 1024u64.pow(3), // Start at 1 GiB
                 bytes_scale: 9.3e-8,         // Delay of 10ms at 2 GiB in-flight
@@ -2193,7 +2216,11 @@ impl Guest {
      */
     async fn send(&self, op: BlockOp) -> BlockReqWaiter {
         let (brw, res) = BlockReqWaiter::pair();
-        self.reqs.lock().await.push_back(BlockReq { op, res });
+        self.reqs.lock().await.push_back(BlockReq::new(
+            op,
+            res,
+            self.backpressure_counters.clone(),
+        ));
         self.notify.notify_one();
 
         brw
@@ -2217,8 +2244,15 @@ impl Guest {
         }
     }
 
-    /// Set `self.backpressure_us` based on outstanding IO ratio
-    fn set_backpressure(&self, bytes: u64, ratio: f64) {
+    /// Computes backpressure (in microseconds)
+    fn get_backpressure(&self) -> Duration {
+        let bytes = self
+            .backpressure_counters
+            .write_bytes_outstanding
+            .load(Ordering::Relaxed);
+        let jobs = self.backpressure_counters.io_jobs.load(Ordering::Relaxed);
+        let ratio = jobs as f64 / crate::IO_OUTSTANDING_MAX as f64;
+
         // Check to see if the number of outstanding write bytes (between
         // the upstairs and downstairs) is particularly high.  If so,
         // apply some backpressure by delaying host operations, with a
@@ -2238,7 +2272,8 @@ impl Guest {
                     .powf(2.0),
             )
             .as_micros() as u64;
-        self.backpressure_us.store(d1.max(d2), Ordering::SeqCst);
+
+        Duration::from_micros(d1.max(d2))
     }
 
     /*
@@ -2410,8 +2445,7 @@ impl Guest {
     }
 
     async fn backpressure_sleep(&self) {
-        let bp =
-            Duration::from_micros(self.backpressure_us.load(Ordering::SeqCst));
+        let bp = self.get_backpressure();
         if bp > Duration::ZERO {
             let _guard = self.backpressure_lock.lock().await;
             tokio::time::sleep(bp).await;

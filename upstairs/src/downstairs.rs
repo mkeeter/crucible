@@ -43,17 +43,6 @@ pub(crate) struct Downstairs {
     /// The active list of IO for the downstairs.
     pub(crate) ds_active: ActiveJobs,
 
-    /// The number of write bytes that haven't finished yet
-    ///
-    /// This is used to configure backpressure to the host, because writes
-    /// (uniquely) will return before actually being completed by a Downstairs
-    /// and can clog up the queues.
-    ///
-    /// It is stored in the Downstairs because from the perspective of the
-    /// Upstairs, writes complete immediately; only the Downstairs is actually
-    /// tracking the pending jobs.
-    write_bytes_outstanding: u64,
-
     /// The next Job ID this Upstairs should use for downstairs work.
     next_id: JobId,
 
@@ -224,7 +213,6 @@ impl Downstairs {
             cfg,
             next_flush: 0,
             ds_active: ActiveJobs::new(),
-            write_bytes_outstanding: 0,
             completed: AllocRingBuffer::new(2048),
             completed_jobs: AllocRingBuffer::new(8),
             next_id: JobId(1000),
@@ -2351,16 +2339,6 @@ impl Downstairs {
             }
         }
 
-        // If this is a write (which will be fast-acked), increment our byte
-        // counter for backpressure calculations.
-        match &io.work {
-            IOop::Write { writes, .. }
-            | IOop::WriteUnwritten { writes, .. } => {
-                self.write_bytes_outstanding +=
-                    writes.iter().map(|w| w.data.len() as u64).sum::<u64>();
-            }
-            _ => (),
-        };
         let is_write = matches!(io.work, IOop::Write { .. });
 
         // Puts the IO onto the downstairs work queue.
@@ -2725,23 +2703,7 @@ impl Downstairs {
             }
             // Now that we've collected jobs to retire, remove them from the map
             for &id in &retired {
-                let job = self.ds_active.remove(&id);
-                // Update pending bytes when this job is retired
-                match &job.work {
-                    IOop::Write { writes, .. }
-                    | IOop::WriteUnwritten { writes, .. } => {
-                        self.write_bytes_outstanding = self
-                            .write_bytes_outstanding
-                            .checked_sub(
-                                writes
-                                    .iter()
-                                    .map(|w| w.data.len() as u64)
-                                    .sum::<u64>(),
-                            )
-                            .unwrap();
-                    }
-                    _ => (),
-                }
+                self.ds_active.remove(&id);
             }
 
             debug!(self.log, "[rc] retire {} clears {:?}", ds_id, retired);
@@ -3342,10 +3304,6 @@ impl Downstairs {
         }
         let completed = self.completed_jobs.to_vec();
         crate::control::DownstairsWork { jobs, completed }
-    }
-
-    pub(crate) fn write_bytes_outstanding(&self) -> u64 {
-        self.write_bytes_outstanding
     }
 
     /// Marks a single job as acked
