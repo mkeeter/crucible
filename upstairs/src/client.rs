@@ -244,24 +244,23 @@ impl DownstairsClient {
 
     /// Choose which `ClientAction` to apply
     ///
-    /// This function is called from within a top-level `select!`, so not only
-    /// must the select expressions be cancel safe, but the **bodies** must also
-    /// be cancel-safe.  This is why we simply return a single value in the body
-    /// of each statement.
+    /// This function must be cancel safe
     pub(crate) async fn select(&mut self) -> ClientAction {
-        tokio::select! {
-            d = self.client_task.client_response_rx.recv() => {
-                match d {
-                    Some(c) => c.into(),
-                    None => ClientAction::ChannelClosed,
-                }
-            }
-            _ = sleep_until(self.ping_interval) => {
-                ClientAction::Ping
-            }
-            _ = sleep_until(self.timeout_deadline) => {
-                ClientAction::Timeout
-            }
+        let d = self.client_task.client_response_rx.recv().await;
+        match d {
+            Some(c) => c.into(),
+            None => ClientAction::ChannelClosed,
+        }
+        // Note that timers are handled by next_timer and awaited as a single
+        // event in the top-level `Upstairs::select!`.  This makes the `select!`
+        // more efficient.
+    }
+
+    pub(crate) fn next_timer(&self) -> (tokio::time::Instant, ClientAction) {
+        if self.ping_interval < self.timeout_deadline {
+            (self.ping_interval, ClientAction::Ping)
+        } else {
+            (self.timeout_deadline, ClientAction::Timeout)
         }
     }
 

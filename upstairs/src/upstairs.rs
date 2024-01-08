@@ -25,7 +25,7 @@ use std::{
     },
 };
 
-use futures::future::{pending, ready, Either};
+use futures::future::{ready, Either};
 use ringbuffer::RingBuffer;
 use slog::{debug, error, info, o, warn, Logger};
 use tokio::{
@@ -378,8 +378,38 @@ impl Upstairs {
         }
     }
 
+    /// Compute the next timer to fire and the associated `UpstairsAction`
+    ///
+    /// Doing this computation ourselves makes the `select` cheaper, since it
+    /// doesn't need to install + wait on many simultaneous sleeps.
+    fn next_timer(&self) -> (tokio::time::Instant, UpstairsAction) {
+        let mut v = (self.leak_deadline, UpstairsAction::LeakCheck);
+        if self.flush_deadline < v.0 {
+            v = (self.flush_deadline, UpstairsAction::FlushCheck);
+        }
+        if self.stat_deadline < v.0 {
+            v = (self.stat_deadline, UpstairsAction::StatUpdate);
+        }
+
+        // The repair timer is optional!
+        if let Some(r) = self.repair_check_interval {
+            if r < v.0 {
+                v = (r, UpstairsAction::RepairCheck);
+            }
+        }
+
+        // Check all of the client timers as well
+        let c = self.downstairs.next_timer();
+        if c.0 < v.0 {
+            v = c;
+        }
+
+        v
+    }
+
     /// Select an event from possible actions
     async fn select(&mut self) -> UpstairsAction {
+        let (next_timer, timer_action) = self.next_timer();
         tokio::select! {
             d = self.downstairs.select() => {
                 UpstairsAction::Downstairs(d)
@@ -387,11 +417,9 @@ impl Upstairs {
             d = self.guest.recv() => {
                 UpstairsAction::Guest(d)
             }
-            _ = self.repair_check_interval
-                .map(|r| Either::Left(sleep_until(r)))
-                .unwrap_or(Either::Right(pending()))
+            _ = sleep_until(next_timer)
             => {
-                UpstairsAction::RepairCheck
+                timer_action
             }
             d = self.deferred_reqs.next(), if !self.deferred_reqs.is_empty()
             => {
@@ -415,15 +443,6 @@ impl Upstairs {
                         UpstairsAction::NoOp
                     }
                 }
-            }
-            _ = sleep_until(self.leak_deadline) => {
-                UpstairsAction::LeakCheck
-            }
-            _ = sleep_until(self.flush_deadline) => {
-                UpstairsAction::FlushCheck
-            }
-            _ = sleep_until(self.stat_deadline) => {
-                UpstairsAction::StatUpdate
             }
             c = self.control_rx.recv() => {
                 // We can always unwrap this, because we hold a handle to the tx

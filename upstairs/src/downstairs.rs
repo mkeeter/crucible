@@ -12,7 +12,7 @@ use crate::{
     },
     live_repair::ExtentInfo,
     stats::UpStatOuter,
-    upstairs::{UpstairsConfig, UpstairsState},
+    upstairs::{UpstairsAction, UpstairsConfig, UpstairsState},
     AckStatus, ActiveJobs, AllocRingBuffer, ClientData, ClientIOStateCount,
     ClientId, ClientMap, CrucibleError, DownstairsIO, DownstairsMend, DsState,
     ExtentFix, ExtentRepairIDs, GtoS, GuestWork, GuestWorkId, IOState,
@@ -261,6 +261,22 @@ impl Downstairs {
                 Some("127.0.0.1:1234".parse().unwrap());
         }
         ds
+    }
+
+    /// Returns the next timer to fire (across any client)
+    pub(crate) fn next_timer(&self) -> (tokio::time::Instant, UpstairsAction) {
+        let (client_id, (time, action)) = ClientId::iter()
+            .map(|i| (i, self.clients[i].next_timer()))
+            .min_by_key(|(_client_id, (time, _action))| *time)
+            .unwrap();
+
+        (
+            time,
+            UpstairsAction::Downstairs(DownstairsAction::Client {
+                client_id,
+                action,
+            }),
+        )
     }
 
     /// Choose which `DownstairsAction` to apply
