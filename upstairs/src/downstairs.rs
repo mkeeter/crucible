@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    backpressure::BackpressureGuard,
     cdt,
     client::{
         ClientAction, ClientRunResult, ClientStopReason, DownstairsClient,
@@ -1279,7 +1280,7 @@ impl Downstairs {
                     let gw_id = gw.next_gw_id();
                     cdt::gw__flush__start!(|| (gw_id.0));
 
-                    let flush_id = self.submit_flush(gw_id, None);
+                    let flush_id = self.submit_flush(gw_id, None, None);
                     info!(self.log, "LiveRepair final flush submitted");
 
                     let new_gtos = GtoS::new(flush_id, None, None);
@@ -1357,6 +1358,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: None,
         }
     }
 
@@ -1481,6 +1483,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: None,
         }
     }
 
@@ -1622,6 +1625,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: None,
         }
     }
 
@@ -1696,6 +1700,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: None,
         };
         self.enqueue(io);
         ds_id
@@ -1733,6 +1738,7 @@ impl Downstairs {
             GuestWorkId(10),
             vec![request.clone()],
             is_write_unwritten,
+            None,
         )
     }
 
@@ -1742,6 +1748,7 @@ impl Downstairs {
         gw_id: GuestWorkId,
         writes: Vec<crucible_protocol::Write>,
         is_write_unwritten: bool,
+        backpressure_guard: Option<BackpressureGuard>,
     ) -> JobId {
         let ds_id = self.next_id();
         let dependencies = self.ds_active.deps_for_write(ds_id, blocks);
@@ -1772,6 +1779,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: backpressure_guard,
         };
         self.enqueue(io);
         ds_id
@@ -1805,6 +1813,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: None,
         }
     }
 
@@ -2099,6 +2108,7 @@ impl Downstairs {
         &mut self,
         gw_id: GuestWorkId,
         snapshot_details: Option<SnapshotDetails>,
+        backpressure_guard: Option<BackpressureGuard>,
     ) -> JobId {
         let next_id = self.next_id();
         let flush_id = self.next_flush_id();
@@ -2134,6 +2144,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: backpressure_guard,
         };
 
         self.enqueue(fl);
@@ -2146,7 +2157,7 @@ impl Downstairs {
         &mut self,
         snap: Option<SnapshotDetails>,
     ) -> JobId {
-        self.submit_flush(GuestWorkId(0), snap)
+        self.submit_flush(GuestWorkId(0), snap, None)
     }
 
     /// Reserves repair IDs if impacted blocks overlap our extent under repair
@@ -2219,6 +2230,7 @@ impl Downstairs {
         guest_id: GuestWorkId,
         blocks: ImpactedBlocks,
         ddef: RegionDefinition,
+        backpressure_guard: Option<BackpressureGuard>,
     ) -> JobId {
         // If there is a live-repair in progress that intersects with this read,
         // then reserve job IDs for those jobs.
@@ -2258,6 +2270,7 @@ impl Downstairs {
             replay: false,
             data: None,
             read_response_hashes: Vec::new(),
+            bp: backpressure_guard,
         };
 
         self.enqueue(io);
@@ -2271,6 +2284,7 @@ impl Downstairs {
         blocks: ImpactedBlocks,
         writes: Vec<crucible_protocol::Write>,
         is_write_unwritten: bool,
+        backpressure_guard: Option<BackpressureGuard>,
     ) -> JobId {
         // If there is a live-repair in progress that intersects with this read,
         // then reserve job IDs for those jobs.
@@ -2281,6 +2295,7 @@ impl Downstairs {
             guest_id,
             writes,
             is_write_unwritten,
+            backpressure_guard,
         )
     }
 
@@ -3430,7 +3445,13 @@ impl Downstairs {
             },
         });
 
-        self.submit_write(gwid, blocks, writes.collect(), is_write_unwritten)
+        self.submit_write(
+            gwid,
+            blocks,
+            writes.collect(),
+            is_write_unwritten,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -3478,7 +3499,7 @@ impl Downstairs {
         ddef.set_block_size(512);
         ddef.set_extent_size(Block::new_512(extent_size));
         ddef.set_extent_count(u32::MAX);
-        self.submit_read(gwid, blocks, ddef)
+        self.submit_read(gwid, blocks, ddef, None)
     }
 
     #[cfg(test)]
@@ -8527,7 +8548,7 @@ pub(crate) mod test {
 
         ds.submit_test_read_block(gw.next_gw_id(), eid, 0);
         ds.submit_test_write_block(gw.next_gw_id(), eid, 1, false);
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         create_and_enqueue_repair_ops(&mut gw, &mut ds, eid);
 
@@ -8652,7 +8673,7 @@ pub(crate) mod test {
         let eid = 1;
 
         create_and_enqueue_repair_ops(&mut gw, &mut ds, eid);
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
@@ -8736,11 +8757,11 @@ pub(crate) mod test {
 
         let (mut gw, mut ds) = Downstairs::repair_test_one_repair();
 
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         create_and_enqueue_repair_ops(&mut gw, &mut ds, 1);
 
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
@@ -8775,7 +8796,7 @@ pub(crate) mod test {
 
         create_and_enqueue_repair_ops(&mut gw, &mut ds, 0);
 
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         create_and_enqueue_repair_ops(&mut gw, &mut ds, 1);
 
@@ -9338,7 +9359,7 @@ pub(crate) mod test {
 
         ds.submit_test_read_block(gw.next_gw_id(), 0, 1);
 
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 
@@ -9540,7 +9561,7 @@ pub(crate) mod test {
             },
         });
 
-        ds.submit_flush(gw.next_gw_id(), None);
+        ds.submit_flush(gw.next_gw_id(), None, None);
 
         let jobs: Vec<&DownstairsIO> = ds.ds_active.values().collect();
 

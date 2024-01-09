@@ -1098,7 +1098,7 @@ impl Upstairs {
 
     pub(crate) async fn submit_flush(
         &mut self,
-        res: Option<BlockRes>,
+        mut res: Option<BlockRes>,
         snapshot_details: Option<SnapshotDetails>,
     ) {
         // Notice that unlike submit_read and submit_write, we do not check for
@@ -1121,7 +1121,11 @@ impl Upstairs {
             info!(self.log, "flush with snap requested");
         }
 
-        let next_id = self.downstairs.submit_flush(gw_id, snapshot_details);
+        let next_id = self.downstairs.submit_flush(
+            gw_id,
+            snapshot_details,
+            res.as_mut().and_then(|w| w.take_backpressure_guard()),
+        );
 
         let new_gtos = GtoS::new(next_id, None, res);
         gw.active.insert(gw_id, new_gtos);
@@ -1157,7 +1161,7 @@ impl Upstairs {
         &mut self,
         offset: Block,
         data: Buffer,
-        res: Option<BlockRes>,
+        mut res: Option<BlockRes>,
     ) {
         #[cfg(not(test))]
         assert!(res.is_some());
@@ -1207,7 +1211,12 @@ impl Upstairs {
         let gw_id = gw.next_gw_id();
         cdt::gw__read__start!(|| (gw_id.0));
 
-        let next_id = self.downstairs.submit_read(gw_id, impacted_blocks, ddef);
+        let next_id = self.downstairs.submit_read(
+            gw_id,
+            impacted_blocks,
+            ddef,
+            res.as_mut().and_then(|w| w.take_backpressure_guard()),
+        );
 
         // New work created, add to the guest_work HM.  It's fine to do this
         // after submitting the job to the downstairs, because no one else is
@@ -1339,7 +1348,7 @@ impl Upstairs {
         })
     }
 
-    async fn submit_write(&mut self, write: EncryptedWrite) {
+    async fn submit_write(&mut self, mut write: EncryptedWrite) {
         /*
          * Get the next ID for the guest work struct we will make at the
          * end. This ID is also put into the IO struct we create that
@@ -1364,6 +1373,7 @@ impl Upstairs {
             write.impacted_blocks,
             write.writes,
             write.is_write_unwritten,
+            write.res.as_mut().and_then(|w| w.take_backpressure_guard()),
         );
 
         // New work created, add to the guest_work HM

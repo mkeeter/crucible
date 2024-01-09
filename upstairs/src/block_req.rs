@@ -73,7 +73,18 @@ impl BlockRes {
         // XXX this eats the result!
         let _ = self.tx.take().expect("sender was populated").send(r);
     }
+
+    /// Steals the backpressure guard
+    ///
+    /// This effectively extends how long this `BlockReq` will exert
+    /// backpressure.  It is used when we reply to the `BlockReq` immediately
+    /// (e.g. for a write), but the IO operation lives and should be counted for
+    /// longer.
+    pub fn take_backpressure_guard(&mut self) -> Option<BackpressureGuard> {
+        self.bp.take()
+    }
 }
+
 impl Drop for BlockRes {
     fn drop(&mut self) {
         if self.tx.is_some() {
