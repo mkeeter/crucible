@@ -612,11 +612,8 @@ impl Upstairs {
             self.downstairs.collect_stats(|c| c.stats.ro_lr_skipped);
 
         let up_backpressure = self.guest.get_backpressure();
-        let write_bytes_out = self
-            .guest
-            .backpressure_counters
-            .write_bytes_outstanding
-            .load(Ordering::Relaxed);
+        let write_bytes_out =
+            self.guest.backpressure_counters.write_bytes_outstanding();
 
         cdt::up__status!(|| {
             let arg = Arg {

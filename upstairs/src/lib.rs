@@ -10,7 +10,7 @@ use std::fmt::{Debug, Formatter};
 use std::io::{Read as _, Result as IOResult, Seek, SeekFrom, Write as _};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,8 +59,10 @@ mod stats;
 mod impacted_blocks;
 pub use impacted_blocks::*;
 
+mod backpressure;
 mod deferred;
 mod live_repair;
+use backpressure::{BackpressureConfig, BackpressureCounters};
 
 #[cfg(test)]
 mod test;
@@ -2101,49 +2103,6 @@ pub struct Guest {
     log: Logger,
 }
 
-/// Configuration for host-side backpressure
-///
-/// Backpressure adds an artificial delay to host write messages (which are
-/// otherwise acked immediately, before actually being complete).  The delay is
-/// varied based on two metrics:
-///
-/// - number of write bytes outstanding
-/// - queue length as a fraction (where 1.0 is full)
-///
-/// These two metrics are used for quadratic backpressure, picking the larger of
-/// the two delays.
-#[derive(Copy, Clone, Debug)]
-struct BackpressureConfig {
-    /// When should backpressure start (in bytes)?
-    bytes_start: u64,
-    /// Scale for byte-based quadratic backpressure
-    bytes_scale: f64,
-
-    /// When should queue-based backpressure start?
-    queue_start: f64,
-    /// Maximum queue-based delay
-    queue_max_delay: Duration,
-}
-
-#[derive(Debug, Default)]
-struct BackpressureCounters {
-    /// The number of write bytes that haven't finished yet
-    ///
-    /// This is used to configure backpressure to the host, because writes
-    /// (uniquely) will return before actually being completed by a Downstairs
-    /// and can clog up the queues.
-    write_bytes_outstanding: AtomicU64,
-
-    /// Number of IO jobs in the downstairs queue
-    io_jobs: AtomicU64,
-}
-
-impl BackpressureCounters {
-    fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-}
-
 /*
  * These methods are how to add or checking for new work on the Guest struct
  */
@@ -2246,34 +2205,8 @@ impl Guest {
 
     /// Computes backpressure (in microseconds)
     fn get_backpressure(&self) -> Duration {
-        let bytes = self
-            .backpressure_counters
-            .write_bytes_outstanding
-            .load(Ordering::Relaxed);
-        let jobs = self.backpressure_counters.io_jobs.load(Ordering::Relaxed);
-        let ratio = jobs as f64 / crate::IO_OUTSTANDING_MAX as f64;
-
-        // Check to see if the number of outstanding write bytes (between
-        // the upstairs and downstairs) is particularly high.  If so,
-        // apply some backpressure by delaying host operations, with a
-        // quadratically-increasing delay.
-        let d1 = (bytes.saturating_sub(self.backpressure_config.bytes_start)
-            as f64
-            * self.backpressure_config.bytes_scale)
-            .powf(2.0) as u64;
-
-        // Compute an alternate delay based on queue length
-        let d2 = self
-            .backpressure_config
-            .queue_max_delay
-            .mul_f64(
-                ((ratio - self.backpressure_config.queue_start).max(0.0)
-                    / (1.0 - self.backpressure_config.queue_start))
-                    .powf(2.0),
-            )
-            .as_micros() as u64;
-
-        Duration::from_micros(d1.max(d2))
+        self.backpressure_config
+            .get_delay(&self.backpressure_counters)
     }
 
     /*

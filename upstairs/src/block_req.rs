@@ -1,5 +1,6 @@
 // Copyright 2022 Oxide Computer Company
 use super::*;
+use crate::backpressure::BackpressureGuard;
 use tokio::sync::oneshot;
 
 /**
@@ -32,9 +33,11 @@ pub(crate) struct BlockRes {
 
     /// Handle to track IO and jobs in flight for upstairs backpressure
     ///
-    /// Each job counts as 1 job in `BackpressureCounters::io_jobs`, and may
-    /// additionally have write bytes as the second member of the tuple
-    bp: Option<(Arc<BackpressureCounters>, u64)>,
+    /// The guard automatically decrements backpressure counters when dropped.
+    /// For some operations, this is immediately upon consuming the `BlockRes`;
+    /// however, for others (anything doing IO to the Downstairs), we extract
+    /// the backpressure guard and save it in the [`DownstairsIO`].
+    bp: Option<BackpressureGuard>,
 }
 
 impl BlockRes {
@@ -62,11 +65,7 @@ impl BlockRes {
             BlockOp::Write { data, .. } => data.len() as u64,
             _ => 0,
         };
-        bp.io_jobs.fetch_add(1, Ordering::Relaxed);
-        bp.write_bytes_outstanding
-            .fetch_add(bytes, Ordering::Relaxed);
-
-        self.bp = Some((bp, bytes));
+        self.bp = Some(BackpressureGuard::new(bp, bytes));
     }
 
     /// Consume this BlockRes and send a Result to the receiver
@@ -81,12 +80,6 @@ impl Drop for BlockRes {
             // During normal operation, we expect to reply to every BlockReq, so
             // we'll fire a DTrace probe here.
             cdt::up__block__req__dropped!();
-        }
-        // Update backpressure counters (if present)
-        if let Some((bp, bytes)) = self.bp.take() {
-            bp.write_bytes_outstanding
-                .fetch_sub(bytes, Ordering::Relaxed);
-            bp.io_jobs.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
