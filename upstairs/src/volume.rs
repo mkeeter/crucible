@@ -684,12 +684,12 @@ impl BlockIO for Volume {
                     .read(parent_offset, parent_buffer.clone())
                     .await?;
 
-                let mut data_vec = data.as_vec().await;
-                let mut owned_vec = data.owned_vec().await;
+                let mut data_vec = data.as_vec();
+                let mut owned_vec = data.owned_vec();
 
-                let sub_data_vec = sub_buffer.as_vec().await;
-                let sub_owned_vec = sub_buffer.owned_vec().await;
-                let parent_data_vec = parent_buffer.as_vec().await;
+                let sub_data_vec = sub_buffer.as_vec();
+                let sub_owned_vec = sub_buffer.owned_vec();
+                let parent_data_vec = parent_buffer.as_vec();
 
                 // "ownership" comes back from the downstairs per byte but all
                 // writes occur per block. Iterate over the blocks that both the
@@ -756,18 +756,18 @@ impl BlockIO for Volume {
                     owned_vec[owned_index] = true;
                 }
             } else {
-                let mut data_vec = data.as_vec().await;
-                let mut owned_vec = data.owned_vec().await;
+                let mut data_vec = data.as_vec();
+                let mut owned_vec = data.owned_vec();
 
                 // In the case where this volume has no read only parent,
                 // propagate the sub volume information up.
                 data_vec[data_index..(data_index + sz)]
-                    .copy_from_slice(&sub_buffer.as_vec().await);
+                    .copy_from_slice(&sub_buffer.as_vec());
 
                 let owned_index = data_index / self.block_size as usize;
                 owned_vec[owned_index
                     ..(owned_index + sz / self.block_size as usize)]
-                    .copy_from_slice(&sub_buffer.owned_vec().await);
+                    .copy_from_slice(&sub_buffer.owned_vec());
             }
 
             data_index += sz;

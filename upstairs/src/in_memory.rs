@@ -63,8 +63,8 @@ impl BlockIO for InMemoryBlockIO {
 
         let inner = self.inner.lock().await;
 
-        let mut data_vec = data.as_vec().await;
-        let mut owned_vec = data.owned_vec().await;
+        let mut data_vec = data.as_vec();
+        let mut owned_vec = data.owned_vec();
 
         let data_start = offset.value as usize * self.block_size as usize;
         let data_len = data_vec.len();

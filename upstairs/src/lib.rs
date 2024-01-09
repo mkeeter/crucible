@@ -25,7 +25,7 @@ use ringbuffer::{AllocRingBuffer, RingBuffer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use slog::{error, info, o, warn, Logger};
-use tokio::sync::{mpsc, oneshot, Mutex, MutexGuard, Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio::time::Instant;
 use tracing::{instrument, span, Level};
 use usdt::register_probes;
@@ -1485,10 +1485,10 @@ pub struct Buffer {
     block_size: usize,
 
     /// Raw data
-    data: Arc<Mutex<Vec<u8>>>,
+    data: Arc<std::sync::Mutex<Vec<u8>>>,
 
     /// Ownership mask, on a per-block basis
-    owned: Arc<Mutex<Vec<bool>>>,
+    owned: Arc<std::sync::Mutex<Vec<bool>>>,
 }
 
 impl Buffer {
@@ -1498,8 +1498,8 @@ impl Buffer {
         Buffer {
             len,
             block_size,
-            data: Arc::new(Mutex::new(vec)),
-            owned: Arc::new(Mutex::new(vec![false; owned_len])),
+            data: Arc::new(std::sync::Mutex::new(vec)),
+            owned: Arc::new(std::sync::Mutex::new(vec![false; owned_len])),
         }
     }
 
@@ -1508,8 +1508,8 @@ impl Buffer {
         Buffer {
             len,
             block_size,
-            data: Arc::new(Mutex::new(vec![0; len])),
-            owned: Arc::new(Mutex::new(vec![false; owned_len])),
+            data: Arc::new(std::sync::Mutex::new(vec![0; len])),
+            owned: Arc::new(std::sync::Mutex::new(vec![false; owned_len])),
         }
     }
 
@@ -1529,7 +1529,7 @@ impl Buffer {
             block_size,
         } = self;
         match Arc::try_unwrap(data) {
-            Ok(buf) => Ok(buf.into_inner()),
+            Ok(buf) => Ok(buf.into_inner().unwrap()),
             Err(data) => Err(Buffer {
                 len,
                 block_size,
@@ -1547,12 +1547,12 @@ impl Buffer {
         self.len == 0
     }
 
-    pub async fn as_vec(&self) -> MutexGuard<'_, Vec<u8>> {
-        self.data.lock().await
+    pub fn as_vec(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.data.lock().unwrap()
     }
 
-    pub async fn owned_vec(&self) -> MutexGuard<'_, Vec<bool>> {
-        self.owned.lock().await
+    pub fn owned_vec(&self) -> std::sync::MutexGuard<'_, Vec<bool>> {
+        self.owned.lock().unwrap()
     }
 }
 
@@ -1575,16 +1575,16 @@ async fn test_buffer_len_after_clone() {
     assert_eq!(data.len(), READ_SIZE);
 }
 
-#[tokio::test]
+#[test]
 #[should_panic(
     expected = "index out of bounds: the len is 512 but the index is 512"
 )]
-async fn test_buffer_len_index_overflow() {
+fn test_buffer_len_index_overflow() {
     const READ_SIZE: usize = 512;
     let data = Buffer::from_slice(&[0x99; READ_SIZE], 512);
     assert_eq!(data.len(), READ_SIZE);
 
-    let mut vec = data.as_vec().await;
+    let mut vec = data.as_vec();
     assert_eq!(vec.len(), 512);
 
     for i in 0..(READ_SIZE + 1) {
@@ -1592,8 +1592,8 @@ async fn test_buffer_len_index_overflow() {
     }
 }
 
-#[tokio::test]
-async fn test_buffer_len_over_block_size() {
+#[test]
+fn test_buffer_len_over_block_size() {
     const READ_SIZE: usize = 600;
     let data = Buffer::from_slice(&[0x99; READ_SIZE], 512);
     assert_eq!(data.len(), READ_SIZE);
@@ -1826,14 +1826,14 @@ impl GtoS {
      * from upstairs memory back to the guest's memory.
      */
     #[instrument]
-    async fn transfer(&mut self) {
+    fn transfer(&mut self) {
         assert!(!self.completed.is_empty());
 
         for ds_id in &self.completed {
             if let Some(guest_buffer) = self.guest_buffers.remove(ds_id) {
                 let mut offset = 0;
-                let mut vec = guest_buffer.as_vec().await;
-                let mut owned_vec = guest_buffer.owned_vec().await;
+                let mut vec = guest_buffer.as_vec();
+                let mut owned_vec = guest_buffer.owned_vec();
 
                 /*
                  * Should this panic?  If the caller is requesting a transfer,
@@ -1887,9 +1887,9 @@ impl GtoS {
         }
     }
 
-    pub async fn finalize(mut self, result: Result<(), CrucibleError>) {
+    pub fn finalize(mut self, result: Result<(), CrucibleError>) {
         if result.is_ok() {
-            self.transfer().await;
+            self.transfer();
         }
 
         self.notify(result);
@@ -1952,7 +1952,7 @@ impl GuestWork {
      * This may include moving data buffers from completed reads.
      */
     #[instrument]
-    async fn gw_ds_complete(
+    fn gw_ds_complete(
         &mut self,
         gw_id: GuestWorkId,
         ds_id: JobId,
@@ -2022,7 +2022,7 @@ impl GuestWork {
                  * Copy (if present) read data back to the guest buffer they
                  * provided to us, and notify any waiters.
                  */
-                gtos_job.finalize(result).await;
+                gtos_job.finalize(result);
 
                 self.completed.push(gw_id);
             } else {

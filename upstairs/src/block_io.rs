@@ -66,12 +66,13 @@ impl BlockIO for FileBlockIO {
         data: Buffer,
     ) -> Result<(), CrucibleError> {
         self.check_data_size(data.len()).await?;
-        let mut data_vec = data.as_vec().await;
-        let mut owned_vec = data.owned_vec().await;
 
         let start = offset.value * self.block_size;
 
         let mut file = self.file.lock().await;
+
+        let mut data_vec = data.as_vec();
+        let mut owned_vec = data.owned_vec();
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut data_vec[..])?;
 
@@ -217,9 +218,6 @@ impl BlockIO for ReqwestBlockIO {
         let cc = self.next_count();
         cdt::reqwest__read__start!(|| (cc, self.uuid));
 
-        let mut data_vec = data.as_vec().await;
-        let mut owned_vec = data.owned_vec().await;
-
         let start = offset.value * self.block_size;
 
         let response = self
@@ -227,11 +225,7 @@ impl BlockIO for ReqwestBlockIO {
             .get(&self.url)
             .header(
                 RANGE,
-                format!(
-                    "bytes={}-{}",
-                    start,
-                    start + data_vec.len() as u64 - 1
-                ),
+                format!("bytes={}-{}", start, start + data.len() as u64 - 1),
             )
             .send()
             .await
@@ -249,13 +243,15 @@ impl BlockIO for ReqwestBlockIO {
         )
         .map_err(|e| CrucibleError::GenericError(e.to_string()))?;
 
-        assert_eq!(total_size, data_vec.len() as u64);
+        assert_eq!(total_size, data.len() as u64);
 
         let bytes = response
             .bytes()
             .await
             .map_err(|e| CrucibleError::GenericError(e.to_string()))?;
 
+        let mut data_vec = data.as_vec();
+        let mut owned_vec = data.owned_vec();
         data_vec.copy_from_slice(&bytes);
         owned_vec.fill(true);
 

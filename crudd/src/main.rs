@@ -230,7 +230,7 @@ async fn cmd_read<T: BlockIO>(
         if futures.len() == opt.pipeline_length {
             futures.pop_front().unwrap().await?;
             let r_buf = buffers.pop_front().unwrap();
-            output.write_all(&r_buf.as_vec().await)?;
+            output.write_all(&r_buf.as_vec())?;
         }
 
         if early_shutdown.try_recv().is_ok() {
@@ -248,7 +248,7 @@ async fn cmd_read<T: BlockIO>(
         while !buffers.is_empty() {
             // unwrapping is safe because of the length check
             let r_buf = buffers.pop_front().unwrap();
-            output.write_all(&r_buf.as_vec().await)?;
+            output.write_all(&r_buf.as_vec())?;
         }
     }
 
@@ -267,7 +267,7 @@ async fn cmd_read<T: BlockIO>(
         let offset = Block::new(block_idx, native_block_size.trailing_zeros());
         crucible.read(offset, buffer.clone()).await?;
         total_bytes_read += remainder as usize;
-        output.write_all(&buffer.as_vec().await[0..remainder as usize])?;
+        output.write_all(&buffer.as_vec()[0..remainder as usize])?;
     }
 
     Ok(total_bytes_read)

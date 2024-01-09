@@ -300,7 +300,7 @@ impl Downstairs {
     }
 
     /// Send back acks for all jobs that are `AckReady`
-    pub(crate) async fn ack_jobs(
+    pub(crate) fn ack_jobs(
         &mut self,
         gw: &mut GuestWork,
         up_stats: &UpStatOuter,
@@ -310,7 +310,7 @@ impl Downstairs {
         let ack_list = std::mem::take(&mut self.ackable_work);
         let jobs_checked = ack_list.len();
         for ds_id_done in ack_list.iter() {
-            self.ack_job(*ds_id_done, gw, up_stats).await;
+            self.ack_job(*ds_id_done, gw, up_stats);
         }
         debug!(self.log, "ack_ready handled {jobs_checked} jobs");
     }
@@ -321,7 +321,7 @@ impl Downstairs {
     ///
     /// This is public for the sake of unit testing, but shouldn't be called
     /// outside of this module normally.
-    async fn ack_job(
+    fn ack_job(
         &mut self,
         ds_id: JobId,
         gw: &mut GuestWork,
@@ -342,7 +342,7 @@ impl Downstairs {
         Self::cdt_gw_work_done(done, up_stats);
         debug!(self.log, "[A] ack job {}:{}", ds_id, gw_id);
 
-        gw.gw_ds_complete(gw_id, ds_id, data, r, &self.log).await;
+        gw.gw_ds_complete(gw_id, ds_id, data, r, &self.log);
 
         self.retire_check(ds_id);
     }

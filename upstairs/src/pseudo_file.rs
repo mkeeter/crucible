@@ -88,7 +88,7 @@ impl IOSpan {
         &self,
         block_io: &Arc<T>,
     ) -> Result<(), CrucibleError> {
-        let bytes = Bytes::from(self.buffer.as_vec().await.clone());
+        let bytes = Bytes::from(self.buffer.as_vec().clone());
 
         block_io
             .write(
@@ -106,7 +106,7 @@ impl IOSpan {
         assert_eq!(data.len(), self.sz as usize);
 
         for (i, item) in data.iter_mut().enumerate() {
-            *item = self.buffer.as_vec().await[self.phase as usize + i];
+            *item = self.buffer.as_vec()[self.phase as usize + i];
         }
     }
 
@@ -115,7 +115,7 @@ impl IOSpan {
         assert_eq!(data.len(), self.sz as usize);
 
         for (i, item) in data.iter().enumerate() {
-            self.buffer.as_vec().await[self.phase as usize + i] = *item;
+            self.buffer.as_vec()[self.phase as usize + i] = *item;
         }
     }
 }

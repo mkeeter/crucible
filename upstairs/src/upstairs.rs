@@ -506,7 +506,7 @@ impl Upstairs {
         // Handle any jobs that have become ready for acks
         if self.downstairs.has_ackable_jobs() {
             let mut gw = self.guest.guest_work.lock().await;
-            self.downstairs.ack_jobs(&mut gw, &self.stats).await;
+            self.downstairs.ack_jobs(&mut gw, &self.stats);
         }
 
         // Check for client-side deactivation

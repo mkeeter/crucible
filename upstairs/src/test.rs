@@ -118,24 +118,24 @@ pub(crate) mod up_test {
             .await;
 
         for i in 0..500 {
-            assert_eq!(span.buffer().as_vec().await[i], 0);
+            assert_eq!(span.buffer().as_vec()[i], 0);
         }
         for i in 500..512 {
-            assert_eq!(span.buffer().as_vec().await[i], 1);
+            assert_eq!(span.buffer().as_vec()[i], 1);
         }
         for i in 512..(512 + 64 - 12) {
-            assert_eq!(span.buffer().as_vec().await[i], 1);
+            assert_eq!(span.buffer().as_vec()[i], 1);
         }
         for i in (512 + 64 - 12)..1024 {
-            assert_eq!(span.buffer().as_vec().await[i], 0);
+            assert_eq!(span.buffer().as_vec()[i], 0);
         }
 
         let data = Buffer::new(64, 512);
-        span.read_from_blocks_into_buffer(&mut data.as_vec().await[..])
+        span.read_from_blocks_into_buffer(&mut data.as_vec()[..])
             .await;
 
         for i in 0..64 {
-            assert_eq!(data.as_vec().await[i], 1);
+            assert_eq!(data.as_vec()[i], 1);
         }
     }
 
@@ -1291,20 +1291,18 @@ pub(crate) mod up_test {
             }],
         }]);
 
-        gw.gw_ds_complete(gw_id, first_id, first_response, Ok(()), &up.log)
-            .await;
+        gw.gw_ds_complete(gw_id, first_id, first_response, Ok(()), &up.log);
         assert!(!gw.completed.contains(&gw_id));
 
-        gw.gw_ds_complete(gw_id, second_id, second_response, Ok(()), &up.log)
-            .await;
+        gw.gw_ds_complete(gw_id, second_id, second_response, Ok(()), &up.log);
         assert!(gw.completed.contains(&gw_id));
 
         assert_eq!(
-            *data_buffers.get(&first_id).unwrap().as_vec().await,
+            *data_buffers.get(&first_id).unwrap().as_vec(),
             first_response_data.to_vec()
         );
         assert_eq!(
-            *data_buffers.get(&second_id).unwrap().as_vec().await,
+            *data_buffers.get(&second_id).unwrap().as_vec(),
             second_response_data.to_vec()
         );
     }
