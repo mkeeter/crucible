@@ -195,7 +195,7 @@ pub(crate) struct Upstairs {
     pub(crate) control_tx: mpsc::Sender<ControlRequest>,
 
     /// Stream of post-processed `BlockOp` futures
-    deferred_reqs: DeferredQueue<Option<DeferredBlockReq>>,
+    deferred_reqs: DeferredQueue<DeferredBlockReq>,
 }
 
 /// Action to be taken which modifies the [`Upstairs`] state
@@ -398,13 +398,7 @@ impl Upstairs {
                 match d {
                     // Normal operation: the deferred task gave us back a
                     // DeferredBlockReq, which we need to handle.
-                    Some(Some(d)) => UpstairsAction::DeferredBlockReq(d),
-
-                    // The innermost Option is None if the deferred task handled
-                    // the request on its own (and replied to the `BlockReq`
-                    // already). This happens if encryption fails, which would
-                    // be odd, but possible?
-                    Some(None) => UpstairsAction::NoOp,
+                    Some(d) => UpstairsAction::DeferredBlockReq(d),
 
                     // The outer Option is None if the FuturesOrdered is empty
                     None => {
@@ -555,7 +549,6 @@ impl Upstairs {
     #[cfg(test)]
     async fn await_deferred_reqs(&mut self) {
         while let Some(req) = self.deferred_reqs.next().await {
-            let req = req.unwrap(); // the deferred request should not fail
             self.apply(UpstairsAction::DeferredBlockReq(req)).await;
         }
         assert!(self.deferred_reqs.is_empty());
@@ -795,9 +788,9 @@ impl Upstairs {
             // have to keep using it for subsequent requests (even ones that are
             // not writes) to preserve FIFO ordering
             _ if !self.deferred_reqs.is_empty() => {
-                self.deferred_reqs.push_back(Either::Left(ready(Ok(Some(
+                self.deferred_reqs.push_back(Either::Left(ready(Ok(
                     DeferredBlockReq::Other(req),
-                )))));
+                ))));
             }
             // Otherwise, we can apply a non-write operation immediately, saving
             // a trip through the FuturesUnordered
@@ -1260,7 +1253,7 @@ impl Upstairs {
     ) {
         if let Some(w) = self
             .compute_deferred_write(offset, data, None, is_write_unwritten)
-            .and_then(DeferredWrite::run)
+            .map(DeferredWrite::run)
         {
             self.apply_guest_request(DeferredBlockReq::Write(w)).await
         }
@@ -1286,8 +1279,7 @@ impl Upstairs {
         {
             let (tx, rx) = oneshot::channel();
             rayon::spawn(move || {
-                let out = w.run().map(DeferredBlockReq::Write);
-                let _ = tx.send(out);
+                let _ = tx.send(DeferredBlockReq::Write(w.run()));
             });
             self.deferred_reqs.push_back(Either::Right(rx));
         }
@@ -1297,7 +1289,7 @@ impl Upstairs {
         &mut self,
         offset: Block,
         data: Bytes,
-        res: Option<BlockRes>,
+        mut res: Option<BlockRes>,
         is_write_unwritten: bool,
     ) -> Option<DeferredWrite> {
         #[cfg(not(test))]
@@ -1338,17 +1330,24 @@ impl Upstairs {
             Block::from_bytes(data.len(), &ddef),
         );
 
-        Some(DeferredWrite {
+        let out = Some(DeferredWrite {
             ddef,
             impacted_blocks,
             data,
-            res,
+            backpressure_guard: res
+                .as_mut()
+                .and_then(|r| r.take_backpressure_guard()),
             is_write_unwritten,
             cfg: self.cfg.clone(),
-        })
+        });
+        if let Some(res) = res {
+            res.send_ok();
+        }
+
+        out
     }
 
-    async fn submit_write(&mut self, mut write: EncryptedWrite) {
+    async fn submit_write(&mut self, write: EncryptedWrite) {
         /*
          * Get the next ID for the guest work struct we will make at the
          * end. This ID is also put into the IO struct we create that
@@ -1373,11 +1372,11 @@ impl Upstairs {
             write.impacted_blocks,
             write.writes,
             write.is_write_unwritten,
-            write.res.as_mut().and_then(|w| w.take_backpressure_guard()),
+            write.backpressure_guard,
         );
 
         // New work created, add to the guest_work HM
-        let new_gtos = GtoS::new(next_id, None, write.res);
+        let new_gtos = GtoS::new(next_id, None, None);
         gw.active.insert(gw_id, new_gtos);
 
         if write.is_write_unwritten {

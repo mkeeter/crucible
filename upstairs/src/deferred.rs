@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use crate::{
-    upstairs::UpstairsConfig, BlockContext, BlockReq, BlockRes, ImpactedBlocks,
+    backpressure::BackpressureGuard, upstairs::UpstairsConfig, BlockContext,
+    BlockReq, ImpactedBlocks,
 };
 use bytes::Bytes;
-use crucible_common::{integrity_hash, CrucibleError, RegionDefinition};
+use crucible_common::{integrity_hash, RegionDefinition};
 use futures::{
     future::{Either, Ready},
     stream::FuturesOrdered,
@@ -90,7 +91,7 @@ pub(crate) struct DeferredWrite {
     pub ddef: RegionDefinition,
     pub impacted_blocks: ImpactedBlocks,
     pub data: Bytes,
-    pub res: Option<BlockRes>,
+    pub backpressure_guard: Option<BackpressureGuard>,
     pub is_write_unwritten: bool,
     pub cfg: Arc<UpstairsConfig>,
 }
@@ -111,12 +112,12 @@ pub(crate) enum DeferredBlockReq {
 pub(crate) struct EncryptedWrite {
     pub writes: Vec<crucible_protocol::Write>,
     pub impacted_blocks: ImpactedBlocks,
-    pub res: Option<BlockRes>,
     pub is_write_unwritten: bool,
+    pub backpressure_guard: Option<BackpressureGuard>,
 }
 
 impl DeferredWrite {
-    pub fn run(self) -> Option<EncryptedWrite> {
+    pub fn run(self) -> EncryptedWrite {
         // Build up all of the Write operations, encrypting data here
         let mut writes: Vec<crucible_protocol::Write> =
             Vec::with_capacity(self.impacted_blocks.len(&self.ddef));
@@ -124,45 +125,44 @@ impl DeferredWrite {
         let mut cur_offset: usize = 0;
         let byte_len: usize = self.ddef.block_size() as usize;
         for (eid, offset) in self.impacted_blocks.blocks(&self.ddef) {
-            let (sub_data, encryption_context, hash) = if let Some(context) =
-                &self.cfg.encryption_context
-            {
-                // Encrypt here
-                let mut mut_data = self
-                    .data
-                    .slice(cur_offset..(cur_offset + byte_len))
-                    .to_vec();
+            let (sub_data, encryption_context, hash) =
+                if let Some(context) = &self.cfg.encryption_context {
+                    // Encrypt here
+                    let mut mut_data = self
+                        .data
+                        .slice(cur_offset..(cur_offset + byte_len))
+                        .to_vec();
 
-                let (nonce, tag, hash) =
-                    match context.encrypt_in_place(&mut mut_data[..]) {
-                        Err(e) => {
-                            if let Some(res) = self.res {
-                                res.send_err(CrucibleError::EncryptionError(
-                                    e.to_string(),
-                                ));
+                    // Encryption should be infallible.  Tracing down the call
+                    // tree from `encrypt_in_place`, the only possible failures
+                    // are if the plaintext or associated data is too large.
+                    // Our associated data is a 12-byte nonce, so that's always
+                    // fine; our plain-text is a block, which is limited by
+                    // `MAX_SHIFT = 15` (well below aes_gcm_siv::P_MAX).
+                    let (nonce, tag, hash) =
+                        match context.encrypt_in_place(&mut mut_data[..]) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                panic!("failed to encrypt: {e}");
                             }
-                            return None;
-                        }
+                        };
 
-                        Ok(v) => v,
-                    };
+                    (
+                        Bytes::copy_from_slice(&mut_data),
+                        Some(crucible_protocol::EncryptionContext {
+                            nonce: nonce.into(),
+                            tag: tag.into(),
+                        }),
+                        hash,
+                    )
+                } else {
+                    // Unencrypted
+                    let sub_data =
+                        self.data.slice(cur_offset..(cur_offset + byte_len));
+                    let hash = integrity_hash(&[&sub_data[..]]);
 
-                (
-                    Bytes::copy_from_slice(&mut_data),
-                    Some(crucible_protocol::EncryptionContext {
-                        nonce: nonce.into(),
-                        tag: tag.into(),
-                    }),
-                    hash,
-                )
-            } else {
-                // Unencrypted
-                let sub_data =
-                    self.data.slice(cur_offset..(cur_offset + byte_len));
-                let hash = integrity_hash(&[&sub_data[..]]);
-
-                (sub_data, None, hash)
-            };
+                    (sub_data, None, hash)
+                };
 
             writes.push(crucible_protocol::Write {
                 eid,
@@ -176,11 +176,11 @@ impl DeferredWrite {
 
             cur_offset += byte_len;
         }
-        Some(EncryptedWrite {
+        EncryptedWrite {
             writes,
             impacted_blocks: self.impacted_blocks,
-            res: self.res,
+            backpressure_guard: self.backpressure_guard,
             is_write_unwritten: self.is_write_unwritten,
-        })
+        }
     }
 }
