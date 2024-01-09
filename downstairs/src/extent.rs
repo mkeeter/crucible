@@ -3,7 +3,6 @@ use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use tokio::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::unistd::{sysconf, SysconfVar};
@@ -27,7 +26,7 @@ pub struct Extent {
     /// data, the metadata about that extent, and the set of dirty blocks that
     /// have been written to since last flush.  We use dynamic dispatch here to
     /// support multiple extent implementations.
-    inner: Mutex<Box<dyn ExtentInner>>,
+    inner: std::sync::Mutex<Box<dyn ExtentInner>>,
 }
 
 pub(crate) trait ExtentInner: Send + Debug {
@@ -437,21 +436,21 @@ impl Extent {
             number,
             read_only,
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(inner),
+            inner: std::sync::Mutex::new(inner),
         };
 
         Ok(extent)
     }
 
-    pub async fn dirty(&self) -> bool {
-        self.inner.lock().await.dirty().unwrap()
+    pub fn dirty(&self) -> bool {
+        self.inner.lock().unwrap().dirty().unwrap()
     }
 
     /**
      * Close an extent and the metadata db files for it.
      */
-    pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
-        let inner = self.inner.lock().await;
+    pub fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
+        let inner = self.inner.lock().unwrap();
 
         let gen = inner.gen_number().unwrap();
         let flush = inner.flush_number().unwrap();
@@ -504,7 +503,7 @@ impl Extent {
             number,
             read_only: false,
             iov_max: Extent::get_iov_max()?,
-            inner: Mutex::new(inner),
+            inner: std::sync::Mutex::new(inner),
         })
     }
 
@@ -516,7 +515,7 @@ impl Extent {
     /// an error occurs while processing any of the requests, the state of
     /// `responses` is undefined.
     #[instrument]
-    pub async fn read(
+    pub fn read(
         &self,
         job_id: JobId,
         requests: &[&crucible_protocol::ReadRequest],
@@ -526,7 +525,7 @@ impl Extent {
             (job_id.0, self.number, requests.len() as u64)
         });
 
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().unwrap();
 
         inner.read(job_id, requests, responses, self.iov_max)?;
 
@@ -538,7 +537,7 @@ impl Extent {
     }
 
     #[instrument]
-    pub async fn write(
+    pub fn write(
         &self,
         job_id: JobId,
         writes: &[&crucible_protocol::Write],
@@ -552,7 +551,7 @@ impl Extent {
             (job_id.0, self.number, writes.len() as u64)
         });
 
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().unwrap();
         inner.write(job_id, writes, only_write_unwritten, self.iov_max)?;
 
         cdt::extent__write__done!(|| {
@@ -563,7 +562,7 @@ impl Extent {
     }
 
     #[instrument]
-    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
+    pub(crate) fn flush<I: Into<JobOrReconciliationId> + Debug>(
         &self,
         new_flush: u64,
         new_gen: u64,
@@ -571,7 +570,7 @@ impl Extent {
         log: &Logger,
     ) -> Result<(), CrucibleError> {
         let job_id: JobOrReconciliationId = id.into();
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.lock().unwrap();
 
         if !inner.dirty()? {
             /*
@@ -592,8 +591,8 @@ impl Extent {
         inner.flush(new_flush, new_gen, job_id)
     }
 
-    pub async fn get_meta_info(&self) -> ExtentMeta {
-        let inner = self.inner.lock().await;
+    pub fn get_meta_info(&self) -> ExtentMeta {
+        let inner = self.inner.lock().unwrap();
         ExtentMeta {
             ext_version: 0,
             gen_number: inner.gen_number().unwrap(),
@@ -603,10 +602,8 @@ impl Extent {
     }
 
     #[cfg(test)]
-    pub(crate) async fn lock(
-        &self,
-    ) -> tokio::sync::MutexGuard<Box<dyn ExtentInner>> {
-        self.inner.lock().await
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<Box<dyn ExtentInner>> {
+        self.inner.lock().unwrap()
     }
 }
 

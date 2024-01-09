@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
             .await?;
 
             if let Some(ref ip) = import_path {
-                downstairs_import(&mut region, ip).await.unwrap();
+                downstairs_import(&mut region, ip).unwrap();
                 /*
                  * The region we just created should now have a flush so the
                  * new data and inital flush number is written to disk.
@@ -294,8 +294,7 @@ async fn main() -> Result<()> {
                 only_show_differences,
                 no_color,
                 log,
-            )
-            .await?;
+            )?;
             Ok(())
         }
         Args::Export {
@@ -311,10 +310,9 @@ async fn main() -> Result<()> {
                 true,
                 true,
                 &log,
-            )
-            .await?;
+            )?;
 
-            downstairs_export(&mut region, export_path, skip, count).await?;
+            downstairs_export(&mut region, export_path, skip, count)?;
             Ok(())
         }
         Args::Run {
@@ -368,8 +366,7 @@ async fn main() -> Result<()> {
                 flush_errors,
                 read_only,
                 Some(log),
-            )
-            .await?;
+            )?;
 
             let downstairs_join_handle = start_downstairs(
                 d,

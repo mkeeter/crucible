@@ -62,8 +62,7 @@ mod test {
                 encrypted,
                 backend,
                 csl(),
-            )
-            .await?;
+            )?;
 
             let downstairs = build_downstairs_for_region_with_backend(
                 tempdir.path(),
@@ -74,8 +73,7 @@ mod test {
                 read_only,
                 backend,
                 Some(csl()),
-            )
-            .await?;
+            )?;
 
             let _join_handle = start_downstairs(
                 downstairs.clone(),
@@ -105,8 +103,7 @@ mod test {
                 false, /* flush errors */
                 true,
                 Some(csl()),
-            )
-            .await?;
+            )?;
 
             let _join_handle = start_downstairs(
                 self.downstairs.clone(),
@@ -132,8 +129,7 @@ mod test {
                 false, /* flush errors */
                 false,
                 Some(csl()),
-            )
-            .await?;
+            )?;
 
             let _join_handle = start_downstairs(
                 self.downstairs.clone(),

@@ -81,7 +81,7 @@ pub async fn dynamometer(
                     .collect();
 
                 let io_operation_time = Instant::now();
-                region.region_write(&writes, JobId(1000), false).await?;
+                region.region_write(&writes, JobId(1000), false)?;
 
                 total_io_time += io_operation_time.elapsed();
                 io_operations_sent += num_writes;
