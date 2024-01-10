@@ -792,10 +792,12 @@ impl Upstairs {
             // All Write operations are deferred, because they will offload
             // encryption to a separate thread pool.
             BlockOp::Write { offset, data } => {
-                self.submit_deferred_write(offset, data, req.res, false);
+                self.submit_deferred_write(offset, data, req.res, false)
+                    .await;
             }
             BlockOp::WriteUnwritten { offset, data } => {
-                self.submit_deferred_write(offset, data, req.res, true);
+                self.submit_deferred_write(offset, data, req.res, true)
+                    .await;
             }
             // If we have any deferred requests in the FuturesOrdered, then we
             // have to keep using it for subsequent requests (even ones that are
@@ -1230,7 +1232,7 @@ impl Upstairs {
     /// This function **defers** the write job submission, because writes
     /// require encrypting data (which is expensive) and we'd like to return as
     /// quickly as possible.
-    fn submit_deferred_write(
+    async fn submit_deferred_write(
         &mut self,
         offset: Block,
         data: Bytes,
@@ -1243,6 +1245,7 @@ impl Upstairs {
             Some(res),
             is_write_unwritten,
         )
+        .await
     }
 
     /// Submits a dummy write (without an associated `BlockReq`)
@@ -1267,7 +1270,7 @@ impl Upstairs {
     ///
     /// # Panics
     /// If `res` is `None` and this isn't running in the test suite
-    fn submit_deferred_write_inner(
+    async fn submit_deferred_write_inner(
         &mut self,
         offset: Block,
         data: Bytes,
@@ -1277,16 +1280,27 @@ impl Upstairs {
         // It's possible for the write to be invalid out of the gate, in which
         // case `compute_deferred_write` replies to the `res` itself and returns
         // `None`.  Otherwise, we have to store a future to process the write
-        // result.
+        // result if the write is large, and do it inline if the write is small
+        // (assuming nothing else is deferred).
+        let data_len = data.len();
         if let Some(w) =
             self.compute_deferred_write(offset, data, res, is_write_unwritten)
         {
-            let (tx, rx) = oneshot::channel();
-            rayon::spawn(move || {
-                let out = w.run().map(DeferredBlockReq::Write);
-                let _ = tx.send(out);
-            });
-            self.deferred_reqs.push_back(Either::Right(rx));
+            let should_defer =
+                !self.deferred_reqs.is_empty() || data_len > 8192;
+
+            if should_defer {
+                let (tx, rx) = oneshot::channel();
+                rayon::spawn(move || {
+                    let out = w.run().map(DeferredBlockReq::Write);
+                    let _ = tx.send(out);
+                });
+                self.deferred_reqs.push_back(Either::Right(rx));
+            } else if let Some(v) = w.run() {
+                // The write is small, valid, and there's nothing in the
+                // deferred_reqs queue; do the write inline for efficiency.
+                self.apply_guest_request(DeferredBlockReq::Write(v)).await;
+            }
         }
     }
 
