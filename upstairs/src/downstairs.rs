@@ -3213,11 +3213,16 @@ impl Downstairs {
         }
 
         /*
-         * If all 3 jobs are done, we can check here to see if we can
-         * remove this job from the DS list. If we have completed the ack
-         * to the guest, then there will be no more work on this job
-         * but messages may still be unprocessed.
+         * If all 3 jobs are done, we can drop the job from the backpressure
+         * list and check here to see if we can remove this job from the DS
+         * list. If we have completed the ack to the guest, then there will be
+         * no more work on this job but messages may still be unprocessed.
          */
+        let wc = job.state_count();
+        if wc.active == 0 {
+            job.drop_backpressure_guard();
+        }
+
         if job.acked {
             self.retire_check(ds_id);
         } else {
@@ -3225,7 +3230,6 @@ impl Downstairs {
             // hasn't acked back yet. We check for NotAcked so we don't
             // double count three done and return true if we already have
             // AckReady set.
-            let wc = job.state_count();
 
             // If we are a write or a flush with one success, then
             // we must switch our state to failed.  This condition is

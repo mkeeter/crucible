@@ -893,7 +893,6 @@ struct DownstairsIO {
     /// things like live-repair.
     ///
     /// It is only used for its side effects on `Drop`!
-    #[allow(dead_code)]
     bp: Option<BackpressureGuard>,
 }
 
@@ -911,6 +910,14 @@ impl DownstairsIO {
         }
 
         wc
+    }
+
+    /// Drops the backpressure guard
+    ///
+    /// This should be called when the job is no longer active on any
+    /// Downstairs, but has not yet been cleaned up by a flush.
+    pub fn drop_backpressure_guard(&mut self) {
+        let _ = self.bp.take();
     }
 
     /*
