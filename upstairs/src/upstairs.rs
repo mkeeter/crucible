@@ -1279,15 +1279,17 @@ impl Upstairs {
     ) {
         // It's possible for the write to be invalid out of the gate, in which
         // case `compute_deferred_write` replies to the `res` itself and returns
-        // `None`.  Otherwise, we have to store a future to process the write
-        // result if the write is large, and do it inline if the write is small
-        // (assuming nothing else is deferred).
+        // `None`.  Otherwise, we either
+        // 1) do encryption inline if the write is small and nothing else is
+        //    deferred, or
+        // 2) store a future that does encryption in a separate thread
         let data_len = data.len();
         if let Some(w) =
             self.compute_deferred_write(offset, data, res, is_write_unwritten)
         {
-            let should_defer =
-                !self.deferred_reqs.is_empty() || data_len > 8192;
+            const MIN_DEFER_SIZE_BYTES: u64 = 8192;
+            let should_defer = !self.deferred_reqs.is_empty()
+                || data_len as u64 > MIN_DEFER_SIZE_BYTES;
 
             if should_defer {
                 let (tx, rx) = oneshot::channel();
