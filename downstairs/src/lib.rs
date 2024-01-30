@@ -540,20 +540,18 @@ async fn is_message_valid<WT>(
     upstairs_connection: UpstairsConnection,
     upstairs_id: Uuid,
     session_id: Uuid,
-    fw: &Mutex<FramedWrite<WT, CrucibleEncoder>>,
+    fw: &mut FramedWrite<WT, CrucibleEncoder>,
 ) -> Result<bool>
 where
     WT: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send,
 {
     if upstairs_connection.upstairs_id != upstairs_id {
-        let mut fw = fw.lock().await;
         fw.send(Message::UuidMismatch {
             expected_id: upstairs_connection.upstairs_id,
         })
         .await?;
         Ok(false)
     } else if upstairs_connection.session_id != session_id {
-        let mut fw = fw.lock().await;
         fw.send(Message::UuidMismatch {
             expected_id: upstairs_connection.session_id,
         })
@@ -574,7 +572,7 @@ async fn proc_frame<WT>(
     upstairs_connection: UpstairsConnection,
     ad: &Mutex<Downstairs>,
     m: Message,
-    fw: &Mutex<FramedWrite<WT, CrucibleEncoder>>,
+    fw: &mut FramedWrite<WT, CrucibleEncoder>,
 ) -> Result<()>
 where
     WT: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send,
@@ -888,7 +886,6 @@ where
                     },
                 }
             };
-            let mut fw = fw.lock().await;
             fw.send(msg).await?;
             return Ok(());
         }
@@ -908,7 +905,6 @@ where
                     },
                 }
             };
-            let mut fw = fw.lock().await;
             fw.send(msg).await?;
             return Ok(());
         }
@@ -943,7 +939,6 @@ where
                     },
                 }
             };
-            let mut fw = fw.lock().await;
             fw.send(msg).await?;
             return Ok(());
         }
@@ -963,7 +958,6 @@ where
                     },
                 }
             };
-            let mut fw = fw.lock().await;
             fw.send(msg).await?;
             return Ok(());
         }
@@ -983,7 +977,7 @@ where
 async fn do_io_work<T>(
     ads: &Mutex<Downstairs>,
     upstairs_connection: UpstairsConnection,
-    fw: &Mutex<FramedWrite<T, CrucibleEncoder>>,
+    fw: &mut FramedWrite<T, CrucibleEncoder>,
 ) -> Result<()>
 where
     T: tokio::io::AsyncWrite + std::marker::Unpin,
@@ -1067,7 +1061,6 @@ where
                     abort_needed = check_message_for_abort(&m);
 
                     if let Some(error) = m.err() {
-                        let mut fw = fw.lock().await;
                         fw.send(&Message::ErrorReport {
                             upstairs_id: upstairs_connection.upstairs_id,
                             session_id: upstairs_connection.session_id,
@@ -1075,7 +1068,6 @@ where
                             error: error.clone(),
                         })
                         .await?;
-                        drop(fw);
 
                         // If the job errored, do not consider it completed.
                         // Retry it.
@@ -1091,9 +1083,7 @@ where
                         )?;
 
                         // Notify the upstairs before completing work
-                        let mut fw = fw.lock().await;
                         fw.send(&m).await?;
-                        drop(fw);
 
                         ads.lock()
                             .await
@@ -1140,10 +1130,7 @@ async fn proc_stream(
             let (read, write) = sock.into_split();
 
             let fr = FramedRead::new(read, CrucibleDecoder::new());
-            let fw = Arc::new(Mutex::new(FramedWrite::new(
-                write,
-                CrucibleEncoder::new(),
-            )));
+            let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
             proc(ads, fr, fw).await
         }
@@ -1151,10 +1138,7 @@ async fn proc_stream(
             let (read, write) = tokio::io::split(stream);
 
             let fr = FramedRead::new(read, CrucibleDecoder::new());
-            let fw = Arc::new(Mutex::new(FramedWrite::new(
-                write,
-                CrucibleEncoder::new(),
-            )));
+            let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
             proc(ads, fr, fw).await
         }
@@ -1178,7 +1162,7 @@ pub struct UpstairsConnection {
 async fn proc<RT, WT>(
     ads: &Arc<Mutex<Downstairs>>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
-    fw: Arc<Mutex<FramedWrite<WT, CrucibleEncoder>>>,
+    mut fw: FramedWrite<WT, CrucibleEncoder>,
 ) -> Result<()>
 where
     RT: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send,
@@ -1269,7 +1253,6 @@ where
                             shutting down connection for {:?}",
                             new_upstairs_connection, upstairs_connection);
 
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(Message::YouAreNoLongerActive {
                             new_upstairs_id:
                                 new_upstairs_connection.upstairs_id,
@@ -1336,7 +1319,6 @@ where
                         return Ok(());
                     }
                     Some(Message::Ruok) => {
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(Message::Imok).await {
                             bail!("Failed to answer ping: {}", e);
                         }
@@ -1378,7 +1360,6 @@ where
                                 let m = Message::VersionMismatch {
                                     version: CRUCIBLE_MESSAGE_VERSION,
                                 };
-                                let mut fw = fw.lock().await;
                                 if let Err(e) = fw.send(m).await {
                                     warn!(
                                         log,
@@ -1401,7 +1382,6 @@ where
                         {
                             let ds = ads.lock().await;
                             if ds.read_only != read_only {
-                                let mut fw = fw.lock().await;
 
                                 if let Err(e) = fw.send(Message::ReadOnlyMismatch {
                                     expected: ds.read_only,
@@ -1414,7 +1394,6 @@ where
                             }
 
                             if ds.encrypted != encrypted {
-                                let mut fw = fw.lock().await;
 
                                 if let Err(e) = fw.send(Message::EncryptedMismatch {
                                     expected: ds.encrypted,
@@ -1438,7 +1417,6 @@ where
                             upstairs_connection.unwrap(),
                             CRUCIBLE_MESSAGE_VERSION);
 
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(
                             Message::YesItsMe {
                                 version: CRUCIBLE_MESSAGE_VERSION,
@@ -1466,7 +1444,6 @@ where
                             upstairs_connection.session_id == session_id;
 
                         if !matches_self {
-                            let mut fw = fw.lock().await;
                             if let Err(e) = fw.send(
                                 Message::UuidMismatch {
                                     expected_id:
@@ -1511,7 +1488,6 @@ where
                             }
                             negotiated = NegotiationState::PromotedToActive;
 
-                            let mut fw = fw.lock().await;
                             if let Err(e) = fw.send(Message::YouAreNowActive {
                                 upstairs_id,
                                 session_id,
@@ -1532,7 +1508,6 @@ where
                             ds.region.def()
                         };
 
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(Message::RegionInfo { region_def }).await {
                             bail!("Failed sending RegionInfo: {}", e);
                         }
@@ -1556,7 +1531,6 @@ where
                                 "Set last flush {}", last_flush_number);
                         }
 
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(Message::LastFlushAck {
                             last_flush_number
                         }).await {
@@ -1603,7 +1577,6 @@ where
                                 flush_numbers);
                         }
 
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(Message::ExtentVersions {
                             gen_numbers,
                             flush_numbers,
@@ -1645,7 +1618,7 @@ where
 async fn resp_loop<RT, WT>(
     ads: &Arc<Mutex<Downstairs>>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
-    fw: Arc<Mutex<FramedWrite<WT, CrucibleEncoder>>>,
+    mut fw: FramedWrite<WT, CrucibleEncoder>,
     mut another_upstairs_active_rx: oneshot::Receiver<UpstairsConnection>,
     upstairs_connection: UpstairsConnection,
 ) -> Result<()>
@@ -1731,7 +1704,6 @@ where
                             shutting down connection for {:?}",
                             new_upstairs_connection, upstairs_connection);
 
-                        let mut fw = fw.lock().await;
                         if let Err(e) = fw.send(Message::YouAreNoLongerActive {
                             new_upstairs_id:
                                 new_upstairs_connection.upstairs_id,
@@ -1770,12 +1742,11 @@ where
                     Some(Ok(msg)) => {
                         if matches!(msg, Message::Ruok) {
                             // Respond instantly to pings, don't wait.
-                            let mut fw = fw.lock().await;
                             if let Err(e) = fw.send(Message::Imok).await {
                                 bail!("Failed sending Imok: {}", e);
                             }
                         } else if let Err(e) = proc_frame(
-                            upstairs_connection, ads, msg, &fw
+                            upstairs_connection, ads, msg, &mut fw
                         ).await {
                             bail!("Failed sending message to proc_frame: {}", e);
                         }
@@ -1788,7 +1759,7 @@ where
                 }
             }
         }
-        do_io_work(ads, upstairs_connection, &fw).await?;
+        do_io_work(ads, upstairs_connection, &mut fw).await?;
     }
 }
 
