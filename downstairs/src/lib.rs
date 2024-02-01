@@ -2453,23 +2453,11 @@ impl Downstairs {
         let work = up.work_mut();
 
         // Complete the job
-        let is_flush = matches!(m, Message::FlushAck { .. });
-
-        // If upstairs_connection grabs the work lock, it is the active
-        // connection for this Upstairs UUID. The job should exist in the Work
-        // struct. If it does not, then we're in the case where the same
-        // Upstairs has reconnected and been promoted to active, meaning
-        // `work.clear()` was run. If that's the case, then do not alter the
-        // Work struct, because there's now two tasks running for the same
-        // UpstairsConnection, and we're the one that should be on the way out
-        // due to a message on the terminate_sender channel.
-        if work.active.remove(&ds_id).is_some() {
-            if is_flush {
-                work.last_flush = ds_id;
-                work.completed = Vec::with_capacity(32);
-            } else {
-                work.completed.push(ds_id);
-            }
+        if matches!(m, Message::FlushAck { .. }) {
+            work.last_flush = ds_id;
+            work.completed = Vec::with_capacity(32);
+        } else {
+            work.completed.push(ds_id);
         }
     }
 
