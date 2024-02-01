@@ -5,6 +5,7 @@
 use futures::lock::{Mutex, MutexGuard};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -22,7 +23,7 @@ use futures::{SinkExt, StreamExt};
 use rand::prelude::*;
 use slog::{debug, error, info, o, warn, Logger};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use uuid::Uuid;
@@ -1080,7 +1081,7 @@ where
                             upstairs_connection,
                             &m,
                             job_id,
-                        )?;
+                        );
 
                         // Notify the upstairs before completing work
                         fw.send(&m).await?;
@@ -1153,6 +1154,1534 @@ pub struct UpstairsConnection {
     gen: u64,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum NegotiationState {
+    Start,
+    ConnectedToUpstairs,
+    PromotedToActive,
+    SentRegionInfo,
+    Ready,
+}
+
+#[derive(Debug)]
+enum UpstairsState {
+    Negotiating {
+        negotiated: NegotiationState,
+        upstairs_connection: Option<UpstairsConnection>,
+    },
+    Running {
+        work: Work,
+        upstairs_connection: UpstairsConnection,
+    },
+}
+
+impl UpstairsState {
+    fn upstairs_connection(&self) -> Option<&UpstairsConnection> {
+        match self {
+            UpstairsState::Negotiating {
+                upstairs_connection,
+                ..
+            } => upstairs_connection.as_ref(),
+            UpstairsState::Running {
+                upstairs_connection,
+                ..
+            } => Some(upstairs_connection),
+        }
+    }
+}
+
+/// Represents a single Upstairs connection
+#[derive(Debug)]
+struct Upstairs {
+    /// Current state
+    state: UpstairsState,
+
+    /// Handle to send messages to the dedicated IO thread
+    ///
+    /// (messages are received on the shared `Downstairs` channel)
+    message_tx: mpsc::Sender<Message>,
+
+    log: Logger,
+}
+
+impl Upstairs {
+    /// Returns a reference to the upstairs connection
+    ///
+    /// # Panics
+    /// If this upstairs is still negotiating
+    fn upstairs_connection(&self) -> UpstairsConnection {
+        self.state.upstairs_connection().unwrap().clone()
+    }
+
+    /// Returns a mutable reference to the work map for a running Upstairs
+    ///
+    /// # Panics
+    /// If the upstairs is still negotiating
+    fn work_mut(&mut self) -> &mut Work {
+        let UpstairsState::Running { work, .. } = &mut self.state else {
+            panic!("can't do work for Upstairs that is not running");
+        };
+        work
+    }
+
+    /// Returns an immutable reference to the work map for a running Upstairs
+    ///
+    /// # Panics
+    /// If the upstairs is still negotiating
+    fn work(&self) -> &Work {
+        let UpstairsState::Running { work, .. } = &self.state else {
+            panic!("can't get work for Upstairs that is not running");
+        };
+        work
+    }
+
+    /// Checks whether the given message IDs are valid
+    ///
+    /// Otherwise, sends a `UuidMismatch` on the channel and returns `false`
+    ///
+    /// Returns an error if we can't send anything on the channel.
+    async fn is_message_valid(
+        &mut self,
+        upstairs_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<bool> {
+        let Some(upstairs_connection) = self.state.upstairs_connection() else {
+            panic!("called is_message_valid without connection");
+        };
+        if upstairs_connection.upstairs_id != upstairs_id {
+            self.message_tx
+                .send(Message::UuidMismatch {
+                    expected_id: upstairs_connection.upstairs_id,
+                })
+                .await?;
+            Ok(false)
+        } else if upstairs_connection.session_id != session_id {
+            self.message_tx
+                .send(Message::UuidMismatch {
+                    expected_id: upstairs_connection.session_id,
+                })
+                .await?;
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+}
+
+/// Internal unique ID for each new connection
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+struct ConnectionId(u64);
+
+/*
+ * Overall structure for things the downstairs is tracking.
+ * This includes the extents and their status as well as the
+ * downstairs work queue.
+ */
+#[derive(Debug)]
+pub struct NewDownstairs {
+    pub region: Region,
+
+    /// Test flag, enables pauses and skipped jobs
+    lossy: bool,
+    /// Test flag, enables random read errors
+    read_errors: bool,
+    /// Test flag, enables random write errors
+    write_errors: bool,
+    /// Test flag, enables random flush errors
+    flush_errors: bool,
+
+    /// All active connections
+    ///
+    /// Many Upstairs may be connected to a single Downstairs simultaneously
+    /// (and in various states of negotiation).
+    connections: HashMap<ConnectionId, Upstairs>,
+
+    /// Active upstairs, as a map from upstairs IDs to the `connections` map
+    active_upstairs: HashMap<Uuid, ConnectionId>,
+
+    next_connection_id: u64,
+
+    dss: DsStatOuter,
+    read_only: bool,
+    encrypted: bool,
+
+    pub address: Option<SocketAddr>,
+    pub repair_address: Option<SocketAddr>,
+
+    log: Logger,
+}
+
+enum Action {
+    /// The socket has accepted a new connection
+    NewConnection(WrappedStream),
+
+    /// The given connection timed out during negotiation
+    NegotiationTimedOut(ConnectionId),
+
+    /// We received a message on the given connection
+    Message(Message, ConnectionId),
+}
+
+impl NewDownstairs {
+    /// Returns the next valid connection ID, bumping our internal counter
+    ///
+    /// Connection IDs are never reused, since a `u64` will not roll over under
+    /// even extraordinary circumstances.
+    fn next_connection_id(&mut self) -> ConnectionId {
+        let i = self.next_connection_id;
+        self.next_connection_id += 1;
+        ConnectionId(i)
+    }
+
+    /// Processes a single message coming from a particular upstairs
+    ///
+    /// Returns `Ok(())` if the message was handled, and `Err(..)` if something
+    /// went wrong and we should bail out of this connection.
+    async fn handle_message(
+        &mut self,
+        m: Message,
+        target: ConnectionId,
+    ) -> Result<()> {
+        let Some(up) = self.connections.get_mut(&target) else {
+            warn!(
+                self.log,
+                "received message on dropped connection {target:?}; ignoring"
+            );
+            return Ok(()); // the connection isn't present, so we can't drop it
+        };
+        match &mut up.state {
+            UpstairsState::Negotiating { .. } => {
+                let r = self.continue_negotiation(m, target).await;
+                if let Err(e) = &r {
+                    let up = &self.connections[&target];
+                    error!(up.log, "negotiation failed: {e:?}");
+                }
+                r
+            }
+            UpstairsState::Running { .. } => {
+                if matches!(m, Message::Ruok) {
+                    // Respond instantly to pings, don't wait.
+                    if let Err(e) = up.message_tx.send(Message::Imok).await {
+                        bail!("Failed sending Imok: {}", e);
+                    }
+                } else if let Err(e) = self.proc_frame(m, target).await {
+                    bail!("Failed sending message to proc_frame: {}", e);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn continue_negotiation(
+        &mut self,
+        m: Message,
+        target: ConnectionId,
+    ) -> Result<()> {
+        let up = self.connections.get_mut(&target).unwrap();
+        let UpstairsState::Negotiating {
+            negotiated,
+            upstairs_connection,
+        } = &mut up.state
+        else {
+            panic!("invalid state");
+        };
+
+        match m {
+            Message::Ruok => {
+                if let Err(e) = up.message_tx.send(Message::Imok).await {
+                    error!(up.log, "Failed to answer ping: {}", e);
+                }
+            }
+            Message::HereIAm {
+                version,
+                upstairs_id,
+                session_id,
+                gen,
+                read_only,
+                encrypted,
+                alternate_versions,
+            } => {
+                if *negotiated != NegotiationState::Start {
+                    bail!("Received connect out of order {:?}", negotiated);
+                }
+                info!(
+                    self.log,
+                    "Connection request from {} with version {}",
+                    upstairs_id,
+                    version
+                );
+
+                // Verify we can communicate with the upstairs.  First
+                // check our message version.  If that fails,  check
+                // to see if our version is one of the supported
+                // versions the upstairs has told us it can support.
+                if version != CRUCIBLE_MESSAGE_VERSION {
+                    if alternate_versions.contains(&CRUCIBLE_MESSAGE_VERSION) {
+                        warn!(
+                            self.log,
+                            "downstairs and upstairs using different \
+                                     but compatible versions, Upstairs is {}, \
+                                     but supports {:?}, downstairs is {}",
+                            version,
+                            alternate_versions,
+                            CRUCIBLE_MESSAGE_VERSION,
+                        );
+                    } else {
+                        let m = Message::VersionMismatch {
+                            version: CRUCIBLE_MESSAGE_VERSION,
+                        };
+                        if let Err(e) = up.message_tx.send(m).await {
+                            warn!(
+                                self.log,
+                                "Failed to send VersionMismatch: {}", e
+                            );
+                        }
+                        bail!(
+                            "Required version {}, Or {:?} got {}",
+                            CRUCIBLE_MESSAGE_VERSION,
+                            alternate_versions,
+                            version,
+                        );
+                    }
+                }
+
+                // Reject an Upstairs negotiation if there is a mismatch
+                // of expectation, and terminate the connection - the
+                // Upstairs will not be able to successfully negotiate.
+                if self.read_only != read_only {
+                    if let Err(e) = up
+                        .message_tx
+                        .send(Message::ReadOnlyMismatch {
+                            expected: self.read_only,
+                        })
+                        .await
+                    {
+                        warn!(
+                            self.log,
+                            "Failed to send ReadOnlyMismatch: {}", e
+                        );
+                    }
+
+                    bail!("closing connection due to read-only mismatch");
+                }
+
+                if self.encrypted != encrypted {
+                    if let Err(e) = up
+                        .message_tx
+                        .send(Message::EncryptedMismatch {
+                            expected: self.encrypted,
+                        })
+                        .await
+                    {
+                        warn!(
+                            up.log,
+                            "Failed to send EncryptedMismatch: {}", e
+                        );
+                    }
+
+                    bail!("closing connection due to encryption mismatch");
+                }
+
+                *negotiated = NegotiationState::ConnectedToUpstairs;
+                *upstairs_connection = Some(UpstairsConnection {
+                    upstairs_id,
+                    session_id,
+                    gen,
+                });
+                info!(
+                    up.log,
+                    "upstairs {:?} connected, version {}",
+                    upstairs_connection.unwrap(),
+                    CRUCIBLE_MESSAGE_VERSION
+                );
+
+                if let Err(e) = up
+                    .message_tx
+                    .send(Message::YesItsMe {
+                        version: CRUCIBLE_MESSAGE_VERSION,
+                        repair_addr: self.repair_address.unwrap(),
+                    })
+                    .await
+                {
+                    bail!("Failed sending YesItsMe: {}", e);
+                }
+            }
+            Message::PromoteToActive {
+                upstairs_id,
+                session_id,
+                gen,
+            } => {
+                if *negotiated != NegotiationState::ConnectedToUpstairs {
+                    bail!("Received activate out of order {negotiated:?}",);
+                }
+
+                // Only allowed to promote or demote self
+                let mut upstairs_connection = upstairs_connection.unwrap();
+                let matches_self = upstairs_connection.upstairs_id
+                    == upstairs_id
+                    && upstairs_connection.session_id == session_id;
+
+                if !matches_self {
+                    if let Err(e) = up
+                        .message_tx
+                        .send(Message::UuidMismatch {
+                            expected_id: upstairs_connection.upstairs_id,
+                        })
+                        .await
+                    {
+                        warn!(up.log, "Failed sending UuidMismatch: {}", e);
+                    }
+                    bail!(
+                        "Upstairs connection expected \
+                         upstairs_id:{} session_id:{}; received \
+                         upstairs_id:{} session_id:{}",
+                        upstairs_connection.upstairs_id,
+                        upstairs_connection.session_id,
+                        upstairs_id,
+                        session_id
+                    );
+                } else {
+                    if upstairs_connection.gen != gen {
+                        warn!(
+                            up.log,
+                            "warning: generation number at \
+                                    negotiation was {} and {} at \
+                                    activation, updating",
+                            upstairs_connection.gen,
+                            gen,
+                        );
+
+                        upstairs_connection.gen = gen;
+                    }
+
+                    let r = self.promote_to_active(target).await;
+
+                    // Reborrow `up` and `negotiated`, which had to be
+                    // unborrowed during `promote_to_active`
+                    let up = self.connections.get_mut(&target).unwrap();
+                    if let Err(e) = r {
+                        bail!("promoting to active failed: {e:?}");
+                    }
+
+                    let UpstairsState::Negotiating { negotiated, .. } =
+                        &mut up.state
+                    else {
+                        panic!("invalid up.state");
+                    };
+                    *negotiated = NegotiationState::PromotedToActive;
+
+                    if let Err(e) = up
+                        .message_tx
+                        .send(Message::YouAreNowActive {
+                            upstairs_id,
+                            session_id,
+                            gen,
+                        })
+                        .await
+                    {
+                        bail!("Failed sending YouAreNewActive: {e}");
+                    }
+                }
+            }
+            Message::RegionInfoPlease => {
+                if *negotiated != NegotiationState::PromotedToActive {
+                    bail!("Received RegionInfo out of order {:?}", negotiated);
+                }
+                *negotiated = NegotiationState::SentRegionInfo;
+                let region_def = self.region.def();
+
+                if let Err(e) =
+                    up.message_tx.send(Message::RegionInfo { region_def }).await
+                {
+                    bail!("Failed sending RegionInfo: {}", e);
+                }
+            }
+            Message::LastFlush { last_flush_number } => {
+                if *negotiated != NegotiationState::SentRegionInfo {
+                    bail!("Received LastFlush out of order {:?}", negotiated);
+                }
+
+                let mut work = Work::new();
+                work.last_flush = last_flush_number;
+
+                // Consume the Negotiating state; we're now running
+                up.state = UpstairsState::Running {
+                    work,
+                    upstairs_connection: upstairs_connection.take().unwrap(),
+                };
+                info!(up.log, "Set last flush {}", last_flush_number);
+
+                if let Err(e) = up
+                    .message_tx
+                    .send(Message::LastFlushAck { last_flush_number })
+                    .await
+                {
+                    bail!("Failed sending LastFlushAck: {}", e);
+                }
+
+                /*
+                 * Once this command is sent, we are ready to exit
+                 * the loop and move forward with receiving IOs
+                 */
+            }
+            Message::ExtentVersionsPlease => {
+                if *negotiated != NegotiationState::SentRegionInfo {
+                    bail!(
+                        "Received ExtentVersions out of order {:?}",
+                        negotiated
+                    );
+                }
+
+                up.state = UpstairsState::Running {
+                    work: Work::new(), // last flush?
+                    upstairs_connection: upstairs_connection.take().unwrap(),
+                };
+                let meta_info = match self.region.meta_info().await {
+                    Ok(meta_info) => meta_info,
+                    Err(e) => {
+                        bail!("could not get meta info: {e}");
+                    }
+                };
+
+                let flush_numbers: Vec<_> =
+                    meta_info.iter().map(|m| m.flush_number).collect();
+                let gen_numbers: Vec<_> =
+                    meta_info.iter().map(|m| m.gen_number).collect();
+                let dirty_bits: Vec<_> =
+                    meta_info.iter().map(|m| m.dirty).collect();
+                if flush_numbers.len() > 12 {
+                    info!(
+                        up.log,
+                        "Current flush_numbers [0..12]: {:?}",
+                        &flush_numbers[0..12]
+                    );
+                } else {
+                    info!(
+                        up.log,
+                        "Current flush_numbers [0..12]: {:?}", flush_numbers
+                    );
+                }
+
+                if let Err(e) = up
+                    .message_tx
+                    .send(Message::ExtentVersions {
+                        gen_numbers,
+                        flush_numbers,
+                        dirty_bits,
+                    })
+                    .await
+                {
+                    bail!("Failed sending ExtentVersions: {}", e);
+                }
+
+                /*
+                 * Once this command is sent, we are ready to exit
+                 * the loop and move forward with receiving IOs
+                 */
+            }
+            _msg => {
+                warn!(up.log, "Ignored message received during negotiation");
+            }
+        }
+        Ok(())
+    }
+
+    async fn proc_frame(
+        &mut self,
+        m: Message,
+        target: ConnectionId,
+    ) -> Result<()> {
+        let up = self.connections.get_mut(&target).unwrap();
+        let UpstairsState::Running {
+            work,
+            upstairs_connection,
+        } = &mut up.state
+        else {
+            panic!("invalid state");
+        };
+
+        let new_ds_id = match m {
+            Message::Write {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                writes,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+                cdt::submit__write__start!(|| job_id.0);
+
+                let new_write = IOop::Write {
+                    dependencies,
+                    writes,
+                };
+
+                self.add_work(target, job_id, new_write).await?;
+                Some(job_id)
+            }
+            Message::Flush {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                flush_number,
+                gen_number,
+                snapshot_details,
+                extent_limit,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+                cdt::submit__flush__start!(|| job_id.0);
+
+                let new_flush = IOop::Flush {
+                    dependencies,
+                    flush_number,
+                    gen_number,
+                    snapshot_details,
+                    extent_limit,
+                };
+
+                self.add_work(target, job_id, new_flush).await?;
+                Some(job_id)
+            }
+            Message::WriteUnwritten {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                writes,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+                cdt::submit__writeunwritten__start!(|| job_id.0);
+
+                let new_write = IOop::WriteUnwritten {
+                    dependencies,
+                    writes,
+                };
+
+                self.add_work(target, job_id, new_write).await?;
+                Some(job_id)
+            }
+            Message::ReadRequest {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                requests,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+                cdt::submit__read__start!(|| job_id.0);
+
+                let new_read = IOop::Read {
+                    dependencies,
+                    requests,
+                };
+
+                self.add_work(target, job_id, new_read).await?;
+                Some(job_id)
+            }
+            // These are for repair while taking live IO
+            Message::ExtentLiveClose {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                extent_id,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+
+                cdt::submit__el__close__start!(|| job_id.0);
+                // TODO: Add dtrace probes
+                let ext_close = IOop::ExtentClose {
+                    dependencies,
+                    extent: extent_id,
+                };
+
+                self.add_work(target, job_id, ext_close).await?;
+                Some(job_id)
+            }
+            Message::ExtentLiveFlushClose {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                extent_id,
+                flush_number,
+                gen_number,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+
+                cdt::submit__el__flush__close__start!(|| job_id.0);
+                // Do both the flush, and then the close
+                let new_flush = IOop::ExtentFlushClose {
+                    dependencies,
+                    extent: extent_id,
+                    flush_number,
+                    gen_number,
+                    source_downstairs: ClientId::new(0), // Unused in the downstairs
+                    repair_downstairs: vec![], // Unused in the downstairs
+                };
+
+                self.add_work(target, job_id, new_flush).await?;
+                Some(job_id)
+            }
+            Message::ExtentLiveRepair {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                extent_id,
+                source_client_id,
+                source_repair_address,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+
+                cdt::submit__el__repair__start!(|| job_id.0);
+                // Do both the flush, and then the close
+                let new_repair = IOop::ExtentLiveRepair {
+                    dependencies,
+                    extent: extent_id,
+                    source_downstairs: source_client_id,
+                    source_repair_address,
+                    repair_downstairs: vec![],
+                };
+
+                debug!(up.log, "Received ExtentLiveRepair {}", job_id);
+                self.add_work(target, job_id, new_repair).await?;
+                Some(job_id)
+            }
+            Message::ExtentLiveReopen {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+                extent_id,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+
+                cdt::submit__el__reopen__start!(|| job_id.0);
+                let new_open = IOop::ExtentLiveReopen {
+                    dependencies,
+                    extent: extent_id,
+                };
+
+                self.add_work(target, job_id, new_open).await?;
+                Some(job_id)
+            }
+            Message::ExtentLiveNoOp {
+                upstairs_id,
+                session_id,
+                job_id,
+                dependencies,
+            } => {
+                if !up.is_message_valid(upstairs_id, session_id).await? {
+                    return Ok(());
+                }
+                cdt::submit__el__noop__start!(|| job_id.0);
+                let new_open = IOop::ExtentLiveNoOp { dependencies };
+
+                debug!(up.log, "Received NoOP {}", job_id);
+                self.add_work(target, job_id, new_open).await?;
+                Some(job_id)
+            }
+
+            // These messages arrive during initial reconciliation.
+            Message::ExtentFlush {
+                repair_id,
+                extent_id,
+                client_id: _,
+                flush_number,
+                gen_number,
+            } => {
+                let msg = {
+                    debug!(
+                        up.log,
+                        "{} Flush extent {} with f:{} g:{}",
+                        repair_id,
+                        extent_id,
+                        flush_number,
+                        gen_number
+                    );
+
+                    match self
+                        .region
+                        .region_flush_extent(
+                            extent_id,
+                            gen_number,
+                            flush_number,
+                            repair_id,
+                        )
+                        .await
+                    {
+                        Ok(()) => Message::RepairAckId { repair_id },
+                        Err(error) => Message::ExtentError {
+                            repair_id,
+                            extent_id,
+                            error,
+                        },
+                    }
+                };
+                up.message_tx.send(msg).await?;
+                return Ok(());
+            }
+            Message::ExtentClose {
+                repair_id,
+                extent_id,
+            } => {
+                let msg = {
+                    debug!(up.log, "{} Close extent {}", repair_id, extent_id);
+                    match self.region.close_extent(extent_id).await {
+                        Ok(_) => Message::RepairAckId { repair_id },
+                        Err(error) => Message::ExtentError {
+                            repair_id,
+                            extent_id,
+                            error,
+                        },
+                    }
+                };
+                up.message_tx.send(msg).await?;
+                return Ok(());
+            }
+            Message::ExtentRepair {
+                repair_id,
+                extent_id,
+                source_client_id,
+                source_repair_address,
+                dest_clients,
+            } => {
+                let msg = {
+                    debug!(
+                        up.log,
+                        "{} Repair extent {} source:[{}] {:?} dest:{:?}",
+                        repair_id,
+                        extent_id,
+                        source_client_id,
+                        source_repair_address,
+                        dest_clients
+                    );
+                    match self
+                        .region
+                        .repair_extent(extent_id, source_repair_address)
+                        .await
+                    {
+                        Ok(()) => Message::RepairAckId { repair_id },
+                        Err(error) => Message::ExtentError {
+                            repair_id,
+                            extent_id,
+                            error,
+                        },
+                    }
+                };
+                up.message_tx.send(msg).await?;
+                return Ok(());
+            }
+            Message::ExtentReopen {
+                repair_id,
+                extent_id,
+            } => {
+                let msg = {
+                    debug!(up.log, "{} Reopen extent {}", repair_id, extent_id);
+                    match self.region.reopen_extent(extent_id).await {
+                        Ok(()) => Message::RepairAckId { repair_id },
+                        Err(error) => Message::ExtentError {
+                            repair_id,
+                            extent_id,
+                            error,
+                        },
+                    }
+                };
+                up.message_tx.send(msg).await?;
+                return Ok(());
+            }
+            x => bail!("unexpected frame {:?}", x),
+        };
+
+        /*
+         * If we added work, then fire a DTrace probe
+         */
+        if let Some(new_ds_id) = new_ds_id {
+            cdt::work__start!(|| new_ds_id.0);
+        }
+
+        Ok(())
+    }
+
+    async fn add_work(
+        &mut self,
+        target: ConnectionId,
+        ds_id: JobId,
+        work: IOop,
+    ) -> Result<()> {
+        // The Upstairs will send Flushes periodically, even in read only mode
+        // we have to accept them. But read-only should never accept writes!
+        if self.read_only {
+            let is_write = match work {
+                IOop::Write { .. }
+                | IOop::WriteUnwritten { .. }
+                | IOop::ExtentClose { .. }
+                | IOop::ExtentFlushClose { .. }
+                | IOop::ExtentLiveRepair { .. }
+                | IOop::ExtentLiveReopen { .. }
+                | IOop::ExtentLiveNoOp { .. } => true,
+                IOop::Read { .. } | IOop::Flush { .. } => false,
+            };
+
+            if is_write {
+                error!(self.log, "read-only but received write {:?}", work);
+                bail!(CrucibleError::ModifyingReadOnlyRegion);
+            }
+        }
+
+        let up = &mut self.connections.get_mut(&target).unwrap();
+        let dsw = DownstairsWork {
+            upstairs_connection: up.upstairs_connection(),
+            ds_id,
+            work,
+            state: WorkState::New,
+        };
+        up.work_mut().add_work(ds_id, dsw);
+
+        Ok(())
+    }
+
+    async fn promote_to_active(
+        &mut self,
+        id_being_promoted: ConnectionId,
+    ) -> Result<()> {
+        let new_connection =
+            self.connections[&id_being_promoted].upstairs_connection();
+
+        if self.read_only {
+            // Multiple active read-only sessions are allowed, but multiple
+            // sessions for the same Upstairs UUID are not. Kick out a
+            // previously active session for this UUID if one exists.
+            if self
+                .active_upstairs
+                .contains_key(&new_connection.upstairs_id)
+            {
+                self.close_connection(
+                    new_connection.upstairs_id,
+                    &new_connection,
+                )
+                .await;
+
+                // In the future, we may decide there is some way to continue
+                // working on outstanding jobs, or a way to merge. But for now,
+                // we just throw out what we have and let the upstairs resend
+                // anything to us that it did not get an ACK for.
+            }
+
+            // Insert a new session.  This must create a new entry, because we
+            // removed the entry above (if it existed).
+            let prev = self
+                .active_upstairs
+                .insert(new_connection.upstairs_id, id_being_promoted);
+            assert!(prev.is_none());
+
+            Ok(())
+        } else {
+            // Only one active read-write session is allowed. Kick out the
+            // currently active Upstairs session if one exists.
+            match self.active_upstairs.len() {
+                0 => (), // this is fine
+                1 => {
+                    // There is a single existing session.  Determine if this
+                    // new request to promote to active should move forward or
+                    // be blocked.
+                    let prev_upstairs_id =
+                        self.active_upstairs.values().next().unwrap();
+                    let prev_upstairs = &self.connections[prev_upstairs_id];
+                    let prev_connection = prev_upstairs.upstairs_connection();
+
+                    warn!(
+                        self.log,
+                        "Attempting RW takeover from {:?} to {:?}",
+                        prev_connection,
+                        new_connection,
+                    );
+
+                    // Compare the new generaion number to what the existing
+                    // connection is and take action based on that.
+                    match new_connection.gen.cmp(&prev_connection.gen) {
+                        Ordering::Less => {
+                            // If the new connection has a lower generation
+                            // number than the current connection, we don't
+                            // allow it to take over.
+                            bail!(
+                                "Current gen {} is > requested gen of {}",
+                                prev_connection.gen,
+                                new_connection.gen,
+                            );
+                        }
+                        Ordering::Equal => {
+                            // The generation numbers match, the only way we
+                            // allow this new connection to take over is if the
+                            // upstairs_id and the session_id are the same,
+                            // which means the whole structures need to be
+                            // identical.
+                            if prev_connection != new_connection {
+                                bail!(
+                                    "Same gen, but UUIDs {:?} don't match {:?}",
+                                    prev_connection,
+                                    new_connection,
+                                );
+                            }
+                        }
+                        // The only remaining case is the new generation
+                        // number is higher than the existing.
+                        Ordering::Greater => {}
+                    }
+
+                    // Close the connection, sending YouAreNoLongerActive
+                    self.close_connection(
+                        prev_connection.upstairs_id,
+                        &new_connection,
+                    )
+                    .await;
+                }
+                _ => {
+                    // Panic - we shouldn't be running with more than one
+                    // active read-write Upstairs
+                    panic!(
+                        "More than one currently active r/w upstairs! {:?}",
+                        self.active_upstairs.keys(),
+                    );
+                }
+            }
+
+            // We've cleared out a slot in `active_upstairs` for our new id
+            let prev = self
+                .active_upstairs
+                .insert(new_connection.upstairs_id, id_being_promoted);
+            assert!(prev.is_none());
+
+            if !self.read_only {
+                assert_eq!(self.active_upstairs.len(), 1);
+            }
+
+            // Re-open any closed extents
+            self.region.reopen_all_extents().await?;
+
+            info!(
+                self.log,
+                "{:?} is now active ({})",
+                new_connection,
+                if self.read_only {
+                    "read-only"
+                } else {
+                    "read-write"
+                }
+            );
+
+            Ok(())
+        }
+    }
+
+    /// Closes a currently-running connection
+    ///
+    /// `old_upstairs_id` must be a member of `self.active_upstairs`.  It is
+    /// removed from `active_upstairs` and `connections`, sent
+    /// `YouAreNoLongerActive`, then dropped (which causes the IO task to halt).
+    async fn close_connection(
+        &mut self,
+        old_upstairs_id: Uuid,
+        new_connection: &UpstairsConnection, // only used for logging
+    ) {
+        let id = self.active_upstairs.remove(&old_upstairs_id).unwrap();
+        let prev_upstairs = self.connections.remove(&id).unwrap();
+        let old_connection = prev_upstairs.upstairs_connection();
+
+        warn!(
+            self.log,
+            "closing {:?} handles because {:?} is being promoted ({})",
+            old_connection,
+            new_connection,
+            if self.read_only {
+                "read-only"
+            } else {
+                "read-write"
+            }
+        );
+
+        if let Err(e) = prev_upstairs
+            .message_tx
+            .send(Message::YouAreNoLongerActive {
+                new_upstairs_id: new_connection.upstairs_id,
+                new_session_id: new_connection.session_id,
+                new_gen: new_connection.gen,
+            })
+            .await
+        {
+            warn!(
+                prev_upstairs.log,
+                "Failed sending YouAreNoLongerActive: {}", e
+            );
+        }
+
+        // Note: in the future, differentiate between new upstairs
+        // connecting vs same upstairs reconnecting here.
+        //
+        // Clear out active jobs, the last flush, and completed
+        // information, as that will not be valid any longer.
+        //
+        // TODO: Really work through this error case
+        let work = prev_upstairs.work();
+        if work.active.keys().len() > 0 {
+            warn!(
+                self.log,
+                "Crucible Downstairs promoting {:?} to active, \
+                            discarding {} jobs",
+                new_connection,
+                work.active.keys().len()
+            );
+        }
+
+        // In the future, we may decide there is some way to
+        // continue working on outstanding jobs, or a way to merge.
+        // But for now, we just throw out what we have and let the
+        // upstairs resend anything to us that it did not get an ACK
+        // for.
+    }
+
+    /// Process all available IO work
+    async fn do_io_work(&mut self) {
+        // Add a little time to completion for this operation.
+        if self.lossy && random() && random() {
+            info!(self.log, "[lossy] sleeping 1 second");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        // Clone our active upstairs values, because we're going to call a
+        // function on &mut self below.
+        let vs = self.active_upstairs.values().cloned().collect::<Vec<_>>();
+        for i in vs {
+            self.do_io_work_for(i).await;
+        }
+    }
+
+    /// Perform all pending IO work for a single Upstairs connection
+    async fn do_io_work_for(&mut self, target: ConnectionId) -> Result<()> {
+        let up = &mut self.connections.get_mut(&target).unwrap();
+        let upstairs_connection = up.upstairs_connection();
+        let work = up.work_mut();
+
+        /*
+         * Build ourselves a list of all the jobs on the work hashmap that
+         * are New or DepWait.
+         */
+        // TODO remove upstairs_connection argument here
+        // TODO make new_work not iterate over everything (???)
+        let mut new_work: VecDeque<JobId> =
+            work.new_work(upstairs_connection).into_iter().collect();
+
+        /*
+         * We don't have to do jobs in order, but the dependencies are, at
+         * least for now, always going to be in order of job id. `new_work` is
+         * sorted before it is returned so this function iterates through jobs
+         * in order.
+         */
+        while let Some(new_id) = new_work.pop_front() {
+            if self.lossy && random() && random() {
+                // Skip a job that needs to be done. Sometimes
+                info!(self.log, "[lossy] skipping {}", new_id);
+                new_work.push_back(new_id);
+                continue;
+            }
+
+            let up = &mut self.connections.get_mut(&target).unwrap();
+            let UpstairsState::Running { work, .. } = &mut up.state else {
+                panic!("can't do work for upstairs that is not running");
+            };
+
+            /*
+             * If this job is still new, take it and go to work. The
+             * in_progress method will only return a job if all
+             * dependencies are met.
+             */
+            let r = work.in_progress(
+                new_id,
+                self.log.new(o!("role" => "work".to_string())),
+            );
+
+            if let Some((job_id, upstairs_connection)) = r {
+                cdt::work__process!(|| job_id.0);
+
+                // TODO can get_ready_job ever fail now?
+                let ds_work = work.get_ready_job(job_id).unwrap();
+                assert_eq!(job_id, ds_work.ds_id);
+                let m = self.do_work(ds_work).await;
+
+                // If this is a repair job, and that repair failed, we
+                // can do no more work on this downstairs and should
+                // force everything to come down before more work arrives.
+                //
+                // However, we can respond to the upstairs with the failed
+                // result, and let the upstairs take action that will
+                // allow it to abort the repair and continue working in
+                // some degraded state.
+                let abort_needed = check_message_for_abort(&m);
+
+                if let Some(error) = m.err() {
+                    // Reborrow `up`
+                    let up = &mut self.connections.get_mut(&target).unwrap();
+                    up.message_tx
+                        .send(Message::ErrorReport {
+                            upstairs_id: upstairs_connection.upstairs_id,
+                            session_id: upstairs_connection.session_id,
+                            job_id: new_id,
+                            error: error.clone(),
+                        })
+                        .await?;
+
+                    // If the job errored, do not consider it completed.
+                    // Retry it.
+                    new_work.push_back(new_id);
+                } else {
+                    // Update our stats
+                    self.complete_work_stat(upstairs_connection, &m, job_id);
+
+                    // Notify the upstairs before completing work
+                    let is_flush = matches!(m, Message::FlushAck { .. });
+
+                    let up = &mut self.connections.get_mut(&target).unwrap();
+                    up.message_tx.send(m).await?;
+
+                    let work = up.work_mut();
+                    work.active.remove(&job_id).unwrap();
+                    if is_flush {
+                        work.last_flush = job_id;
+                        work.completed.clear();
+                    } else {
+                        work.completed.push(job_id);
+                    }
+
+                    cdt::work__done!(|| job_id.0);
+                }
+
+                // Now, if the message requires an abort, we handle
+                // that now by exiting this task with error.
+                if abort_needed {
+                    // TODO how to handle this?
+                    bail!("Repair has failed, exiting task");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn do_work(&mut self, job: DownstairsWork) -> Message {
+        let job_id = job.ds_id;
+        match &job.work {
+            IOop::Read {
+                dependencies,
+                requests,
+            } => {
+                /*
+                 * Any error from an IO should be intercepted here and passed
+                 * back to the upstairs.
+                 */
+                let responses = if self.read_errors && random() && random() {
+                    warn!(self.log, "returning error on read!");
+                    Err(CrucibleError::GenericError("test error".to_string()))
+                } else {
+                    self.region.region_read(requests, job_id).await
+                };
+                debug!(
+                    self.log,
+                    "Read      :{} deps:{:?} res:{}",
+                    job_id,
+                    dependencies,
+                    responses.is_ok(),
+                );
+
+                Message::ReadResponse {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    responses,
+                }
+            }
+            IOop::WriteUnwritten { writes, .. } => {
+                /*
+                 * Any error from an IO should be intercepted here and passed
+                 * back to the upstairs.
+                 */
+                let result = if self.write_errors && random() && random() {
+                    warn!(self.log, "returning error on writeunwritten!");
+                    Err(CrucibleError::GenericError("test error".to_string()))
+                } else {
+                    // The region_write will handle what happens to each block
+                    // based on if they have data or not.
+                    self.region.region_write(writes, job_id, true).await
+                };
+
+                Message::WriteUnwrittenAck {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    result,
+                }
+            }
+            IOop::Write {
+                dependencies,
+                writes,
+            } => {
+                let result = if self.write_errors && random() && random() {
+                    warn!(self.log, "returning error on write!");
+                    Err(CrucibleError::GenericError("test error".to_string()))
+                } else {
+                    self.region.region_write(writes, job_id, false).await
+                };
+                debug!(
+                    self.log,
+                    "Write     :{} deps:{:?} res:{}",
+                    job_id,
+                    dependencies,
+                    result.is_ok(),
+                );
+
+                Message::WriteAck {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    result,
+                }
+            }
+            IOop::Flush {
+                dependencies,
+                flush_number,
+                gen_number,
+                snapshot_details,
+                extent_limit,
+            } => {
+                let result = if self.flush_errors && random() && random() {
+                    warn!(self.log, "returning error on flush!");
+                    Err(CrucibleError::GenericError("test error".to_string()))
+                } else {
+                    self.region
+                        .region_flush(
+                            *flush_number,
+                            *gen_number,
+                            snapshot_details,
+                            job_id,
+                            *extent_limit,
+                        )
+                        .await
+                };
+                debug!(
+                    self.log,
+                    "Flush     :{} extent_limit {:?} deps:{:?} res:{} f:{} g:{}",
+                    job_id, extent_limit, dependencies, result.is_ok(),
+                    flush_number, gen_number,
+                );
+
+                Message::FlushAck {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    result,
+                }
+            }
+            IOop::ExtentClose {
+                dependencies,
+                extent,
+            } => {
+                let result = self.region.close_extent(*extent).await;
+                debug!(
+                    self.log,
+                    "JustClose :{} extent {} deps:{:?} res:{}",
+                    job_id,
+                    extent,
+                    dependencies,
+                    result.is_ok(),
+                );
+
+                Message::ExtentLiveCloseAck {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id: job.ds_id,
+                    result,
+                }
+            }
+            IOop::ExtentFlushClose {
+                dependencies,
+                extent,
+                flush_number,
+                gen_number,
+                source_downstairs: _,
+                repair_downstairs: _,
+            } => {
+                // If flush fails, return that result.
+                // Else, if close fails, return that result.
+                // Else, return the f/g/d from the close.
+                let result = match self
+                    .region
+                    .region_flush_extent(
+                        *extent,
+                        *gen_number,
+                        *flush_number,
+                        job_id,
+                    )
+                    .await
+                {
+                    Err(f_res) => Err(f_res),
+                    Ok(_) => self.region.close_extent(*extent).await,
+                };
+
+                debug!(
+                    self.log,
+                    "FlushClose:{} extent {} deps:{:?} res:{} f:{} g:{}",
+                    job_id,
+                    extent,
+                    dependencies,
+                    result.is_ok(),
+                    flush_number,
+                    gen_number,
+                );
+
+                Message::ExtentLiveCloseAck {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id: job.ds_id,
+                    result,
+                }
+            }
+            IOop::ExtentLiveRepair {
+                dependencies,
+                extent,
+                source_downstairs: _,
+                source_repair_address,
+                repair_downstairs: _,
+            } => {
+                debug!(
+                    self.log,
+                    "ExtentLiveRepair: extent {} sra:{:?}",
+                    extent,
+                    source_repair_address
+                );
+                let result = self
+                    .region
+                    .repair_extent(*extent, *source_repair_address)
+                    .await;
+                debug!(
+                    self.log,
+                    "LiveRepair:{} extent {} deps:{:?} res:{}",
+                    job_id,
+                    extent,
+                    dependencies,
+                    result.is_ok(),
+                );
+
+                Message::ExtentLiveRepairAckId {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    result,
+                }
+            }
+            IOop::ExtentLiveReopen {
+                dependencies,
+                extent,
+            } => {
+                let result = self.region.reopen_extent(*extent).await;
+                debug!(
+                    self.log,
+                    "LiveReopen:{} extent {} deps:{:?} res:{}",
+                    job_id,
+                    extent,
+                    dependencies,
+                    result.is_ok(),
+                );
+                Message::ExtentLiveAckId {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    result,
+                }
+            }
+            IOop::ExtentLiveNoOp { dependencies } => {
+                debug!(self.log, "Work of: LiveNoOp {}", job_id);
+                let result = Ok(());
+                debug!(
+                    self.log,
+                    "LiveNoOp  :{} deps:{:?} res:{}",
+                    job_id,
+                    dependencies,
+                    result.is_ok(),
+                );
+                Message::ExtentLiveAckId {
+                    upstairs_id: job.upstairs_connection.upstairs_id,
+                    session_id: job.upstairs_connection.session_id,
+                    job_id,
+                    result,
+                }
+            }
+        }
+    }
+
+    /*
+     * After we complete a read/write/flush on a region, update the
+     * Oximeter counter for the operation.
+     */
+    fn complete_work_stat(
+        &mut self,
+        _upstairs_connection: UpstairsConnection,
+        m: &Message,
+        ds_id: JobId,
+    ) {
+        // XXX dss per upstairs connection?
+        match m {
+            Message::FlushAck { .. } => {
+                cdt::submit__flush__done!(|| ds_id.0);
+                self.dss.add_flush();
+            }
+            Message::WriteAck { .. } => {
+                cdt::submit__write__done!(|| ds_id.0);
+                self.dss.add_write();
+            }
+            Message::WriteUnwrittenAck { .. } => {
+                cdt::submit__writeunwritten__done!(|| ds_id.0);
+                self.dss.add_write();
+            }
+            Message::ReadResponse { .. } => {
+                cdt::submit__read__done!(|| ds_id.0);
+                self.dss.add_read();
+            }
+            Message::ExtentLiveClose { .. } => {
+                cdt::submit__el__close__done!(|| ds_id.0);
+            }
+            Message::ExtentLiveFlushClose { .. } => {
+                cdt::submit__el__flush__close__done!(|| ds_id.0);
+            }
+            Message::ExtentLiveRepair { .. } => {
+                cdt::submit__el__repair__done!(|| ds_id.0);
+            }
+            Message::ExtentLiveReopen { .. } => {
+                cdt::submit__el__reopen__done!(|| ds_id.0);
+            }
+            Message::ExtentLiveNoOp { .. } => {
+                cdt::submit__el__noop__done!(|| ds_id.0);
+            }
+            _ => (),
+        }
+    }
+}
+
 /*
  * This function handles the initial negotiation steps between the
  * upstairs and the downstairs.  Either we return error, or we call
@@ -1184,14 +2713,6 @@ where
     // appropriate point in negotiation.
     let mut another_upstairs_active_tx = Some(another_upstairs_active_tx);
 
-    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-    enum NegotiationState {
-        Start,
-        ConnectedToUpstairs,
-        PromotedToActive,
-        SentRegionInfo,
-        Ready,
-    }
     let mut negotiated = NegotiationState::Start;
     let log = ads.lock().await.log.new(o!("task" => "proc".to_string()));
     /*
@@ -1430,7 +2951,7 @@ where
                         upstairs_id,
                         session_id,
                         gen,
-                    }) => {
+                    } )=> {
                         if negotiated != NegotiationState::ConnectedToUpstairs {
                             bail!("Received activate out of order {:?}",
                                 negotiated);
@@ -2697,7 +4218,7 @@ pub struct Work {
 
 #[derive(Debug, Clone)]
 struct DownstairsWork {
-    upstairs_connection: UpstairsConnection,
+    upstairs_connection: UpstairsConnection, // TODO(matt) this is expensive
     ds_id: JobId,
     work: IOop,
     state: WorkState,
