@@ -1,6 +1,8 @@
 // Copyright 2022 Oxide Computer Company
 use super::*;
 
+use std::collections::HashSet;
+
 use dropshot::{
     endpoint, ApiDescription, ConfigDropshot, HttpError, HttpResponseCreated,
     HttpServerStarter, Path, RequestContext, TypedBody,
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct ServerContext {
     // Region UUID -> a running Downstairs
-    downstairs: Mutex<HashMap<Uuid, Arc<Mutex<Downstairs>>>>,
+    downstairs: Mutex<HashSet<Uuid>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -55,14 +57,14 @@ pub async fn run_downstairs_for_region(
 
     let mut downstairs = apictx.downstairs.lock().await;
 
-    if downstairs.contains_key(&uuid) {
+    if downstairs.contains(&uuid) {
         return Err(HttpError::for_bad_request(
             Some(String::from("BadInput")),
             format!("downstairs {} running already", uuid),
         ));
     }
 
-    let d = build_downstairs_for_region(
+    let (d, chan) = build_downstairs_for_region(
         &run_params.data,
         run_params.lossy,
         run_params.read_errors,
@@ -75,7 +77,8 @@ pub async fn run_downstairs_for_region(
     .map_err(|e| HttpError::for_internal_error(e.to_string()))?;
 
     let _join_handle = start_downstairs(
-        d.clone(),
+        d,
+        chan,
         run_params.address,
         run_params.oximeter,
         run_params.port,
@@ -89,7 +92,7 @@ pub async fn run_downstairs_for_region(
 
     // past here, the downstairs has started successfully
 
-    downstairs.insert(uuid, d);
+    downstairs.insert(uuid);
 
     Ok(HttpResponseCreated(DownstairsRunningResponse { uuid }))
 }
@@ -118,7 +121,7 @@ pub async fn run_dropshot(
     }
 
     let ctx = Arc::new(ServerContext {
-        downstairs: Mutex::new(HashMap::default()),
+        downstairs: Mutex::new(HashSet::default()),
     });
 
     let http_server =
