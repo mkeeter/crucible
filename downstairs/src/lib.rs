@@ -2638,6 +2638,8 @@ impl Work {
                     job.state = WorkState::DepWait;
                 }
 
+                // Return the job to the map
+                self.active.insert(ds_id, job);
                 return None;
             }
 
@@ -2654,9 +2656,8 @@ impl Work {
             // taken it out again and will return it again for a second try.
             Some(job)
         } else {
-            /*
-             * job id is not new, we can't run it.
-             */
+            // job id is not new, we can't run it; return the job to the map
+            self.active.insert(ds_id, job);
             None
         }
     }
