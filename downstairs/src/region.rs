@@ -871,8 +871,8 @@ impl Region {
         //   multiple at the same time.
         let mut results = vec![Ok(()); dirty_extents.len()];
         if matches!(
-            tokio::runtime::Handle::current().runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
+            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
         ) {
             let mut slice_start = 0;
             let mut slice = self.extents.as_mut_slice();
