@@ -62,8 +62,7 @@ mod test {
                 encrypted,
                 backend,
                 csl(),
-            )
-            .await?;
+            )?;
 
             let (ds, io) = build_downstairs_for_region_with_backend(
                 tempdir.path(),
@@ -74,8 +73,7 @@ mod test {
                 read_only,
                 backend,
                 Some(csl()),
-            )
-            .await?;
+            )?;
 
             let (ds_addr, downstairs) = start_downstairs(
                 ds, io, address, None, /* oximeter */
@@ -104,8 +102,7 @@ mod test {
                 false, /* flush errors */
                 true,
                 Some(csl()),
-            )
-            .await?;
+            )?;
 
             let (addr, join_handle) = start_downstairs(
                 ds,
@@ -136,8 +133,7 @@ mod test {
                 false, /* flush errors */
                 false,
                 Some(csl()),
-            )
-            .await?;
+            )?;
 
             let (addr, join_handle) = start_downstairs(
                 ds,
