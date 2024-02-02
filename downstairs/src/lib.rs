@@ -1084,6 +1084,12 @@ impl Downstairs {
             );
             return Ok(()); // the connection isn't present, so we can't drop it
         };
+
+        // Don't wait more than 50 seconds to hear from the other side.
+        // XXX Timeouts, timeouts: always wrong!  Some too short and
+        // some too long.
+        up.timeout_deadline = deadline_secs(50);
+
         match &mut up.state {
             UpstairsState::Negotiating { .. } => {
                 let r = self.continue_negotiation(m, target).await;
