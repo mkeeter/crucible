@@ -5,6 +5,7 @@
 use futures::lock::Mutex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs::File;
@@ -2115,7 +2116,7 @@ impl Downstairs {
                         work.last_flush = job_id;
                         work.completed.clear();
                     } else {
-                        work.completed.push(job_id);
+                        work.completed.insert(job_id);
                     }
 
                     cdt::work__done!(|| job_id.0);
@@ -2467,9 +2468,9 @@ impl Downstairs {
         // Complete the job
         if matches!(m, Message::FlushAck { .. }) {
             work.last_flush = ds_id;
-            work.completed = Vec::with_capacity(32);
+            work.completed.clear();
         } else {
-            work.completed.push(ds_id);
+            work.completed.insert(ds_id);
         }
     }
 
@@ -2485,7 +2486,7 @@ impl Downstairs {
     fn get_job(&self, id: ConnectionId, ds_id: JobId) -> &DownstairsWork {
         let up = self.connections.get(&id).unwrap();
         let work = up.work().unwrap();
-        work.get_job(ds_id)
+        work.active.get(&ds_id).unwrap()
     }
 }
 
@@ -2511,7 +2512,7 @@ pub struct Work {
      * typically) for the most recent flush.
      */
     last_flush: JobId,
-    completed: Vec<JobId>,
+    completed: HashSet<JobId>,
 }
 
 #[derive(Debug)]
@@ -2527,7 +2528,7 @@ impl Work {
             active: HashMap::new(),
             outstanding_deps: HashMap::new(),
             last_flush: JobId(0), // TODO(matt) make this an Option?
-            completed: Vec::with_capacity(32),
+            completed: HashSet::new(),
         }
     }
 
@@ -2550,11 +2551,6 @@ impl Work {
 
     fn add_work(&mut self, ds_id: JobId, dsw: DownstairsWork) {
         self.active.insert(ds_id, dsw);
-    }
-
-    #[cfg(test)]
-    fn get_job(&self, ds_id: JobId) -> &DownstairsWork {
-        self.active.get(&ds_id).unwrap()
     }
 
     /**
@@ -2672,6 +2668,16 @@ impl Work {
             self.active.insert(ds_id, job);
             None
         }
+    }
+}
+
+#[cfg(test)]
+impl Work {
+    /// Returns completed work as a sorted `Vec`
+    fn completed(&self) -> Vec<JobId> {
+        let mut out: Vec<_> = self.completed.iter().cloned().collect();
+        out.sort_unstable();
+        out
     }
 }
 
@@ -3106,7 +3112,7 @@ mod test {
             work.last_flush = ds_id;
             work.completed.clear();
         } else {
-            work.completed.push(ds_id);
+            work.completed.insert(ds_id);
         }
     }
 
@@ -3169,7 +3175,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
 
         assert!(test_push_next_jobs(&mut work).is_empty());
     }
@@ -3998,7 +4004,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
 
         assert!(test_push_next_jobs(&mut work,).is_empty());
     }
@@ -4025,7 +4031,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![ds_id]);
+        assert_eq!(work.completed(), [ds_id]);
 
         assert!(test_push_next_jobs(&mut work,).is_empty());
     }
@@ -4121,7 +4127,7 @@ mod test {
         // do work
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000), JobId(1001)]);
+        assert_eq!(work.completed(), [JobId(1000), JobId(1001)]);
 
         assert!(test_push_next_jobs(&mut work,).is_empty());
     }
@@ -4149,7 +4155,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
 
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
@@ -4190,7 +4196,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
             next_jobs.iter().map(|w| w.ds_id).collect::<Vec<_>>(),
@@ -4200,7 +4206,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000), JobId(1001)]);
+        assert_eq!(work.completed(), [JobId(1000), JobId(1001)]);
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
             next_jobs.iter().map(|w| w.ds_id).collect::<Vec<_>>(),
@@ -4210,7 +4216,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000), JobId(1001), JobId(1002)]);
+        assert_eq!(work.completed(), [JobId(1000), JobId(1001), JobId(1002)]);
     }
 
     #[test]
@@ -4257,7 +4263,7 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1000));
-        assert_eq!(work.completed, vec![JobId(1001)]);
+        assert_eq!(work.completed(), [JobId(1001)]);
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
             next_jobs.iter().map(|w| w.ds_id).collect::<Vec<_>>(),
@@ -4268,7 +4274,7 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1000));
-        assert_eq!(work.completed, vec![JobId(1001), JobId(1002)]);
+        assert_eq!(work.completed(), [JobId(1001), JobId(1002)]);
     }
 
     #[test]
@@ -4303,7 +4309,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
             next_jobs.iter().map(|w| w.ds_id).collect::<Vec<_>>(),
@@ -4325,7 +4331,7 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1001));
-        assert_eq!(work.completed, vec![JobId(1002)]);
+        assert_eq!(work.completed(), [JobId(1002)]);
     }
 
     #[test]
@@ -4392,7 +4398,7 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1002));
-        assert_eq!(work.completed, vec![JobId(1003), JobId(1004)]);
+        assert_eq!(work.completed(), [JobId(1003), JobId(1004)]);
     }
 
     #[test]
@@ -4464,7 +4470,7 @@ mod test {
             vec![JobId(1000), JobId(2000)]
         );
         test_do_work(&mut work, next_jobs);
-        assert_eq!(work.completed, vec![JobId(1000), JobId(2000)]);
+        assert_eq!(work.completed(), [JobId(1000), JobId(2000)]);
 
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
@@ -4473,8 +4479,8 @@ mod test {
         );
         test_do_work(&mut work, next_jobs);
         assert_eq!(
-            work.completed,
-            vec![JobId(1000), JobId(2000), JobId(1001), JobId(2001)]
+            work.completed(),
+            [JobId(1000), JobId(1001), JobId(2000), JobId(2001)]
         );
 
         let next_jobs = test_push_next_jobs(&mut work);
@@ -4520,7 +4526,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
 
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
@@ -4544,8 +4550,8 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(
-            work.completed,
-            vec![JobId(1000), JobId(1001), JobId(1002), JobId(1003)]
+            work.completed(),
+            [JobId(1000), JobId(1001), JobId(1002), JobId(1003)]
         );
     }
 
@@ -4581,7 +4587,7 @@ mod test {
             false,
         );
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
 
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
@@ -4605,8 +4611,8 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(
-            work.completed,
-            vec![JobId(1000), JobId(1001), JobId(1002), JobId(1003)]
+            work.completed(),
+            [JobId(1000), JobId(1001), JobId(1002), JobId(1003)]
         );
     }
 
@@ -4635,7 +4641,7 @@ mod test {
 
         test_do_work(&mut work, next_jobs);
 
-        assert_eq!(work.completed, vec![JobId(1000)]);
+        assert_eq!(work.completed(), [JobId(1000)]);
 
         let next_jobs = test_push_next_jobs(&mut work);
         assert_eq!(
@@ -4671,8 +4677,8 @@ mod test {
         test_do_work(&mut work, next_jobs);
 
         assert_eq!(
-            work.completed,
-            vec![JobId(1000), JobId(1001), JobId(1002), JobId(1003)]
+            work.completed(),
+            [JobId(1000), JobId(1001), JobId(1002), JobId(1003)]
         );
     }
 
