@@ -858,16 +858,52 @@ impl Region {
             }
         };
 
-        let extent_count = dirty_extents.len();
-
-        // Wait for all flushes to finish - wait until after
-        // cdt::os__flush__done to check the results and bail out.
-        let mut results = Vec::with_capacity(extent_count);
-        for eid in &dirty_extents {
-            // TODO parallelism?
+        // This is a bit sneaky: we want to perform each flush in a separate
+        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
+        // multiple times.  In addition, we can't use the tokio thread pool to
+        // spawn a task, because that requires a 'static lifetime, which we
+        // can't get from a borrowed Extent.
+        //
+        // We'll combine two tricks to work around the issue:
+        // - Do the work in the rayon thread pool instead of using tokio tasks
+        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
+        //   multiple at the same time.
+        let mut results = vec![Ok(()); dirty_extents.len()];
+        if matches!(
+            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            let mut slice_start = 0;
+            let mut slice = self.extents.as_mut_slice();
+            tokio::task::block_in_place(|| {
+                rayon::scope(|s| {
+                    for (eid, r) in dirty_extents.iter().zip(results.iter_mut())
+                    {
+                        let next = eid - slice_start;
+                        slice = &mut slice[next..];
+                        let (extent, rest) = slice.split_first_mut().unwrap();
+                        let ExtentState::Opened(extent) = extent else {
+                            panic!("can't flush closed extent");
+                        };
+                        slice = rest;
+                        slice_start += next + 1;
+                        s.spawn(|_| {
+                            *r = extent.flush(
+                                flush_number,
+                                gen_number,
+                                job_id,
+                                &self.log,
+                            )
+                        });
+                    }
+                })
+            });
+        } else {
             let log = self.log.clone();
-            let extent = self.get_opened_extent_mut(*eid);
-            results.push(extent.flush(flush_number, gen_number, job_id, &log));
+            for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
+                let extent = self.get_opened_extent_mut(*eid);
+                *r = extent.flush(flush_number, gen_number, job_id, &log);
+            }
         }
 
         cdt::os__flush__done!(|| job_id.0);
@@ -1935,7 +1971,7 @@ pub(crate) mod test {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&extent_file)?;
+            .open(extent_file)?;
         extent_inner_raw::RawInner::import(
             &mut file,
             &ddef,
