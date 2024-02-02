@@ -869,30 +869,43 @@ impl Region {
         // - Do the work in the rayon thread pool instead of using tokio tasks
         // - Carefully walk self.extents.as_mut_slice() to mutably borrow
         //   multiple at the same time.
-
-        let mut slice_start = 0;
-        let mut slice = self.extents.as_mut_slice();
         let mut results = vec![Ok(()); dirty_extents.len()];
-        rayon::scope(|s| {
+        if matches!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            let mut slice_start = 0;
+            let mut slice = self.extents.as_mut_slice();
+            tokio::task::block_in_place(|| {
+                rayon::scope(|s| {
+                    for (eid, r) in dirty_extents.iter().zip(results.iter_mut())
+                    {
+                        let next = eid - slice_start;
+                        slice = &mut slice[next..];
+                        let (extent, rest) = slice.split_first_mut().unwrap();
+                        let ExtentState::Opened(extent) = extent else {
+                            panic!("can't flush closed extent");
+                        };
+                        slice = rest;
+                        slice_start += next + 1;
+                        s.spawn(|_| {
+                            *r = extent.flush(
+                                flush_number,
+                                gen_number,
+                                job_id,
+                                &self.log,
+                            )
+                        });
+                    }
+                })
+            });
+        } else {
+            let log = self.log.clone();
             for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
-                let next = eid - slice_start;
-                slice = &mut slice[next..];
-                let (extent, rest) = slice.split_first_mut().unwrap();
-                let ExtentState::Opened(extent) = extent else {
-                    panic!("can't flush closed extent");
-                };
-                slice = rest;
-                slice_start += next + 1;
-                s.spawn(|_| {
-                    *r = extent.flush(
-                        flush_number,
-                        gen_number,
-                        job_id,
-                        &self.log,
-                    )
-                });
+                let extent = self.get_opened_extent_mut(*eid);
+                *r = extent.flush(flush_number, gen_number, job_id, &log);
             }
-        });
+        }
 
         cdt::os__flush__done!(|| job_id.0);
 
