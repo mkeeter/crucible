@@ -51,6 +51,25 @@ fn deadline_secs(secs: u64) -> Instant {
         .unwrap()
 }
 
+/// Run a blocking function
+///
+/// If possible, this will use `tokio::task::block_in_place` to avoid blocking
+/// the executor, but will fall back to executing the function directly if we
+/// are using the current-thread executor.
+pub(crate) fn run_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if matches!(
+        tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, PartialEq)]
 enum IOop {
