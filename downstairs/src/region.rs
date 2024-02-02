@@ -1,6 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::fs::{rename, File, OpenOptions};
@@ -843,7 +843,7 @@ impl Region {
 
         // Select extents we're going to flush, while respecting the
         // extent_limit if one was provided.
-        let dirty_extents: Vec<usize> = match extent_limit {
+        let dirty_extents: BTreeSet<usize> = match extent_limit {
             None => self.dirty_extents.iter().copied().collect(),
             Some(el) => {
                 if el > self.def.extent_count().try_into().unwrap() {
