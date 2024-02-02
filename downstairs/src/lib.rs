@@ -350,7 +350,9 @@ pub fn show_work(ds: &mut Downstairs) {
     );
 
     for upstairs_connection in ds.active_upstairs.values() {
-        let work = ds.connections[upstairs_connection].work();
+        let Some(work) = ds.connections[upstairs_connection].work() else {
+            continue;
+        };
 
         let mut kvec: Vec<JobId> = work.active.keys().cloned().collect();
 
@@ -726,25 +728,24 @@ impl Upstairs {
     }
 
     /// Returns a mutable reference to the work map for a running Upstairs
-    ///
-    /// # Panics
-    /// If the upstairs is still negotiating
-    fn work_mut(&mut self) -> &mut Work {
-        let UpstairsState::Running { work, .. } = &mut self.state else {
-            panic!("can't do work for Upstairs that is not running");
-        };
-        work
+    fn work_mut(&mut self) -> Option<&mut Work> {
+        if let UpstairsState::Running { work, .. } = &mut self.state {
+            Some(work)
+        } else {
+            None
+        }
     }
 
     /// Returns an immutable reference to the work map for a running Upstairs
     ///
     /// # Panics
     /// If the upstairs is still negotiating
-    fn work(&self) -> &Work {
-        let UpstairsState::Running { work, .. } = &self.state else {
-            panic!("can't get work for Upstairs that is not running");
-        };
-        work
+    fn work(&self) -> Option<&Work> {
+        if let UpstairsState::Running { work, .. } = &self.state {
+            Some(work)
+        } else {
+            None
+        }
     }
 
     /// Checks whether the given message IDs are valid
@@ -1780,7 +1781,7 @@ impl Downstairs {
             work,
             state: WorkState::New,
         };
-        up.work_mut().add_work(ds_id, dsw);
+        up.work_mut().unwrap().add_work(ds_id, dsw);
 
         Ok(())
     }
@@ -1974,14 +1975,16 @@ impl Downstairs {
         //
         // TODO: Really work through this error case
         let work = prev_upstairs.work();
-        if work.active.keys().len() > 0 {
-            warn!(
-                self.log,
-                "Crucible Downstairs promoting {:?} to active, \
-                            discarding {} jobs",
-                new_connection,
-                work.active.keys().len()
-            );
+        if let Some(work) = work {
+            if work.active.keys().len() > 0 {
+                warn!(
+                    self.log,
+                    "Crucible Downstairs promoting {:?} to active, \
+                     discarding {} jobs",
+                    new_connection,
+                    work.active.keys().len()
+                );
+            }
         }
 
         // In the future, we may decide there is some way to
@@ -2017,7 +2020,9 @@ impl Downstairs {
     async fn do_io_work_for(&mut self, target: ConnectionId) -> Result<()> {
         let up = &mut self.connections.get_mut(&target).unwrap();
         let upstairs_connection = up.upstairs_connection();
-        let work = up.work_mut();
+        let Some(work) = up.work_mut() else {
+            return Ok(());
+        };
 
         /*
          * Build ourselves a list of all the jobs on the work hashmap that
@@ -2039,8 +2044,9 @@ impl Downstairs {
                 continue;
             }
 
+            // Reborrow `up` and `work`
             let up = &mut self.connections.get_mut(&target).unwrap();
-            let work = up.work_mut();
+            let work = up.work_mut().unwrap();
 
             /*
              * If this job is still new, take it and go to work. The
@@ -2084,7 +2090,7 @@ impl Downstairs {
 
                     // If the job errored, do not consider it completed.
                     // Retry it, putting it back in the map.
-                    let work = up.work_mut(); // reborrow
+                    let work = up.work_mut().unwrap(); // reborrow
                     new_work.push_back(new_id);
                     work.active.insert(job_id, ds_work);
                 } else {
@@ -2098,7 +2104,7 @@ impl Downstairs {
                     let up = &mut self.connections.get_mut(&target).unwrap();
                     up.message_tx.send(m).await?;
 
-                    let work = up.work_mut();
+                    let work = up.work_mut().unwrap();
                     if is_flush {
                         work.last_flush = job_id;
                         work.completed.clear();
@@ -2427,7 +2433,7 @@ impl Downstairs {
     /// This imitates the beginning of `do_io_work_for`
     fn new_work(&mut self, id: ConnectionId) -> VecDeque<JobId> {
         let up = &mut self.connections.get_mut(&id).unwrap();
-        let work = up.work_mut();
+        let work = up.work_mut().unwrap();
         work.new_work()
     }
 
@@ -2441,7 +2447,7 @@ impl Downstairs {
         ds_id: JobId,
     ) -> Option<DownstairsWork> {
         let up = &mut self.connections.get_mut(&id).unwrap();
-        let work = up.work_mut();
+        let work = up.work_mut().unwrap();
         work.in_progress(ds_id, self.log.clone())
     }
 
@@ -2450,7 +2456,7 @@ impl Downstairs {
     /// This imitates the end of `do_io_work_for`
     fn complete_work(&mut self, id: ConnectionId, ds_id: JobId, m: Message) {
         let up = &mut self.connections.get_mut(&id).unwrap();
-        let work = up.work_mut();
+        let work = up.work_mut().unwrap();
 
         // Complete the job
         if matches!(m, Message::FlushAck { .. }) {
@@ -2472,7 +2478,7 @@ impl Downstairs {
 
     fn get_job(&self, id: ConnectionId, ds_id: JobId) -> &DownstairsWork {
         let up = self.connections.get(&id).unwrap();
-        let work = up.work();
+        let work = up.work().unwrap();
         work.get_job(ds_id)
     }
 }
@@ -5055,6 +5061,16 @@ mod test {
         id
     }
 
+    /// Switch the given connection's state to Running
+    fn make_running(ds: &mut Downstairs, id: ConnectionId) {
+        let up = ds.connections.get_mut(&id).unwrap();
+        let upstairs_connection = up.upstairs_connection();
+        up.state = UpstairsState::Running {
+            work: Work::new(),
+            upstairs_connection,
+        };
+    }
+
     #[tokio::test]
     async fn test_promote_to_active_one_read_write() -> Result<()> {
         let (mut ds, _chan) = build_test_downstairs(false).await?;
@@ -5353,9 +5369,11 @@ mod test {
 
         ds.promote_to_active(id_1).await?;
         assert_eq!(ds.active_upstairs.len(), 1);
+        make_running(&mut ds, id_1);
 
         ds.promote_to_active(id_2).await?;
         assert_eq!(ds.active_upstairs.len(), 2);
+        make_running(&mut ds, id_2);
 
         let read_1 = IOop::Read {
             dependencies: Vec::new(),
