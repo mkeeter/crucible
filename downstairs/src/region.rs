@@ -1,6 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::fs::{rename, File, OpenOptions};
@@ -844,7 +844,7 @@ impl Region {
 
         // Select extents we're going to flush, while respecting the
         // extent_limit if one was provided.
-        let dirty_extents: Vec<usize> = match extent_limit {
+        let dirty_extents: BTreeSet<usize> = match extent_limit {
             None => self.dirty_extents.iter().copied().collect(),
             Some(el) => {
                 if el > self.def.extent_count().try_into().unwrap() {
@@ -859,13 +859,40 @@ impl Region {
             }
         };
 
-        // TODO: parallelism?
-        let mut results = vec![];
-        for eid in &dirty_extents {
-            let log = self.log.clone();
-            let extent = self.get_opened_extent_mut(*eid);
-            results.push(extent.flush(flush_number, gen_number, job_id, &log));
-        }
+        // This is a bit sneaky: we want to perform each flush in a separate
+        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
+        // multiple times.  In addition, we can't use the tokio thread pool to
+        // spawn a task, because that requires a 'static lifetime, which we
+        // can't get from a borrowed Extent.
+        //
+        // We'll combine two tricks to work around the issue:
+        // - Do the work in the rayon thread pool instead of using tokio tasks
+        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
+        //   multiple at the same time.
+
+        let mut slice_start = 0;
+        let mut slice = self.extents.as_mut_slice();
+        let mut results = vec![Ok(()); dirty_extents.len()];
+        rayon::scope(|s| {
+            for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
+                let next = eid - slice_start;
+                slice = &mut slice[next..];
+                let (extent, rest) = slice.split_first_mut().unwrap();
+                let ExtentState::Opened(extent) = extent else {
+                    panic!("can't flush closed extent");
+                };
+                slice = rest;
+                slice_start += next + 1;
+                s.spawn(|_| {
+                    *r = extent.flush(
+                        flush_number,
+                        gen_number,
+                        job_id,
+                        &self.log,
+                    )
+                });
+            }
+        });
 
         cdt::os__flush__done!(|| job_id.0);
 
@@ -1932,7 +1959,7 @@ pub(crate) mod test {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&extent_file)?;
+            .open(extent_file)?;
         extent_inner_raw::RawInner::import(
             &mut file,
             &ddef,
