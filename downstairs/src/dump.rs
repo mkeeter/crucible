@@ -18,7 +18,7 @@ struct ExtInfo {
  *
  * If you don't want color, then set nc to true.
  */
-pub async fn dump_region(
+pub fn dump_region(
     region_dir: Vec<PathBuf>,
     mut cmp_extent: Option<u32>,
     block: Option<u64>,
@@ -45,8 +45,7 @@ pub async fn dump_region(
     assert!(!region_dir.is_empty());
     for (index, dir) in region_dir.iter().enumerate() {
         // Open Region read only
-        let region =
-            Region::open(dir, Default::default(), false, true, &log).await?;
+        let region = Region::open(dir, Default::default(), false, true, &log)?;
 
         blocks_per_extent = region.def().extent_size().value;
         total_extents = region.def().extent_count();
@@ -59,8 +58,7 @@ pub async fn dump_region(
          * directory index and the value is the ExtentMeta for that region.
          */
         for e in &region.extents {
-            let e = e.lock().await;
-            let e = match &*e {
+            let e = match e {
                 extent::ExtentState::Opened(extent) => extent,
                 extent::ExtentState::Closed => panic!("dump on closed extent!"),
             };
@@ -96,7 +94,7 @@ pub async fn dump_region(
                 }
             }
 
-            let extent_info = e.get_meta_info().await;
+            let extent_info = e.get_meta_info();
 
             /*
              * If we have an entry already, then add this at our directory
@@ -141,8 +139,7 @@ pub async fn dump_region(
                 only_show_differences,
                 nc,
                 log,
-            )
-            .await;
+            );
         }
 
         show_extent(
@@ -153,8 +150,7 @@ pub async fn dump_region(
             only_show_differences,
             nc,
             log,
-        )
-        .await?;
+        )?;
 
         return Ok(());
     };
@@ -438,7 +434,7 @@ fn return_status_letters<'a, T, U: std::cmp::PartialEq>(
  * Show the metadata and a block by block diff of a single extent
  * We need at least two directories to compare, and no more than three.
  */
-async fn show_extent(
+fn show_extent(
     region_dir: Vec<PathBuf>,
     ei_hm: &HashMap<u32, ExtentMeta>,
     cmp_extent: u32,
@@ -534,19 +530,16 @@ async fn show_extent(
          */
         for (index, dir) in region_dir.iter().enumerate() {
             // Open Region read only
-            let region =
-                Region::open(dir, Default::default(), false, true, &log)
-                    .await?;
+            let mut region =
+                Region::open(dir, Default::default(), false, true, &log)?;
 
-            let mut responses = region
-                .region_read(
-                    &[ReadRequest {
-                        eid: cmp_extent as u64,
-                        offset: Block::new_with_ddef(block, &region.def()),
-                    }],
-                    JobId(0),
-                )
-                .await?;
+            let mut responses = region.region_read(
+                &[ReadRequest {
+                    eid: cmp_extent as u64,
+                    offset: Block::new_with_ddef(block, &region.def()),
+                }],
+                JobId(0),
+            )?;
             let response = responses.pop().unwrap();
 
             dvec.insert(index, response);
@@ -620,7 +613,7 @@ fn is_all_same<T: PartialEq>(slice: &[T]) -> bool {
 /*
  * Show detailed comparison of different region's blocks
  */
-async fn show_extent_block(
+fn show_extent_block(
     region_dir: Vec<PathBuf>,
     cmp_extent: u32,
     block: u64,
@@ -650,21 +643,16 @@ async fn show_extent_block(
      */
     for (index, dir) in region_dir.iter().enumerate() {
         // Open Region read only
-        let region =
-            Region::open(dir, Default::default(), false, true, &log).await?;
+        let mut region =
+            Region::open(dir, Default::default(), false, true, &log)?;
 
-        let mut responses = region
-            .region_read(
-                &[ReadRequest {
-                    eid: cmp_extent as u64,
-                    offset: Block::new_with_ddef(
-                        block_in_extent,
-                        &region.def(),
-                    ),
-                }],
-                JobId(0),
-            )
-            .await?;
+        let mut responses = region.region_read(
+            &[ReadRequest {
+                eid: cmp_extent as u64,
+                offset: Block::new_with_ddef(block_in_extent, &region.def()),
+            }],
+            JobId(0),
+        )?;
         let response = responses.pop().unwrap();
 
         dvec.insert(index, response);

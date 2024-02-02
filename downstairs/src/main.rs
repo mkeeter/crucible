@@ -251,16 +251,15 @@ async fn main() -> Result<()> {
                 uuid,
                 encrypted,
                 log.clone(),
-            )
-            .await?;
+            )?;
 
             if let Some(ref ip) = import_path {
-                downstairs_import(&mut region, ip).await.unwrap();
+                downstairs_import(&mut region, ip).unwrap();
                 /*
                  * The region we just created should now have a flush so the
                  * new data and inital flush number is written to disk.
                  */
-                region.region_flush(1, 0, &None, JobId(0), None).await?;
+                region.region_flush(1, 0, &None, JobId(0), None)?;
             }
 
             info!(log, "UUID: {:?}", region.def().uuid());
@@ -290,7 +289,6 @@ async fn main() -> Result<()> {
                 no_color,
                 log,
             )
-            .await
         }
         Args::Export {
             count,
@@ -305,10 +303,9 @@ async fn main() -> Result<()> {
                 true,
                 true,
                 &log,
-            )
-            .await?;
+            )?;
 
-            downstairs_export(&mut region, export_path, skip, count).await
+            downstairs_export(&mut region, export_path, skip, count)
         }
         Args::Run {
             address,
@@ -361,8 +358,7 @@ async fn main() -> Result<()> {
                 flush_errors,
                 read_only,
                 Some(log),
-            )
-            .await?;
+            )?;
 
             let downstairs_join_handle = start_downstairs(
                 d,
@@ -444,8 +440,7 @@ async fn main() -> Result<()> {
                 uuid,
                 encrypted,
                 log.clone(),
-            )
-            .await?;
+            )?;
 
             let flush_config = if let Some(flush_per_iops) = flush_per_iops {
                 DynoFlushConfig::FlushPerIops(flush_per_iops)
