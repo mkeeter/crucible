@@ -452,7 +452,7 @@ async fn main() -> Result<()> {
                 DynoFlushConfig::None
             };
 
-            dynamometer(region, num_writes, samples, flush_config).await
+            dynamometer(region, num_writes, samples, flush_config)
         }
     }
 }

@@ -8,7 +8,7 @@ pub enum DynoFlushConfig {
     None,
 }
 
-pub async fn dynamometer(
+pub fn dynamometer(
     mut region: Region,
     num_writes: usize,
     samples: usize,
