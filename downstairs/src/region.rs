@@ -896,7 +896,7 @@ impl Region {
      */
     #[instrument]
     pub(crate) async fn region_flush_extent<
-        I: Into<JobOrReconciliationId> + Debug,
+        I: Into<JobOrReconciliationId> + Debug + Copy,
     >(
         &mut self,
         eid: usize,
@@ -915,6 +915,8 @@ impl Region {
         let log = self.log.clone();
         let extent = self.get_opened_extent_mut(eid);
         extent.flush(flush_number, gen_number, job_id, &log).await?;
+
+        extent.post_flush(flush_number, gen_number, job_id).await?;
 
         Ok(())
     }
@@ -1012,6 +1014,37 @@ impl Region {
             // the results were all collected above, each extent flush has
             // completed at this point.
             result?;
+        }
+
+        if cfg!(feature = "omicron-build") {
+            use std::io;
+            use std::os::fd::AsRawFd;
+            use std::ptr;
+
+            // "file system flush", defined in illumos' sys/filio.h
+            const FIOFFS: libc::c_int = 0x20000000 | (0x66 /*'f'*/ << 8) | 0x42 /*66*/;
+
+            // Open the region's mountpoint
+            let file = File::open(&self.dir)?;
+
+            let rc = unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    FIOFFS as _,
+                    ptr::null_mut::<i32>(),
+                )
+            };
+
+            if rc != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+
+        // After the bits have been committed to durable storage, execute any post flush routine
+        // that needs to happen
+        for eid in &dirty_extents {
+            let extent = self.get_opened_extent(*eid);
+            extent.post_flush(flush_number, gen_number, job_id).await?;
         }
 
         // Now everything has succeeded, we can remove these extents from the
