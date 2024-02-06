@@ -1,14 +1,12 @@
 // Copyright 2023 Oxide Computer Company
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::fs::{rename, File, OpenOptions};
 use std::io::{IoSlice, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 use anyhow::{bail, Result};
 use futures::TryStreamExt;
@@ -73,7 +71,7 @@ impl From<ReconciliationId> for JobOrReconciliationId {
 pub struct Region {
     pub dir: PathBuf,
     def: RegionDefinition,
-    pub extents: Vec<Arc<Mutex<ExtentState>>>,
+    pub extents: Vec<ExtentState>,
 
     /// extents which are dirty and need to be flushed. should be true if the
     /// dirty flag in the extent's metadata is set. When an extent is opened, if
@@ -328,9 +326,18 @@ impl Region {
         self.def.get_encrypted()
     }
 
-    async fn get_opened_extent(&self, eid: usize) -> Arc<Extent> {
-        match &*self.extents[eid].lock().await {
-            ExtentState::Opened(extent) => extent.clone(),
+    fn get_opened_extent_mut(&mut self, eid: usize) -> &mut Extent {
+        match &mut self.extents[eid] {
+            ExtentState::Opened(extent) => extent,
+            ExtentState::Closed => {
+                panic!("attempting to get closed extent {}", eid)
+            }
+        }
+    }
+
+    fn get_opened_extent(&self, eid: usize) -> &Extent {
+        match &self.extents[eid] {
+            ExtentState::Opened(extent) => extent,
             ExtentState::Closed => {
                 panic!("attempting to get closed extent {}", eid)
             }
@@ -374,15 +381,13 @@ impl Region {
                 extent
             };
 
-            these_extents.push(Arc::new(Mutex::new(ExtentState::Opened(
-                Arc::new(extent),
-            ))));
+            these_extents.push(ExtentState::Opened(extent));
         }
 
         self.extents.extend(these_extents);
 
         for eid in next_eid..self.def.extent_count() {
-            assert_eq!(self.get_opened_extent(eid as usize).await.number, eid);
+            assert_eq!(self.get_opened_extent(eid as usize).number, eid);
         }
         assert_eq!(self.def.extent_count() as usize, self.extents.len());
 
@@ -396,8 +401,7 @@ impl Region {
     pub async fn reopen_all_extents(&mut self) -> Result<()> {
         let mut to_open = Vec::new();
         for (i, extent) in self.extents.iter().enumerate() {
-            let inner = extent.lock().await;
-            if matches!(*inner, ExtentState::Closed) {
+            if matches!(extent, ExtentState::Closed) {
                 to_open.push(i);
             }
         }
@@ -423,8 +427,8 @@ impl Region {
          * - matches our eid
          * - is not read-only
          */
-        let mut mg = self.extents[eid].lock().await;
-        assert!(matches!(*mg, ExtentState::Closed));
+        let mg = &mut self.extents[eid];
+        assert!(matches!(mg, ExtentState::Closed));
         assert!(!self.read_only);
 
         let new_extent = Extent::open(
@@ -440,28 +444,21 @@ impl Region {
             self.dirty_extents.insert(eid);
         }
 
-        *mg = ExtentState::Opened(Arc::new(new_extent));
+        *mg = ExtentState::Opened(new_extent);
 
         Ok(())
     }
 
     pub async fn close_extent(
-        &self,
+        &mut self,
         eid: usize,
     ) -> Result<(u64, u64, bool), CrucibleError> {
-        let mut extent_state = self.extents[eid].lock().await;
+        let extent_state = &mut self.extents[eid];
 
-        let open_extent =
-            std::mem::replace(&mut *extent_state, ExtentState::Closed);
+        let open_extent = std::mem::replace(extent_state, ExtentState::Closed);
 
         match open_extent {
-            ExtentState::Opened(extent) => {
-                // extent here is Arc<Extent>, and closing only makes sense if
-                // the reference count is 1.
-                let inner = Arc::into_inner(extent);
-                assert!(inner.is_some());
-                inner.unwrap().close().await
-            }
+            ExtentState::Opened(extent) => extent.close().await,
 
             ExtentState::Closed => {
                 panic!("close on closed extent {}!", eid);
@@ -509,9 +506,7 @@ impl Region {
     ) -> Result<(), CrucibleError> {
         // Make sure the extent:
         // is currently closed, matches our eid, is not read-only
-        let mg = self.extents[eid].lock().await;
-        assert!(matches!(*mg, ExtentState::Closed));
-        drop(mg);
+        assert!(matches!(self.extents[eid], ExtentState::Closed));
         assert!(!self.read_only);
 
         self.get_extent_copy(eid, repair_addr).await?;
@@ -537,9 +532,7 @@ impl Region {
         repair_addr: SocketAddr,
     ) -> Result<(), CrucibleError> {
         // An extent must be closed before we replace its files.
-        let mg = self.extents[eid].lock().await;
-        assert!(matches!(*mg, ExtentState::Closed));
-        drop(mg);
+        assert!(matches!(self.extents[eid], ExtentState::Closed));
 
         // Make sure copy, replace, and cleanup directories don't exist yet.
         // We don't need them yet, but if they do exist, then something
@@ -665,7 +658,7 @@ impl Region {
     pub async fn meta_info(&self) -> Result<Vec<ExtentMeta>> {
         let mut result = Vec::with_capacity(self.extents.len());
         for eid in 0..self.extents.len() {
-            let extent = self.get_opened_extent(eid).await;
+            let extent = self.get_opened_extent(eid);
             result.push(extent.get_meta_info().await)
         }
         Ok(result)
@@ -733,7 +726,7 @@ impl Region {
             cdt::os__write__start!(|| job_id.0);
         }
         for eid in batched_writes.keys() {
-            let extent = self.get_opened_extent(*eid).await;
+            let extent = self.get_opened_extent_mut(*eid);
             let writes = batched_writes.get(eid).unwrap();
             extent
                 .write(job_id, &writes[..], only_write_unwritten)
@@ -754,7 +747,7 @@ impl Region {
 
     #[instrument]
     pub async fn region_read(
-        &self,
+        &mut self,
         requests: &[crucible_protocol::ReadRequest],
         job_id: JobId,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
@@ -778,7 +771,7 @@ impl Region {
                 if request.eid == _eid {
                     batched_reads.push(request);
                 } else {
-                    let extent = self.get_opened_extent(_eid as usize).await;
+                    let extent = self.get_opened_extent_mut(_eid as usize);
                     extent
                         .read(job_id, &batched_reads[..], &mut responses)
                         .await?;
@@ -795,7 +788,7 @@ impl Region {
         }
 
         if let Some(_eid) = eid {
-            let extent = self.get_opened_extent(_eid as usize).await;
+            let extent = self.get_opened_extent_mut(_eid as usize);
             extent
                 .read(job_id, &batched_reads[..], &mut responses)
                 .await?;
@@ -813,7 +806,7 @@ impl Region {
     pub(crate) async fn region_flush_extent<
         I: Into<JobOrReconciliationId> + Debug,
     >(
-        &self,
+        &mut self,
         eid: usize,
         gen_number: u64,
         flush_number: u64,
@@ -827,10 +820,9 @@ impl Region {
             gen_number
         );
 
-        let extent = self.get_opened_extent(eid).await;
-        extent
-            .flush(flush_number, gen_number, job_id, &self.log)
-            .await?;
+        let log = self.log.clone();
+        let extent = self.get_opened_extent_mut(eid);
+        extent.flush(flush_number, gen_number, job_id, &log).await?;
 
         Ok(())
     }
@@ -858,8 +850,9 @@ impl Region {
         cdt::os__flush__start!(|| job_id.0);
 
         // Select extents we're going to flush, while respecting the
-        // extent_limit if one was provided.
-        let dirty_extents: Vec<usize> = match extent_limit {
+        // extent_limit if one was provided.  This must be ordered, because
+        // we're going to walk through the extent slice.
+        let dirty_extents: BTreeSet<usize> = match extent_limit {
             None => self.dirty_extents.iter().copied().collect(),
             Some(el) => {
                 if el > self.def.extent_count().try_into().unwrap() {
@@ -874,30 +867,50 @@ impl Region {
             }
         };
 
-        let extent_count = dirty_extents.len();
-
-        // Spawn parallel tasks for the flush
-        let mut join_handles: Vec<JoinHandle<Result<(), CrucibleError>>> =
-            Vec::with_capacity(extent_count);
-
-        for eid in &dirty_extents {
-            let extent = self.get_opened_extent(*eid).await;
-            let log = self.log.clone();
-            let jh = tokio::spawn(async move {
-                extent.flush(flush_number, gen_number, job_id, &log).await
-            });
-            join_handles.push(jh);
-        }
-
-        // Wait for all flushes to finish - wait until after
-        // cdt::os__flush__done to check the results and bail out.
-        let mut results = Vec::with_capacity(extent_count);
-        for join_handle in join_handles {
-            results.push(
-                join_handle
-                    .await
-                    .map_err(|e| CrucibleError::GenericError(e.to_string())),
-            );
+        // This is a bit sneaky: we want to perform each flush in a separate
+        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
+        // multiple times.  In addition, we can't use the tokio thread pool to
+        // spawn a task, because that requires a 'static lifetime, which we
+        // can't get from a borrowed Extent.
+        //
+        // We'll combine two tricks to work around the issue:
+        // - Do the work in the rayon thread pool instead of using tokio tasks
+        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
+        //   multiple at the same time.
+        let mut results = vec![Ok(()); dirty_extents.len()];
+        let log = self.log.clone();
+        let mut f = || {
+            let mut slice_start = 0;
+            let mut slice = self.extents.as_mut_slice();
+            let h = tokio::runtime::Handle::current();
+            rayon::scope(|s| {
+                for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
+                    let next = eid - slice_start;
+                    slice = &mut slice[next..];
+                    let (extent, rest) = slice.split_first_mut().unwrap();
+                    let ExtentState::Opened(extent) = extent else {
+                        panic!("can't flush closed extent");
+                    };
+                    slice = rest;
+                    slice_start += next + 1;
+                    let log = log.clone();
+                    s.spawn(|_| {
+                        h.block_on(async move {
+                            *r = extent
+                                .flush(flush_number, gen_number, job_id, &log)
+                                .await
+                        });
+                    });
+                }
+            })
+        };
+        if matches!(
+            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            tokio::task::block_in_place(f)
+        } else {
+            f()
         }
 
         cdt::os__flush__done!(|| job_id.0);
@@ -906,7 +919,7 @@ impl Region {
             // If any extent flush failed, then return that as an error. Because
             // the results were all collected above, each extent flush has
             // completed at this point.
-            result??;
+            result?;
         }
 
         // Now everything has succeeded, we can remove these extents from the
@@ -1380,10 +1393,7 @@ pub(crate) mod test {
 
         // Verify inner is gone, and we returned the expected gen, flush
         // and dirty values for a new unwritten extent.
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
         assert_eq!(gen, 0);
         assert_eq!(flush, 0);
         assert!(!dirty);
@@ -1394,7 +1404,7 @@ pub(crate) mod test {
         region.reopen_extent(1).await?;
 
         // Verify extent one is valid
-        let ext_one = region.get_opened_extent(1).await;
+        let ext_one = region.get_opened_extent(1);
 
         // Make sure the eid matches
         assert_eq!(ext_one.number, 1);
@@ -1417,10 +1427,7 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Make copy directory for this extent
         let cp = Region::create_copy_dir(&dir, 1)?;
@@ -1429,7 +1436,7 @@ pub(crate) mod test {
         region.reopen_extent(1).await?;
 
         // Verify extent one is valid
-        let ext_one = region.get_opened_extent(1).await;
+        let ext_one = region.get_opened_extent(1);
 
         // Make sure the eid matches
         assert_eq!(ext_one.number, 1);
@@ -1452,10 +1459,7 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Make copy directory for this extent
         let cp = Region::create_copy_dir(&dir, 1)?;
@@ -1472,7 +1476,7 @@ pub(crate) mod test {
         region.reopen_extent(1).await?;
 
         // Verify extent one is valid
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure all repair directories are gone
         assert!(!Path::new(&cp).exists());
@@ -1495,10 +1499,7 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Make copy directory for this extent
         let cp = Region::create_copy_dir(&dir, 1)?;
@@ -1521,7 +1522,7 @@ pub(crate) mod test {
         // Reopen extent 1
         region.reopen_extent(1).await?;
 
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure all repair directories are gone
         assert!(!Path::new(&cp).exists());
@@ -1553,10 +1554,7 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Make copy directory for this extent
         let cp = Region::create_copy_dir(&dir, 1)?;
@@ -1591,7 +1589,7 @@ pub(crate) mod test {
         // Reopen extent 1
         region.reopen_extent(1).await?;
 
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure all repair directories are gone
         assert!(!Path::new(&cp).exists());
@@ -1619,10 +1617,7 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Make copy directory for this extent
         let cp = Region::create_copy_dir(&dir, 1)?;
@@ -1647,7 +1642,7 @@ pub(crate) mod test {
         // Reopen extent 1
         region.reopen_extent(1).await?;
 
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure all repair directories are gone
         assert!(!Path::new(&cp).exists());
@@ -1681,10 +1676,7 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Make copy directory for this extent
         let cp = Region::create_copy_dir(&dir, 1)?;
@@ -1734,7 +1726,7 @@ pub(crate) mod test {
         dest_path.set_extension("db-wal");
         assert!(!Path::new(&dest_path).exists());
 
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure all repair directories are gone
         assert!(!Path::new(&cp).exists());
@@ -1767,7 +1759,7 @@ pub(crate) mod test {
         region.extend(3).await?;
 
         // Make copy directory for this extent
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
         let cp = Region::create_copy_dir(&dir, 1)?;
 
         // We are simulating the copy of files from the "source" repair
@@ -1794,7 +1786,7 @@ pub(crate) mod test {
                 .await?;
 
         // Verify extent 1 has opened again.
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure repair directory is still present
         assert!(Path::new(&rd).exists());
@@ -1816,7 +1808,7 @@ pub(crate) mod test {
         region.extend(3).await?;
 
         // Make copy directory for this extent
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
         let cp = Region::create_copy_dir(&dir, 1)?;
 
         // We are simulating the copy of files from the "source" repair
@@ -1839,7 +1831,7 @@ pub(crate) mod test {
                 .await?;
 
         // Verify extent 1 has opened again.
-        let _ext_one = region.get_opened_extent(1).await;
+        let _ext_one = region.get_opened_extent(1);
 
         // Make sure repair directory is still present
         assert!(Path::new(&rd).exists());
@@ -1923,7 +1915,7 @@ pub(crate) mod test {
         // deleted the `.db` on disk.  As such, migration should restart when
         // the extent is reopened.
 
-        let region =
+        let mut region =
             Region::open(&dir, new_region_options(), true, false, &log).await?;
         let out = region
             .region_read(
@@ -2024,7 +2016,7 @@ pub(crate) mod test {
         // deleted the `.db` on disk.  As such, migration should restart when
         // the extent is reopened, and we should recover from corruption.
 
-        let region =
+        let mut region =
             Region::open(&dir, new_region_options(), true, false, &log).await?;
         let out = region
             .region_read(
@@ -2096,29 +2088,23 @@ pub(crate) mod test {
 
         // Close extent 1
         region.close_extent(1).await.unwrap();
-        assert!(matches!(
-            *region.extents[1].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[1], ExtentState::Closed));
 
         // Close extent 4
         region.close_extent(4).await.unwrap();
-        assert!(matches!(
-            *region.extents[4].lock().await,
-            ExtentState::Closed
-        ));
+        assert!(matches!(region.extents[4], ExtentState::Closed));
 
         // Reopen all extents
         region.reopen_all_extents().await?;
 
         // Verify extent one is valid
-        let ext_one = region.get_opened_extent(1).await;
+        let ext_one = region.get_opened_extent(1);
 
         // Make sure the eid matches
         assert_eq!(ext_one.number, 1);
 
         // Verify extent four is valid
-        let ext_four = region.get_opened_extent(4).await;
+        let ext_four = region.get_opened_extent(4);
 
         // Make sure the eid matches
         assert_eq!(ext_four.number, 4);
@@ -2398,15 +2384,15 @@ pub(crate) mod test {
         for i in 0..3 {
             region.region_flush_extent(i, 10, 15, JobId(21)).await?;
         }
-        let meta = region.get_opened_extent(0).await.get_meta_info().await;
+        let meta = region.get_opened_extent(0).get_meta_info().await;
         assert_eq!(meta.gen_number, 10);
         assert_eq!(meta.flush_number, 15);
         drop(region);
 
         // Open the region as read-only, which doesn't trigger a migration
-        let region =
+        let mut region =
             Region::open(&dir, new_region_options(), true, true, &log).await?;
-        let meta = region.get_opened_extent(0).await.get_meta_info().await;
+        let meta = region.get_opened_extent(0).get_meta_info().await;
         assert_eq!(meta.gen_number, 10);
         assert_eq!(meta.flush_number, 15);
 
@@ -2441,9 +2427,9 @@ pub(crate) mod test {
         drop(region);
 
         // Open the region as read-write, which **does** trigger a migration
-        let region =
+        let mut region =
             Region::open(&dir, new_region_options(), true, false, &log).await?;
-        let meta = region.get_opened_extent(0).await.get_meta_info().await;
+        let meta = region.get_opened_extent(0).get_meta_info().await;
         assert_eq!(meta.gen_number, 10);
         assert_eq!(meta.flush_number, 15);
 
@@ -2488,16 +2474,16 @@ pub(crate) mod test {
 
         // A write of some sort only wrote a block context row and dirty flag
         {
-            let ext = region.get_opened_extent(0).await;
-            let mut inner = ext.lock().await;
-            inner.set_dirty_and_block_context(&DownstairsBlockContext {
+            let ext = region.get_opened_extent_mut(0);
+            ext.set_dirty_and_block_context(&DownstairsBlockContext {
                 block_context: BlockContext {
                     encryption_context: None,
                     hash: 1024,
                 },
                 block: 0,
                 on_disk_hash: 65536,
-            })?;
+            })
+            .await?;
         }
 
         // This should clear out the invalid contexts
@@ -2509,9 +2495,8 @@ pub(crate) mod test {
 
         // Verify no block context rows exist
         {
-            let ext = region.get_opened_extent(0).await;
-            let mut inner = ext.lock().await;
-            assert!(inner.get_block_contexts(0, 1)?[0].is_empty());
+            let ext = region.get_opened_extent_mut(0);
+            assert!(ext.get_block_contexts(0, 1).await?[0].is_empty());
         }
 
         // Assert write unwritten will write to the first block
@@ -2622,7 +2607,7 @@ pub(crate) mod test {
 
         // Verify the dirty bit is now set.
         // We know our EID, so we can shortcut to getting the actual extent.
-        assert!(region.get_opened_extent(eid as usize).await.dirty().await);
+        assert!(region.get_opened_extent(eid as usize).dirty().await);
 
         // Now read back that block, make sure it is updated.
         let responses = region
@@ -2754,7 +2739,7 @@ pub(crate) mod test {
         region.region_write(&writes, JobId(0), true).await?;
 
         // Verify the dirty bit is now set.
-        assert!(region.get_opened_extent(eid as usize).await.dirty().await);
+        assert!(region.get_opened_extent(eid as usize).dirty().await);
 
         // Flush extent with eid, fn, gen
         region
@@ -2762,7 +2747,7 @@ pub(crate) mod test {
             .await?;
 
         // Verify the dirty bit is no longer set.
-        assert!(!region.get_opened_extent(eid as usize).await.dirty().await);
+        assert!(!region.get_opened_extent(eid as usize).dirty().await);
 
         // Create a new write IO with different data.
         let data = BytesMut::from(&[1u8; 512][..]);
@@ -2789,7 +2774,7 @@ pub(crate) mod test {
         region.region_write(&writes, JobId(1), true).await?;
 
         // Verify the dirty bit is not set.
-        assert!(!region.get_opened_extent(eid as usize).await.dirty().await);
+        assert!(!region.get_opened_extent(eid as usize).dirty().await);
 
         // Read back our block, make sure it has the first write data
         let responses = region
@@ -3407,8 +3392,8 @@ pub(crate) mod test {
         region.region_write(&writes, JobId(0), true).await.unwrap();
 
         // Verify the dirty bit is now set for both extents.
-        assert!(region.get_opened_extent(0).await.dirty().await);
-        assert!(region.get_opened_extent(1).await.dirty().await);
+        assert!(region.get_opened_extent(0).dirty().await);
+        assert!(region.get_opened_extent(1).dirty().await);
 
         // Call flush, but limit the flush to extent 0
         region
@@ -3418,8 +3403,8 @@ pub(crate) mod test {
 
         // Verify the dirty bit is no longer set for 0, but still set
         // for extent 1.
-        assert!(!region.get_opened_extent(0).await.dirty().await);
-        assert!(region.get_opened_extent(1).await.dirty().await);
+        assert!(!region.get_opened_extent(0).dirty().await);
+        assert!(region.get_opened_extent(1).dirty().await);
     }
 
     #[tokio::test]
@@ -3441,8 +3426,8 @@ pub(crate) mod test {
         region.region_write(&writes, JobId(2), true).await.unwrap();
 
         // Verify the dirty bit is now set for both extents.
-        assert!(region.get_opened_extent(1).await.dirty().await);
-        assert!(region.get_opened_extent(2).await.dirty().await);
+        assert!(region.get_opened_extent(1).dirty().await);
+        assert!(region.get_opened_extent(2).dirty().await);
 
         // Call flush, but limit the flush to extents < 2
         region
@@ -3452,8 +3437,8 @@ pub(crate) mod test {
 
         // Verify the dirty bit is no longer set for 1, but still set
         // for extent 2.
-        assert!(!region.get_opened_extent(1).await.dirty().await);
-        assert!(region.get_opened_extent(2).await.dirty().await);
+        assert!(!region.get_opened_extent(1).dirty().await);
+        assert!(region.get_opened_extent(2).dirty().await);
 
         // Now flush with no restrictions.
         region
@@ -3462,7 +3447,7 @@ pub(crate) mod test {
             .unwrap();
 
         // Extent 2 should no longer be dirty
-        assert!(!region.get_opened_extent(2).await.dirty().await);
+        assert!(!region.get_opened_extent(2).dirty().await);
     }
 
     #[tokio::test]
@@ -3488,7 +3473,7 @@ pub(crate) mod test {
 
         // Verify the dirty bit is now set for all extents.
         for ext in 0..10 {
-            assert!(region.get_opened_extent(ext).await.dirty().await);
+            assert!(region.get_opened_extent(ext).dirty().await);
         }
 
         // Walk up the extent_limit, verify at each flush extents are
@@ -3502,12 +3487,12 @@ pub(crate) mod test {
 
             // This ext should no longer be dirty.
             println!("extent {} should not be dirty now", ext);
-            assert!(!region.get_opened_extent(ext).await.dirty().await);
+            assert!(!region.get_opened_extent(ext).dirty().await);
 
             // Any extent above the current point should still be dirty.
             for d_ext in ext + 1..10 {
                 println!("verify {} still dirty", d_ext);
-                assert!(region.get_opened_extent(d_ext).await.dirty().await);
+                assert!(region.get_opened_extent(d_ext).dirty().await);
             }
         }
     }
@@ -3717,13 +3702,13 @@ pub(crate) mod test {
         // We are gonna compare against the last write iteration
         let last_writes = writes.last().unwrap();
 
-        let ext = region.get_opened_extent(0).await;
-        let mut inner = ext.lock().await;
+        let ext = region.get_opened_extent_mut(0);
 
         for (i, range) in ranges.iter().enumerate() {
             // Get the contexts for the range
-            let ctxts = inner
-                .get_block_contexts(range.start, range.end - range.start)?;
+            let ctxts = ext
+                .get_block_contexts(range.start, range.end - range.start)
+                .await?;
 
             // Every block should have at most 1 block
             assert_eq!(
@@ -3799,11 +3784,10 @@ pub(crate) mod test {
         // compare against the last write iteration
         let last_writes = writes.last().unwrap();
 
-        let ext = region.get_opened_extent(0).await;
-        let mut inner = ext.lock().await;
+        let ext = region.get_opened_extent_mut(0);
 
         // Get the contexts for the range
-        let ctxts = inner.get_block_contexts(0, EXTENT_SIZE)?;
+        let ctxts = ext.get_block_contexts(0, EXTENT_SIZE).await?;
 
         // Every block should have at most 1 block
         assert_eq!(
@@ -3948,7 +3932,7 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn test_read_single_large_contiguous() -> Result<()> {
-        let (_dir, region, data) = prepare_random_region().await?;
+        let (_dir, mut region, data) = prepare_random_region().await?;
 
         // Call region_read with a single large contiguous range
         let requests: Vec<crucible::ReadRequest> = (1..8)
@@ -3974,7 +3958,7 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn test_read_single_large_contiguous_span_extents() -> Result<()> {
-        let (_dir, region, data) = prepare_random_region().await?;
+        let (_dir, mut region, data) = prepare_random_region().await?;
 
         // Call region_read with a single large contiguous range that spans
         // multiple extents
@@ -4001,7 +3985,7 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn test_read_multiple_disjoint_large_contiguous() -> Result<()> {
-        let (_dir, region, data) = prepare_random_region().await?;
+        let (_dir, mut region, data) = prepare_random_region().await?;
 
         // Call region_read with a multiple disjoint large contiguous ranges
         let requests: Vec<crucible::ReadRequest> = vec![
@@ -4049,7 +4033,7 @@ pub(crate) mod test {
 
     #[tokio::test]
     async fn test_read_multiple_disjoint_none_contiguous() -> Result<()> {
-        let (_dir, region, data) = prepare_random_region().await?;
+        let (_dir, mut region, data) = prepare_random_region().await?;
 
         // Call region_read with a multiple disjoint non-contiguous ranges
         let requests: Vec<crucible::ReadRequest> = vec![
@@ -4124,7 +4108,10 @@ pub(crate) mod test {
         writes
     }
 
-    async fn validate_whole_region(region: &Region, data: &[u8]) -> Result<()> {
+    async fn validate_whole_region(
+        region: &mut Region,
+        data: &[u8],
+    ) -> Result<()> {
         let num_blocks = region.def().extent_size().value
             * region.def().extent_count() as u64;
 
@@ -4159,7 +4146,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4174,7 +4161,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4193,7 +4180,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4213,7 +4200,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4237,7 +4224,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4263,7 +4250,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4293,7 +4280,7 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 
     #[tokio::test]
@@ -4324,6 +4311,6 @@ pub(crate) mod test {
 
         // Validate written data by reading everything back and comparing with
         // data buffer
-        validate_whole_region(&region, &data).await
+        validate_whole_region(&mut region, &data).await
     }
 }
