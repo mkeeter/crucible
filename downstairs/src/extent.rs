@@ -3,8 +3,10 @@ use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures::future::{ready, Either};
 use nix::unistd::{sysconf, SysconfVar};
 
 use serde::{Deserialize, Serialize};
@@ -20,19 +22,207 @@ use super::*;
 pub struct Extent {
     pub number: u32,
     read_only: bool,
+
+    /// The actual extent work takes place in a separate IO task
+    io_tx: mpsc::Sender<ExtentRequest>,
+
+    log: Logger,
+}
+
+/// Data used for the IO task
+#[derive(Debug)]
+struct ExtentRunner {
+    rx: mpsc::Receiver<ExtentRequest>,
     iov_max: usize,
+    read_only: bool,
 
     /// Inner contains information about the actual extent file that holds the
     /// data, the metadata about that extent, and the set of dirty blocks that
     /// have been written to since last flush.  We use dynamic dispatch here to
     /// support multiple extent implementations.
     inner: Box<dyn ExtentInner + Send + Sync>,
+
+    log: Logger,
+}
+
+impl ExtentRunner {
+    /// Runs the IO loop
+    ///
+    /// The IO loop takes messages from `rx` and executes them on `inner`
+    ///
+    /// This function is infallible, because errors are reported to the caller
+    /// (via the `oneshot` in the `ExtentRequest`).
+    async fn run(&mut self) {
+        let can_block_in_place = matches!(
+            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        );
+
+        while let Some(m) = self.rx.recv().await {
+            let r = if can_block_in_place {
+                tokio::task::block_in_place(|| self.dispatch(m))
+            } else {
+                self.dispatch(m)
+            };
+            if !r {
+                break;
+            }
+        }
+        info!(self.log, "io task done, exiting");
+    }
+
+    /// Process a single extent IO request, sending the reply down the oneshot
+    fn dispatch(&mut self, m: ExtentRequest) -> bool {
+        match m {
+            ExtentRequest::Dirty { done } => {
+                self.reply(done, self.inner.dirty());
+            }
+            ExtentRequest::Close { done } => {
+                self.reply(done, self.inner.meta());
+                info!(self.log, "received close request; exiting loop");
+                return false;
+            }
+            ExtentRequest::Read {
+                job_id,
+                requests,
+                done,
+            } => {
+                let resp = self.inner.read(job_id, &requests, self.iov_max);
+                self.reply(done, resp);
+            }
+            ExtentRequest::Write {
+                job_id,
+                writes,
+                only_write_unwritten,
+                done,
+            } => {
+                let r = self.inner.write(
+                    job_id,
+                    &writes,
+                    only_write_unwritten,
+                    self.iov_max,
+                );
+                self.reply(done, r);
+            }
+            ExtentRequest::Flush {
+                job_id,
+                new_flush,
+                new_gen,
+                done,
+            } => {
+                let r = match self.inner.dirty() {
+                    Ok(false) => Ok(()),
+                    Ok(true) => {
+                        // Read only extents should never have the dirty bit
+                        // set. If they do, bail!
+                        if self.read_only {
+                            error!(
+                                self.log,
+                                "read-only extent has dirty bit set!"
+                            );
+                            Err(CrucibleError::ModifyingReadOnlyRegion)
+                        } else {
+                            self.inner.flush(new_flush, new_gen, job_id)
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                self.reply(done, r);
+            }
+            ExtentRequest::GetMetaInfo { done } => {
+                self.reply(done, self.inner.meta());
+            }
+            #[cfg(test)]
+            ExtentRequest::SetDirtyAndBlockContext {
+                block_context,
+                done,
+            } => {
+                let r = self.inner.set_dirty_and_block_context(&block_context);
+                self.reply(done, r);
+            }
+            #[cfg(test)]
+            ExtentRequest::GetBlockContexts { block, count, done } => {
+                let r = self.inner.get_block_contexts(block, count);
+                self.reply(done, r);
+            }
+        }
+        true
+    }
+
+    /// Send a reply on a `oneshot` channel, logging a warning on failure
+    fn reply<V>(&self, done: oneshot::Sender<V>, v: V) {
+        let r = done.send(v);
+        if r.is_err() {
+            warn!(
+                self.log,
+                "oneshot receiver has been dropped while IO was running"
+            );
+        }
+    }
+}
+
+/// Messages to the extent runner task
+enum ExtentRequest {
+    Dirty {
+        done: oneshot::Sender<Result<bool, CrucibleError>>,
+    },
+    Close {
+        done: oneshot::Sender<Result<ExtentMeta, CrucibleError>>,
+    },
+    Read {
+        job_id: JobId,
+        requests: Vec<crucible_protocol::ReadRequest>,
+        done: oneshot::Sender<
+            Result<Vec<crucible_protocol::ReadResponse>, CrucibleError>,
+        >,
+    },
+    Write {
+        job_id: JobId,
+        writes: Vec<crucible_protocol::Write>,
+        only_write_unwritten: bool,
+        done: oneshot::Sender<Result<(), CrucibleError>>,
+    },
+    Flush {
+        job_id: JobOrReconciliationId,
+        new_flush: u64,
+        new_gen: u64,
+        done: oneshot::Sender<Result<(), CrucibleError>>,
+    },
+    GetMetaInfo {
+        done: oneshot::Sender<Result<ExtentMeta, CrucibleError>>,
+    },
+
+    #[cfg(test)]
+    SetDirtyAndBlockContext {
+        block_context: DownstairsBlockContext,
+        done: oneshot::Sender<Result<(), CrucibleError>>,
+    },
+    #[cfg(test)]
+    GetBlockContexts {
+        block: u64,
+        count: u64,
+        done: oneshot::Sender<
+            Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError>,
+        >,
+    },
 }
 
 pub(crate) trait ExtentInner: Send + Sync + Debug {
     fn gen_number(&self) -> Result<u64, CrucibleError>;
     fn flush_number(&self) -> Result<u64, CrucibleError>;
     fn dirty(&self) -> Result<bool, CrucibleError>;
+
+    fn meta(&self) -> Result<ExtentMeta, CrucibleError> {
+        let gen_number = self.gen_number()?;
+        let flush_number = self.flush_number()?;
+        let dirty = self.dirty()?;
+        Ok(ExtentMeta {
+            ext_version: 0,
+            gen_number,
+            flush_number,
+            dirty,
+        })
+    }
 
     fn flush(
         &mut self,
@@ -431,31 +621,54 @@ impl Extent {
             }
         };
 
-        let extent = Extent {
-            number,
+        Self::start(number, read_only, inner, log)
+    }
+
+    fn start(
+        number: u32,
+        read_only: bool,
+        inner: Box<dyn ExtentInner + Send + Sync>,
+        log: &Logger,
+    ) -> Result<Self> {
+        let log = log.new(o!("extent" => number.to_string()));
+        let (io_tx, rx) = mpsc::channel(64);
+        let mut runner = ExtentRunner {
             read_only,
             iov_max: Extent::get_iov_max()?,
             inner,
+            rx,
+            log: log.new(o!("task" => "io".to_string())),
+        };
+        tokio::task::spawn(async move { runner.run().await });
+
+        let extent = Extent {
+            number,
+            read_only,
+            io_tx,
+            log,
         };
 
         Ok(extent)
     }
 
-    #[allow(clippy::unused_async)] // this will be async again in the future
     pub async fn dirty(&self) -> bool {
-        self.inner.dirty().unwrap()
+        self.submit(|done| ExtentRequest::Dirty { done })
+            .await
+            .await
+            .unwrap()
     }
 
     /**
      * Close an extent and the metadata db files for it.
      */
-    #[allow(clippy::unused_async)] // this will be async again in the future
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
-        let gen = self.inner.gen_number().unwrap();
-        let flush = self.inner.flush_number().unwrap();
-        let dirty = self.inner.dirty().unwrap();
+        let r = self
+            .submit(|done| ExtentRequest::Close { done })
+            .await
+            .await
+            .unwrap();
 
-        Ok((gen, flush, dirty))
+        Ok((r.gen_number, r.flush_number, r.dirty))
     }
 
     /**
@@ -468,6 +681,7 @@ impl Extent {
         def: &RegionDefinition,
         number: u32,
         backend: Backend,
+        log: &Logger,
     ) -> Result<Extent> {
         /*
          * Store extent data in files within a directory hierarchy so that
@@ -495,40 +709,94 @@ impl Extent {
             ),
         };
 
-        /*
-         * Complete the construction of our new extent
-         */
-        Ok(Extent {
-            number,
-            read_only: false,
-            iov_max: Extent::get_iov_max()?,
-            inner,
-        })
+        Self::start(number, false, inner, log)
     }
 
     pub fn number(&self) -> u32 {
         self.number
     }
 
+    /// Submits a read to the IO task
+    pub async fn submit_read(
+        &mut self,
+        job_id: JobId,
+        requests: &[crucible_protocol::ReadRequest],
+    ) -> impl Future<
+        Output = Result<Vec<crucible_protocol::ReadResponse>, CrucibleError>,
+    > {
+        cdt::extent__read__start!(|| {
+            (job_id.0, self.number, requests.len() as u64)
+        });
+
+        let requests = requests.to_vec();
+        let request_count = requests.len();
+        let resp = self
+            .submit(move |done| ExtentRequest::Read {
+                job_id,
+                requests,
+                done,
+            })
+            .await;
+
+        let number = self.number;
+        async move {
+            let r = resp.await;
+            cdt::extent__read__done!(|| {
+                (job_id.0, number, request_count as u64)
+            });
+            r
+        }
+    }
+
     /// Read the real data off underlying storage, and get block metadata. If
-    /// an error occurs while processing any of the requests, the state of
-    /// `responses` is undefined.
+    /// an error occurs while processing any of the requests, an error is
+    /// returned.
     #[instrument]
     pub async fn read(
         &mut self,
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        cdt::extent__read__start!(|| {
-            (job_id.0, self.number, requests.len() as u64)
+        self.submit_read(job_id, requests).await.await
+    }
+
+    /// Submit a write to the IO task
+    pub async fn submit_write(
+        &mut self,
+        job_id: JobId,
+        writes: &[crucible_protocol::Write],
+        only_write_unwritten: bool,
+    ) -> impl Future<Output = Result<(), CrucibleError>> {
+        if self.read_only {
+            return Either::Left(ready(Err(
+                CrucibleError::ModifyingReadOnlyRegion,
+            )));
+        }
+        cdt::extent__write__start!(|| {
+            (job_id.0, self.number, writes.len() as u64)
         });
 
-        let responses = self.inner.read(job_id, requests, self.iov_max)?;
-        cdt::extent__read__done!(|| {
-            (job_id.0, self.number, requests.len() as u64)
-        });
+        let writes = writes.to_vec();
+        let write_count = writes.len();
 
-        Ok(responses)
+        // Send the job to the IO task
+        let resp = self
+            .submit(move |done| ExtentRequest::Write {
+                job_id,
+                writes,
+                only_write_unwritten,
+                done,
+            })
+            .await;
+
+        let number = self.number;
+        Either::Right(async move {
+            let r = resp.await;
+            cdt::extent__write__done!(|| {
+                (job_id.0, number, write_count as u64)
+            });
+            r
+        })
     }
 
     #[instrument]
@@ -538,22 +806,25 @@ impl Extent {
         writes: &[crucible_protocol::Write],
         only_write_unwritten: bool,
     ) -> Result<(), CrucibleError> {
-        if self.read_only {
-            crucible_bail!(ModifyingReadOnlyRegion);
-        }
+        self.submit_write(job_id, writes, only_write_unwritten)
+            .await
+            .await
+    }
 
-        cdt::extent__write__start!(|| {
-            (job_id.0, self.number, writes.len() as u64)
-        });
-
-        self.inner
-            .write(job_id, writes, only_write_unwritten, self.iov_max)?;
-
-        cdt::extent__write__done!(|| {
-            (job_id.0, self.number, writes.len() as u64)
-        });
-
-        Ok(())
+    pub(crate) async fn submit_flush<I: Into<JobOrReconciliationId> + Debug>(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        id: I, // only used for logging
+    ) -> impl Future<Output = Result<(), CrucibleError>> {
+        let job_id: JobOrReconciliationId = id.into();
+        self.submit(move |done| ExtentRequest::Flush {
+            job_id,
+            new_flush,
+            new_gen,
+            done,
+        })
+        .await
     }
 
     #[instrument]
@@ -562,56 +833,81 @@ impl Extent {
         new_flush: u64,
         new_gen: u64,
         id: I, // only used for logging
-        log: &Logger,
     ) -> Result<(), CrucibleError> {
-        let job_id: JobOrReconciliationId = id.into();
-
-        if !self.inner.dirty()? {
-            /*
-             * If we have made no writes to this extent since the last flush,
-             * we do not need to update the extent on disk
-             */
-            return Ok(());
-        }
-
-        // Read only extents should never have the dirty bit set. If they do,
-        // bail
-        if self.read_only {
-            // XXX Make this a panic?
-            error!(log, "read-only extent {} has dirty bit set!", self.number);
-            crucible_bail!(ModifyingReadOnlyRegion);
-        }
-
-        self.inner.flush(new_flush, new_gen, job_id)
+        self.submit_flush(new_flush, new_gen, id).await.await
     }
 
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn get_meta_info(&self) -> ExtentMeta {
-        ExtentMeta {
-            ext_version: 0,
-            gen_number: self.inner.gen_number().unwrap(),
-            flush_number: self.inner.flush_number().unwrap(),
-            dirty: self.inner.dirty().unwrap(),
+    /// Submits a job to the IO task
+    ///
+    /// `submit` is an async function which **returns a future**, so it must be
+    /// doubly awaited.  This is because the function only returns **after** the
+    /// job has been sent to the IO task, which requres pushing it into an
+    /// `mpsc::Sender` (and `Sender::send` is async because it waits until there
+    /// is available room).
+    ///
+    /// Once this function returns, the IO operation is in flight and will be
+    /// completed autonomously; we do not need to `await` the returned future to
+    /// drive the IO operation to completion.
+    async fn submit<
+        T,
+        F: FnOnce(oneshot::Sender<Result<T, CrucibleError>>) -> ExtentRequest,
+    >(
+        &self,
+        f: F,
+    ) -> impl Future<Output = Result<T, CrucibleError>> {
+        let (done, rx) = oneshot::channel();
+        let r = match self.io_tx.send(f(done)).await {
+            Ok(()) => Either::Left(rx),
+            Err(e) => {
+                error!(self.log, "send error: {e:?}");
+                Either::Right(ready(Ok(Err(CrucibleError::IoTaskError(
+                    format!("send failed: {e:?}"),
+                )))))
+            }
+        };
+        async move {
+            match r.await {
+                Ok(v) => v,
+                Err(e) => Err(CrucibleError::IoTaskError(format!(
+                    "recv failed: {e:?}"
+                ))),
+            }
         }
+    }
+
+    pub async fn get_meta_info(&self) -> ExtentMeta {
+        self.submit(|done| ExtentRequest::GetMetaInfo { done })
+            .await
+            .await
+            .unwrap()
     }
 
     #[cfg(test)]
-    #[allow(clippy::unused_async)] // this will be async again in the future
     pub async fn set_dirty_and_block_context(
         &mut self,
-        block_context: &DownstairsBlockContext,
+        block_context: DownstairsBlockContext,
     ) -> Result<(), CrucibleError> {
-        self.inner.set_dirty_and_block_context(block_context)
+        self.submit(|done| ExtentRequest::SetDirtyAndBlockContext {
+            block_context,
+            done,
+        })
+        .await
+        .await
     }
 
     #[cfg(test)]
-    #[allow(clippy::unused_async)] // this will be async again in the future
     pub async fn get_block_contexts(
         &mut self,
         block: u64,
         count: u64,
     ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        self.inner.get_block_contexts(block, count)
+        self.submit(|done| ExtentRequest::GetBlockContexts {
+            block,
+            count,
+            done,
+        })
+        .await
+        .await
     }
 }
 
