@@ -158,6 +158,9 @@ pub enum CrucibleError {
 
     #[error("missing block context for non-empty block")]
     MissingBlockContext,
+
+    #[error("failed to communicate with IO task: {0}")]
+    IoTaskError(String),
 }
 
 impl From<std::io::Error> for CrucibleError {
@@ -402,7 +405,8 @@ impl From<CrucibleError> for dropshot::HttpError {
             | CrucibleError::MissingContextSlot(..)
             | CrucibleError::BadMetadata(..)
             | CrucibleError::BadContextSlot(..)
-            | CrucibleError::MissingBlockContext => {
+            | CrucibleError::MissingBlockContext
+            | CrucibleError::IoTaskError(..) => {
                 dropshot::HttpError::for_internal_error(e.to_string())
             }
         }
