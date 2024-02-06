@@ -1,15 +1,19 @@
 // Copyright 2023 Oxide Computer Company
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::fs::{rename, File, OpenOptions};
+use std::future::Future;
 use std::io::{IoSlice, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
-use futures::TryStreamExt;
+use futures::{
+    future::{ready, Either},
+    TryStreamExt,
+};
 
 use tracing::instrument;
 
@@ -382,7 +386,13 @@ impl Region {
 
         for eid in eid_range {
             let extent = if create {
-                Extent::create(&self.dir, &self.def, eid, self.backend)?
+                Extent::create(
+                    &self.dir,
+                    &self.def,
+                    eid,
+                    self.backend,
+                    &self.log,
+                )?
             } else {
                 let extent = Extent::open(
                     &self.dir,
@@ -762,21 +772,24 @@ impl Region {
         Ok(())
     }
 
-    #[instrument]
-    pub async fn region_write(
+    pub async fn submit_region_write(
         &mut self,
         writes: &[crucible_protocol::Write],
         job_id: JobId,
         only_write_unwritten: bool,
-    ) -> Result<(), CrucibleError> {
+    ) -> impl Future<Output = Result<(), CrucibleError>> {
         if self.read_only {
-            crucible_bail!(ModifyingReadOnlyRegion);
+            return Either::Left(ready(Err(
+                CrucibleError::ModifyingReadOnlyRegion,
+            )));
         }
 
         /*
          * Before anything, validate hashes
          */
-        self.validate_hashes(writes)?;
+        if let Err(e) = self.validate_hashes(writes) {
+            return Either::Left(ready(Err(e)));
+        }
 
         /*
          * Batch writes so they can all be sent to the appropriate extent
@@ -796,34 +809,52 @@ impl Region {
         } else {
             cdt::os__write__start!(|| job_id.0);
         }
+        let mut jobs = Vec::with_capacity(batched_writes.len());
         for eid in batched_writes.keys() {
             let extent = self.get_opened_extent_mut(*eid);
             let writes = batched_writes.get(eid).unwrap();
-            extent
-                .write(job_id, &writes[..], only_write_unwritten)
-                .await?;
+            jobs.push(
+                extent
+                    .submit_write(job_id, &writes[..], only_write_unwritten)
+                    .await,
+            );
         }
 
         // Mark any extents we sent a write-command to as potentially dirty
         self.dirty_extents.extend(batched_writes.keys());
 
-        if only_write_unwritten {
-            cdt::os__writeunwritten__done!(|| job_id.0);
-        } else {
-            cdt::os__write__done!(|| job_id.0);
-        }
-
-        Ok(())
+        Either::Right(async move {
+            for r in jobs {
+                r.await?;
+            }
+            if only_write_unwritten {
+                cdt::os__writeunwritten__done!(|| job_id.0);
+            } else {
+                cdt::os__write__done!(|| job_id.0);
+            }
+            Ok(())
+        })
     }
 
     #[instrument]
-    pub async fn region_read(
+    pub async fn region_write(
+        &mut self,
+        writes: &[crucible_protocol::Write],
+        job_id: JobId,
+        only_write_unwritten: bool,
+    ) -> Result<(), CrucibleError> {
+        self.submit_region_write(writes, job_id, only_write_unwritten)
+            .await
+            .await
+    }
+
+    pub async fn submit_region_read(
         &mut self,
         requests: &[crucible_protocol::ReadRequest],
         job_id: JobId,
-    ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        let mut responses = Vec::with_capacity(requests.len());
-
+    ) -> impl Future<
+        Output = Result<Vec<crucible_protocol::ReadResponse>, CrucibleError>,
+    > {
         /*
          * Batch reads so they can all be sent to the appropriate extent
          * together.
@@ -836,14 +867,16 @@ impl Region {
         let mut batched_reads = Vec::with_capacity(requests.len());
 
         cdt::os__read__start!(|| job_id.0);
+        let mut jobs = Vec::with_capacity(requests.len());
         for request in requests {
             if let Some(_eid) = eid {
                 if request.eid == _eid {
                     batched_reads.push(request.clone());
                 } else {
                     let extent = self.get_opened_extent_mut(_eid as usize);
-                    responses
-                        .extend(extent.read(job_id, &batched_reads[..]).await?);
+                    jobs.push(
+                        extent.submit_read(job_id, &batched_reads[..]).await,
+                    );
 
                     eid = Some(request.eid);
                     batched_reads.clear();
@@ -858,11 +891,26 @@ impl Region {
 
         if let Some(_eid) = eid {
             let extent = self.get_opened_extent_mut(_eid as usize);
-            responses.extend(extent.read(job_id, &batched_reads[..]).await?);
+            jobs.push(extent.submit_read(job_id, &batched_reads[..]).await);
         }
-        cdt::os__read__done!(|| job_id.0);
 
-        Ok(responses)
+        let mut responses = Vec::with_capacity(requests.len());
+        async move {
+            for r in jobs {
+                responses.extend(r.await?);
+            }
+            cdt::os__read__done!(|| job_id.0);
+            Ok(responses)
+        }
+    }
+
+    #[instrument]
+    pub async fn region_read(
+        &mut self,
+        requests: &[crucible_protocol::ReadRequest],
+        job_id: JobId,
+    ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
+        self.submit_region_read(requests, job_id).await.await
     }
 
     /*
@@ -887,9 +935,8 @@ impl Region {
             gen_number
         );
 
-        let log = self.log.clone();
         let extent = self.get_opened_extent_mut(eid);
-        extent.flush(flush_number, gen_number, job_id, &log).await?;
+        extent.flush(flush_number, gen_number, job_id).await?;
 
         Ok(())
     }
@@ -917,9 +964,8 @@ impl Region {
         cdt::os__flush__start!(|| job_id.0);
 
         // Select extents we're going to flush, while respecting the
-        // extent_limit if one was provided.  This must be ordered, because
-        // we're going to walk through the extent slice.
-        let dirty_extents: BTreeSet<usize> = match extent_limit {
+        // extent_limit if one was provided.
+        let dirty_extents: Vec<usize> = match extent_limit {
             None => self.dirty_extents.iter().copied().collect(),
             Some(el) => {
                 if el > self.def.extent_count().try_into().unwrap() {
@@ -934,59 +980,30 @@ impl Region {
             }
         };
 
-        // This is a bit sneaky: we want to perform each flush in a separate
-        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
-        // multiple times.  In addition, we can't use the tokio thread pool to
-        // spawn a task, because that requires a 'static lifetime, which we
-        // can't get from a borrowed Extent.
-        //
-        // We'll combine two tricks to work around the issue:
-        // - Do the work in the rayon thread pool instead of using tokio tasks
-        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
-        //   multiple at the same time.
-        let mut results = vec![Ok(()); dirty_extents.len()];
-        let log = self.log.clone();
-        let mut f = || {
-            let mut slice_start = 0;
-            let mut slice = self.extents.as_mut_slice();
-            let h = tokio::runtime::Handle::current();
-            rayon::scope(|s| {
-                for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
-                    let next = eid - slice_start;
-                    slice = &mut slice[next..];
-                    let (extent, rest) = slice.split_first_mut().unwrap();
-                    let ExtentState::Opened(extent) = extent else {
-                        panic!("can't flush closed extent");
-                    };
-                    slice = rest;
-                    slice_start += next + 1;
-                    let log = log.clone();
-                    s.spawn(|_| {
-                        h.block_on(async move {
-                            *r = extent
-                                .flush(flush_number, gen_number, job_id, &log)
-                                .await
-                        });
-                    });
-                }
-            })
-        };
-        if matches!(
-            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        ) {
-            tokio::task::block_in_place(f)
-        } else {
-            f()
+        // We'll store the futures in a Vec here (rather than something fancy
+        // like a FuturesUnordered or FuturesOrdered), because they're simply
+        // the `Receiver` end of a `oneshot`.  Once we kick them off, the
+        // futures are fully autonomous; because they're not driven to
+        // completion by the `await` in this function, we can use a plain `Vec`
+        // (which has much better performance)
+        let mut fut = Vec::with_capacity(dirty_extents.len());
+        let mut got_err = None;
+        for eid in &dirty_extents {
+            let e = self.get_opened_extent_mut(*eid);
+            fut.push(e.submit_flush(flush_number, gen_number, job_id).await);
+        }
+
+        // Process all of the futures, storing the last error in `got_err`
+        for f in fut {
+            if let Err(e) = f.await {
+                got_err = Some(e);
+            }
         }
 
         cdt::os__flush__done!(|| job_id.0);
 
-        for result in results {
-            // If any extent flush failed, then return that as an error. Because
-            // the results were all collected above, each extent flush has
-            // completed at this point.
-            result?;
+        if let Some(err) = got_err {
+            return Err(err);
         }
 
         // Now everything has succeeded, we can remove these extents from the
@@ -2627,7 +2644,7 @@ pub(crate) mod test {
         // A write of some sort only wrote a block context row and dirty flag
         {
             let ext = region.get_opened_extent_mut(0);
-            ext.set_dirty_and_block_context(&DownstairsBlockContext {
+            ext.set_dirty_and_block_context(DownstairsBlockContext {
                 block_context: BlockContext {
                     encryption_context: None,
                     hash: 1024,
