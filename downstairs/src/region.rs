@@ -4,12 +4,16 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::fs::{rename, File, OpenOptions};
+use std::future::Future;
 use std::io::{IoSlice, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
-use futures::TryStreamExt;
+use futures::{
+    future::{ready, Either},
+    TryStreamExt,
+};
 
 use tracing::instrument;
 
@@ -697,21 +701,24 @@ impl Region {
         Ok(())
     }
 
-    #[instrument]
-    pub async fn region_write(
+    pub async fn submit_region_write(
         &mut self,
         writes: &[crucible_protocol::Write],
         job_id: JobId,
         only_write_unwritten: bool,
-    ) -> Result<(), CrucibleError> {
+    ) -> impl Future<Output = Result<(), CrucibleError>> {
         if self.read_only {
-            crucible_bail!(ModifyingReadOnlyRegion);
+            return Either::Left(ready(Err(
+                CrucibleError::ModifyingReadOnlyRegion,
+            )));
         }
 
         /*
          * Before anything, validate hashes
          */
-        self.validate_hashes(writes)?;
+        if let Err(e) = self.validate_hashes(writes) {
+            return Either::Left(ready(Err(e)));
+        }
 
         /*
          * Batch writes so they can all be sent to the appropriate extent
@@ -731,34 +738,52 @@ impl Region {
         } else {
             cdt::os__write__start!(|| job_id.0);
         }
+        let mut jobs = Vec::with_capacity(batched_writes.len());
         for eid in batched_writes.keys() {
             let extent = self.get_opened_extent_mut(*eid);
             let writes = batched_writes.get(eid).unwrap();
-            extent
-                .write(job_id, &writes[..], only_write_unwritten)
-                .await?;
+            jobs.push(
+                extent
+                    .submit_write(job_id, &writes[..], only_write_unwritten)
+                    .await,
+            );
         }
 
         // Mark any extents we sent a write-command to as potentially dirty
         self.dirty_extents.extend(batched_writes.keys());
 
-        if only_write_unwritten {
-            cdt::os__writeunwritten__done!(|| job_id.0);
-        } else {
-            cdt::os__write__done!(|| job_id.0);
-        }
-
-        Ok(())
+        Either::Right(async move {
+            for r in jobs {
+                r.await?;
+            }
+            if only_write_unwritten {
+                cdt::os__writeunwritten__done!(|| job_id.0);
+            } else {
+                cdt::os__write__done!(|| job_id.0);
+            }
+            Ok(())
+        })
     }
 
     #[instrument]
-    pub async fn region_read(
+    pub async fn region_write(
+        &mut self,
+        writes: &[crucible_protocol::Write],
+        job_id: JobId,
+        only_write_unwritten: bool,
+    ) -> Result<(), CrucibleError> {
+        self.submit_region_write(writes, job_id, only_write_unwritten)
+            .await
+            .await
+    }
+
+    pub async fn submit_region_read(
         &mut self,
         requests: &[crucible_protocol::ReadRequest],
         job_id: JobId,
-    ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        let mut responses = Vec::with_capacity(requests.len());
-
+    ) -> impl Future<
+        Output = Result<Vec<crucible_protocol::ReadResponse>, CrucibleError>,
+    > {
         /*
          * Batch reads so they can all be sent to the appropriate extent
          * together.
@@ -771,14 +796,16 @@ impl Region {
         let mut batched_reads = Vec::with_capacity(requests.len());
 
         cdt::os__read__start!(|| job_id.0);
+        let mut jobs = Vec::with_capacity(requests.len());
         for request in requests {
             if let Some(_eid) = eid {
                 if request.eid == _eid {
                     batched_reads.push(request.clone());
                 } else {
                     let extent = self.get_opened_extent_mut(_eid as usize);
-                    responses
-                        .extend(extent.read(job_id, &batched_reads[..]).await?);
+                    jobs.push(
+                        extent.submit_read(job_id, &batched_reads[..]).await,
+                    );
 
                     eid = Some(request.eid);
                     batched_reads.clear();
@@ -793,11 +820,26 @@ impl Region {
 
         if let Some(_eid) = eid {
             let extent = self.get_opened_extent_mut(_eid as usize);
-            responses.extend(extent.read(job_id, &batched_reads[..]).await?);
+            jobs.push(extent.submit_read(job_id, &batched_reads[..]).await);
         }
-        cdt::os__read__done!(|| job_id.0);
 
-        Ok(responses)
+        let mut responses = Vec::with_capacity(requests.len());
+        async move {
+            for r in jobs {
+                responses.extend(r.await?);
+            }
+            cdt::os__read__done!(|| job_id.0);
+            Ok(responses)
+        }
+    }
+
+    #[instrument]
+    pub async fn region_read(
+        &mut self,
+        requests: &[crucible_protocol::ReadRequest],
+        job_id: JobId,
+    ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
+        self.submit_region_read(requests, job_id).await.await
     }
 
     /*
