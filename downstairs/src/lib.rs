@@ -2533,6 +2533,23 @@ impl Work {
         }
     }
 
+    /// Count the number of unfinished deps for the given IOop
+    fn unfinished_deps(&self, io: &IOop) -> usize {
+        // The Downstairs currently assumes that all jobs previous to the
+        // last flush have completed, hence the comparison against
+        // `self.last_flush`
+        //
+        // Currently, `work.completed` is cleared out when
+        // `Downstairs::complete_work` (or `complete` in mod test) is called
+        // with a FlushAck, so this comparison cannot be removed unless that
+        // is changed too.
+        io.deps()
+            .iter()
+            .cloned()
+            .filter(|d| *d > self.last_flush && !self.completed.contains(d))
+            .count()
+    }
+
     /// Removes and returns all work whose dependencies are met
     ///
     /// After this function returns, the work must either be completed or
@@ -2541,21 +2558,7 @@ impl Work {
     fn take_ready_work(&mut self, log: &Logger) -> Vec<(JobId, IOop)> {
         let mut ready = vec![];
         for (ds_id, io) in &self.active {
-            // The Downstairs currently assumes that all jobs previous to the
-            // last flush have completed, hence the comparison against
-            // `self.last_flush`
-            //
-            // Currently, `work.completed` is cleared out when
-            // `Downstairs::complete_work` (or `complete` in mod test) is called
-            // with a FlushAck, so this comparison cannot be removed unless that
-            // is changed too.
-            let num_deps = io
-                .deps()
-                .iter()
-                .cloned()
-                .filter(|d| *d > self.last_flush && !self.completed.contains(d))
-                .count();
-
+            let num_deps = self.unfinished_deps(io);
             if num_deps == 0 {
                 ready.push(*ds_id);
             } else {
