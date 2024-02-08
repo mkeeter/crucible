@@ -4,7 +4,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -381,8 +380,8 @@ pub fn show_work(ds: &mut Downstairs) {
                     }
                 };
                 println!(
-                    "DSW:[{:04}] {:>07} {:>05} deps:{:?}",
-                    id, dsw_type, dsw.state, dep_list,
+                    "DSW:[{:04}] {:>07} deps:{:?}",
+                    id, dsw_type, dep_list,
                 );
             }
         }
@@ -1906,11 +1905,7 @@ impl Downstairs {
             }
         }
 
-        let dsw = DownstairsWork {
-            ds_id,
-            work,
-            state: WorkState::New,
-        };
+        let dsw = DownstairsWork { ds_id, work };
 
         let up = &mut self.connections.get_mut(&target).unwrap();
         up.work_mut().unwrap().add_work(ds_id, dsw);
@@ -2555,7 +2550,6 @@ pub struct Work {
 struct DownstairsWork {
     ds_id: JobId,
     work: IOop,
-    state: WorkState,
 }
 
 impl Work {
@@ -2576,9 +2570,7 @@ impl Work {
         let mut result = Vec::with_capacity(self.active.len());
 
         for job in self.active.values() {
-            if job.state == WorkState::New || job.state == WorkState::DepWait {
-                result.push(job.ds_id);
-            }
+            result.push(job.ds_id);
         }
 
         result.sort_unstable();
@@ -2609,139 +2601,81 @@ impl Work {
         ds_id: JobId,
         log: Logger,
     ) -> Option<DownstairsWork> {
-        let Some(mut job) = self.active.remove(&ds_id) else {
+        let Some(job) = self.active.remove(&ds_id) else {
             panic!("can't call in_progress on missing job");
         };
 
-        if job.state == WorkState::New || job.state == WorkState::DepWait {
-            /*
-             * Before we can make this in_progress, we have to, while
-             * holding this locked, check the dep list if there is one
-             * and make sure all dependencies are completed.
-             */
-            let dep_list = job.work.deps();
+        /*
+         * Before we can make this in_progress, we have to, while
+         * holding this locked, check the dep list if there is one
+         * and make sure all dependencies are completed.
+         */
+        let dep_list = job.work.deps();
 
-            /*
-             * See which of our dependencies are met.
-             * XXX Make this better/faster by removing the ones that
-             * are met, so next lap we don't have to check again?  There
-             * may be some debug value to knowing what the dep list was,
-             * so consider that before making this faster.
-             */
-            let mut deps_outstanding: Vec<JobId> =
-                Vec::with_capacity(dep_list.len());
+        /*
+         * See which of our dependencies are met.
+         * XXX Make this better/faster by removing the ones that
+         * are met, so next lap we don't have to check again?  There
+         * may be some debug value to knowing what the dep list was,
+         * so consider that before making this faster.
+         */
+        let mut deps_outstanding: Vec<JobId> =
+            Vec::with_capacity(dep_list.len());
 
-            for dep in dep_list.iter() {
-                // The Downstairs currently assumes that all jobs previous
-                // to the last flush have completed, hence this early out.
-                //
-                // Currently `work.completed` is cleared out when
-                // `Downstairs::complete_work` (or `complete` in mod test)
-                // is called with a FlushAck so this early out cannot be
-                // removed unless that is changed too.
-                if dep <= &self.last_flush {
-                    continue;
-                }
-
-                if !self.completed.contains(dep) {
-                    deps_outstanding.push(*dep);
-                }
+        for dep in dep_list.iter() {
+            // The Downstairs currently assumes that all jobs previous
+            // to the last flush have completed, hence this early out.
+            //
+            // Currently `work.completed` is cleared out when
+            // `Downstairs::complete_work` (or `complete` in mod test)
+            // is called with a FlushAck so this early out cannot be
+            // removed unless that is changed too.
+            if dep <= &self.last_flush {
+                continue;
             }
 
-            if !deps_outstanding.is_empty() {
-                let print = if let Some(existing_outstanding_deps) =
-                    self.outstanding_deps.get(&ds_id)
-                {
-                    *existing_outstanding_deps != deps_outstanding.len()
-                } else {
-                    false
-                };
+            if !self.completed.contains(dep) {
+                deps_outstanding.push(*dep);
+            }
+        }
 
-                if print {
-                    warn!(
-                        log,
-                        "{} job {} waiting on {} deps",
-                        ds_id,
-                        match &job.work {
-                            IOop::Write { .. } => "Write",
-                            IOop::WriteUnwritten { .. } => "WriteUnwritten",
-                            IOop::Flush { .. } => "Flush",
-                            IOop::Read { .. } => "Read",
-                            IOop::ExtentClose { .. } => "ECLose",
-                            IOop::ExtentFlushClose { .. } => "EFlushCLose",
-                            IOop::ExtentLiveRepair { .. } => "ELiveRepair",
-                            IOop::ExtentLiveReopen { .. } => "ELiveReopen",
-                            IOop::ExtentLiveNoOp { .. } => "NoOp",
-                        },
-                        deps_outstanding.len(),
-                    );
-                }
+        if !deps_outstanding.is_empty() {
+            let print = if let Some(existing_outstanding_deps) =
+                self.outstanding_deps.get(&ds_id)
+            {
+                *existing_outstanding_deps != deps_outstanding.len()
+            } else {
+                false
+            };
 
-                let _ =
-                    self.outstanding_deps.insert(ds_id, deps_outstanding.len());
-
-                /*
-                 * If we got here, then the dep is not met.
-                 * Set DepWait if not already set.
-                 */
-                if job.state == WorkState::New {
-                    job.state = WorkState::DepWait;
-                }
-
-                // Return the job to the map
-                self.active.insert(ds_id, job);
-                return None;
+            if print {
+                warn!(
+                    log,
+                    "{} job {} waiting on {} deps",
+                    ds_id,
+                    match &job.work {
+                        IOop::Write { .. } => "Write",
+                        IOop::WriteUnwritten { .. } => "WriteUnwritten",
+                        IOop::Flush { .. } => "Flush",
+                        IOop::Read { .. } => "Read",
+                        IOop::ExtentClose { .. } => "ECLose",
+                        IOop::ExtentFlushClose { .. } => "EFlushCLose",
+                        IOop::ExtentLiveRepair { .. } => "ELiveRepair",
+                        IOop::ExtentLiveReopen { .. } => "ELiveReopen",
+                        IOop::ExtentLiveNoOp { .. } => "NoOp",
+                    },
+                    deps_outstanding.len(),
+                );
             }
 
-            /*
-             * We had no dependencies, or they are all completed, we
-             * can go ahead and work on this job.
-             */
-            job.state = WorkState::InProgress;
+            let _ = self.outstanding_deps.insert(ds_id, deps_outstanding.len());
 
-            Some(job)
-        } else if job.state == WorkState::InProgress {
-            // A previous call of this function put this job in progress, but
-            // something went wrong and the job ended up back in the map. We've
-            // taken it out again and will return it again for a second try.
-            Some(job)
-        } else {
-            // job id is not new, we can't run it; return the job to the map
+            // Return the job to the map
             self.active.insert(ds_id, job);
-            None
+            return None;
         }
-    }
-}
 
-/*
- * XXX We may not need Done. At the moment all we actually look at is New or
- * InProgress.
- */
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Clone, PartialEq)]
-pub enum WorkState {
-    New,
-    DepWait,
-    InProgress,
-    Done,
-}
-
-impl fmt::Display for WorkState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WorkState::New => {
-                write!(f, " New")
-            }
-            WorkState::DepWait => {
-                write!(f, "DepW")
-            }
-            WorkState::InProgress => {
-                write!(f, "In P")
-            }
-            WorkState::Done => {
-                write!(f, "Done")
-            }
-        }
+        Some(job)
     }
 }
 
@@ -3097,7 +3031,6 @@ mod test {
                         }],
                     }
                 },
-                state: WorkState::New,
             },
         );
     }
@@ -3111,7 +3044,6 @@ mod test {
                     dependencies: deps,
                     writes: Vec::with_capacity(1),
                 },
-                state: WorkState::New,
             },
         );
     }
@@ -3158,7 +3090,6 @@ mod test {
             let ds_work = work.in_progress(*new_id, csl());
             match ds_work {
                 Some(ds_work) => {
-                    assert_eq!(ds_work.state, WorkState::InProgress);
                     jobs.push(ds_work);
                 }
                 None => {
@@ -4081,14 +4012,7 @@ mod test {
     fn test_misc_work_through_work_queue(ds_id: JobId, ioop: IOop) {
         // Verify that a IOop work request will move through the work queue.
         let mut work = Work::new();
-        work.add_work(
-            ds_id,
-            DownstairsWork {
-                ds_id,
-                work: ioop,
-                state: WorkState::New,
-            },
-        );
+        work.add_work(ds_id, DownstairsWork { ds_id, work: ioop });
 
         assert_eq!(work.new_work(), vec![ds_id]);
 
@@ -4461,10 +4385,6 @@ mod test {
         assert!(work.completed.is_empty());
 
         assert_eq!(work.new_work(), vec![JobId(1003)]);
-        assert_eq!(
-            work.active.get(&JobId(1003)).unwrap().state,
-            WorkState::DepWait
-        );
     }
 
     #[test]
@@ -5359,11 +5279,9 @@ mod test {
 
         assert_eq!(job_1.ds_id, JobId(1000));
         assert_eq!(job_1.work, read_1);
-        assert_eq!(job_1.state, WorkState::New);
 
         assert_eq!(job_2.ds_id, JobId(1000));
         assert_eq!(job_2.work, read_2);
-        assert_eq!(job_2.state, WorkState::New);
 
         Ok(())
     }
