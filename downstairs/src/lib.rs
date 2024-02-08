@@ -531,7 +531,7 @@ pub mod cdt {
 
 async fn socket_io_task(
     stream: WrappedStream,
-    tx_to_main_task: mpsc::Sender<DownstairsRequest>,
+    tx_to_main_task: mpsc::Sender<Action>,
     log: Logger,
 ) {
     match stream {
@@ -581,7 +581,7 @@ struct NewConnectionReply {
 async fn socket_io_loop<RT, WT>(
     mut fr: FramedRead<RT, CrucibleDecoder>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
-    tx_to_main_task: mpsc::Sender<DownstairsRequest>,
+    tx_to_main_task: mpsc::Sender<Action>,
     log: Logger,
 ) where
     RT: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send + 'static,
@@ -631,7 +631,7 @@ async fn socket_io_loop<RT, WT>(
     // connection ID for us.
     let (done, rx) = oneshot::channel();
     if let Err(e) = tx_to_main_task
-        .send(DownstairsRequest::Connection(NewConnectionRequest {
+        .send(Action::NewConnection(NewConnectionRequest {
             upstairs_connection,
             done,
         }))
@@ -652,7 +652,7 @@ async fn socket_io_loop<RT, WT>(
 
     // Send the very first message (HereIAm) to the main task
     if let Err(e) = tx_to_main_task
-        .send(DownstairsRequest::Message { msg, connection_id })
+        .send(Action::Message(msg, connection_id))
         .await
     {
         error!(rx_log, "failed to send message to main task: {e:?}");
@@ -662,18 +662,29 @@ async fn socket_io_loop<RT, WT>(
     // The rx task **mostly** just decodes and forwards messages to the
     // Downstairs task.
     let mut rx_task = tokio::task::spawn(async move {
-        while let Some(msg) = fr.next().await {
-            let msg = match msg {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!(rx_log, "got invalid message: {e}");
-                    break;
+        let mut timeout_deadline = deadline_secs(50);
+        loop {
+            let m = tokio::select! {
+                r = fr.next() => {
+                    let msg = match r {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(e)) => {
+                            error!(rx_log, "got invalid message: {e}");
+                            break;
+                        }
+                        None => {
+                            error!(rx_log, "rx channel closed");
+                            break;
+                        }
+                    };
+                    timeout_deadline = deadline_secs(50);
+                    Action::Message( msg, connection_id )
+                }
+                _ = sleep_until(timeout_deadline) => {
+                    Action::Timeout(connection_id)
                 }
             };
-            if let Err(e) = tx_to_main_task
-                .send(DownstairsRequest::Message { msg, connection_id })
-                .await
-            {
+            if let Err(e) = tx_to_main_task.send(m).await {
                 error!(rx_log, "failed to send message to main task: {e}");
                 break;
             }
@@ -804,9 +815,6 @@ struct Upstairs {
     /// (messages are received on the shared `Downstairs` channel)
     message_tx: mpsc::Sender<Message>,
 
-    /// Deadline at which point we declare this Upstairs dead
-    timeout_deadline: tokio::time::Instant,
-
     log: Logger,
 }
 
@@ -876,7 +884,7 @@ pub struct Downstairs {
     pub repair_address: Option<SocketAddr>,
 
     /// Queue to receive new messages, tagged with their connection
-    rx: mpsc::Receiver<DownstairsRequest>,
+    rx: mpsc::Receiver<Action>,
 
     /// Indicates that the socket listener and all IO tasks are done
     done: bool,
@@ -884,20 +892,9 @@ pub struct Downstairs {
     log: Logger,
 }
 
-/// All messages to the Downstairs come through this channel
-enum DownstairsRequest {
-    /// We have received a message from the given socket connection
-    Message {
-        msg: Message,
-        connection_id: ConnectionId,
-    },
-    /// We have received a connection request from the main socket listener
-    Connection(NewConnectionRequest),
-}
-
 /// IO handle to communicate with the downstairs
 pub struct DownstairsIoHandle {
-    tx: mpsc::Sender<DownstairsRequest>,
+    tx: mpsc::Sender<Action>,
 }
 
 /// Actions that can be applied to the [`Downstairs`]
@@ -965,34 +962,11 @@ impl Downstairs {
 
     /// Selects from many possible actions
     async fn select(&mut self) -> Action {
-        // Pick the next timeout among the various upstairs connections
-        let next_timeout = self
-            .connections
-            .iter()
-            .min_by_key(|(_id, up)| up.timeout_deadline);
-
-        tokio::select! {
-            r = self.rx.recv() => {
-                match r {
-                    Some(DownstairsRequest::Message { msg, connection_id }) =>
-                        Action::Message(msg, connection_id),
-                    Some(DownstairsRequest::Connection(r)) =>
-                        Action::NewConnection(r),
-                    None => {
-                        warn!(self.log, "downstairs tx was dropped");
-                        Action::RxChannelClosed
-                    }
-                }
-            }
-            timeout_id = async move {
-                if let Some((id, t)) = next_timeout {
-                    sleep_until(t.timeout_deadline).await;
-                    id
-                } else {
-                    futures::future::pending().await
-                }
-            } => {
-                Action::Timeout(*timeout_id)
+        match self.rx.recv().await {
+            Some(m) => m,
+            None => {
+                warn!(self.log, "downstairs tx was dropped");
+                Action::RxChannelClosed
             }
         }
     }
@@ -1011,7 +985,6 @@ impl Downstairs {
                         },
                         upstairs_connection: req.upstairs_connection,
                         message_tx: tx,
-                        timeout_deadline: deadline_secs(5),
                         log: self.log.new(
                             o!("upstairs" => format!("{}", connection_id.0)),
                         ),
@@ -1199,11 +1172,6 @@ impl Downstairs {
             );
             return Ok(()); // the connection isn't present, so we can't drop it
         };
-
-        // Don't wait more than 50 seconds to hear from the other side.
-        // XXX Timeouts, timeouts: always wrong!  Some too short and
-        // some too long.
-        up.timeout_deadline = deadline_secs(50);
 
         // Special handling for messages which require an immediate reply
         let upstairs_connection = up.upstairs_connection();
@@ -3084,7 +3052,6 @@ mod test {
             state,
             upstairs_connection,
             message_tx: tx,
-            timeout_deadline: deadline_secs(10),
             log: log.new(o!("role" => "test_upstairs")),
         }
     }
