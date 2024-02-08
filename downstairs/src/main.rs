@@ -353,7 +353,7 @@ async fn main() -> Result<()> {
             }
 
             let read_only = mode == Mode::Ro;
-            let d = build_downstairs_for_region(
+            let (ds, chan) = build_downstairs_for_region(
                 &data,
                 lossy,
                 read_errors,
@@ -364,8 +364,9 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            let downstairs_join_handle = start_downstairs(
-                d,
+            let (_socket_addr, downstairs_join_handle) = start_downstairs(
+                ds,
+                chan,
                 address,
                 oximeter,
                 port,

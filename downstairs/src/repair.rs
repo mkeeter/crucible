@@ -41,7 +41,7 @@ fn build_api() -> ApiDescription<Arc<FileServerContext>> {
 
 /// Returns Ok(listen address) if everything launched ok, Err otherwise
 pub async fn repair_main(
-    ds: &Mutex<Downstairs>,
+    region_dir: PathBuf,
     addr: SocketAddr,
     log: &Logger,
 ) -> Result<SocketAddr, String> {
@@ -58,14 +58,6 @@ pub async fn repair_main(
      * Build a description of the API
      */
     let api = build_api();
-
-    /*
-     * Record the region directory where all the extents and metadata
-     * files live.
-     */
-    let ds = ds.lock().await;
-    let region_dir = ds.region.dir.clone();
-    drop(ds);
 
     let context = FileServerContext { region_dir };
 
