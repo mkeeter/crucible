@@ -530,10 +530,8 @@ pub mod cdt {
 }
 
 async fn socket_io_task(
-    connection_id: ConnectionId,
     stream: WrappedStream,
-    tx_to_main_task: mpsc::Sender<(Message, ConnectionId)>,
-    rx_from_main_task: mpsc::Receiver<Message>,
+    downstairs_req: mpsc::Sender<NewConnectionRequest>,
     log: Logger,
 ) {
     match stream {
@@ -543,15 +541,7 @@ async fn socket_io_task(
             let fr = FramedRead::new(read, CrucibleDecoder::new());
             let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            socket_io_loop(
-                connection_id,
-                fr,
-                fw,
-                tx_to_main_task,
-                rx_from_main_task,
-                log,
-            )
-            .await
+            socket_io_loop(fr, fw, downstairs_req, log).await
         }
         WrappedStream::Https(stream) => {
             let (read, write) = tokio::io::split(stream);
@@ -559,15 +549,7 @@ async fn socket_io_task(
             let fr = FramedRead::new(read, CrucibleDecoder::new());
             let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            socket_io_loop(
-                connection_id,
-                fr,
-                fw,
-                tx_to_main_task,
-                rx_from_main_task,
-                log,
-            )
-            .await
+            socket_io_loop(fr, fw, downstairs_req, log).await
         }
     }
 }
@@ -580,16 +562,28 @@ pub struct UpstairsConnection {
     gen: u64,
 }
 
+/// Request for a new connection from the `socket_io_loop`
+struct NewConnectionRequest {
+    upstairs_connection: UpstairsConnection,
+    done: oneshot::Sender<NewConnectionReply>,
+}
+
+/// Connection data returned to a `socket_io_loop` by the `Downstairs` task
+struct NewConnectionReply {
+    connection_id: ConnectionId,
+
+    tx_to_main_task: mpsc::Sender<(Message, ConnectionId)>,
+    rx_from_main_task: mpsc::Receiver<Message>,
+}
+
 /// Handles IO to and from the socket
 ///
 /// Under the hood, this spawns a separate task to receive data from the socket,
 /// to avoid blocking if either direction gets too clogged.
 async fn socket_io_loop<RT, WT>(
-    connection_id: ConnectionId,
     mut fr: FramedRead<RT, CrucibleDecoder>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
-    tx_to_main_task: mpsc::Sender<(Message, ConnectionId)>,
-    mut rx_from_main_task: mpsc::Receiver<Message>,
+    downstairs_req: mpsc::Sender<NewConnectionRequest>,
     log: Logger,
 ) where
     RT: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send + 'static,
@@ -598,67 +592,87 @@ async fn socket_io_loop<RT, WT>(
         + std::marker::Send
         + 'static,
 {
-    let (response_tx, mut rx_from_tx_task) = mpsc::channel::<Message>(500);
     let rx_log = log.new(o!("role" => "rx".to_string()));
 
-    // The rx task **mostly** just decodes and forwards messages to the
-    // Downstairs task.  There are two exceptions:
-    //
-    // - Ping (Ruok) messages are replied to immediately
-    // - Messages with upstairs_id and session_id are validated here
-    let mut rx_task = tokio::task::spawn(async move {
-        let mut upstairs_connection = None;
-        loop {
-            while let Some(m) = fr.next().await {
-                let m = match m {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!(rx_log, "got invalid message: {e}");
-                        break;
-                    }
-                };
-                // Snoop on the incoming message stream to learn upstairs_id and
-                // session_id (so that we can check against them later)
-                if let Message::HereIAm {
-                    upstairs_id,
-                    session_id,
-                    gen,
-                    ..
-                } = &m
-                {
-                    upstairs_connection = Some(UpstairsConnection {
+    // We start by listening for `Message::HereIAm`, which should be sent by the
+    // Upstairs right away upon connecting.
+    let (upstairs_connection, msg) = loop {
+        let m = fr.next().await;
+        match &m {
+            None => {
+                warn!(rx_log, "FramedRead disconnected before HereIAm");
+                return;
+            }
+            Some(Err(e)) => {
+                warn!(rx_log, "FramedRead got error before HereIAm: {e}");
+                return;
+            }
+            Some(Ok(Message::HereIAm {
+                upstairs_id,
+                session_id,
+                gen,
+                ..
+            })) => {
+                // ladies and gentlemen, we got it
+                break (
+                    UpstairsConnection {
                         upstairs_id: *upstairs_id,
                         session_id: *session_id,
                         gen: *gen,
-                    });
+                    },
+                    m.unwrap().unwrap(),
+                );
+            }
+            Some(Ok(_)) => {
+                // ignore other messages
+            }
+        }
+    };
+
+    // Now that we've got our connection, ask the Downstairs to allocate a
+    // connection ID for us.
+    let (done, rx) = oneshot::channel();
+    if let Err(e) = downstairs_req
+        .send(NewConnectionRequest {
+            upstairs_connection,
+            done,
+        })
+        .await
+    {
+        warn!(rx_log, "could not send setup req to Downstairs: {e:?}");
+        return;
+    }
+
+    let Ok(NewConnectionReply {
+        connection_id,
+        tx_to_main_task,
+        mut rx_from_main_task,
+    }) = rx.await
+    else {
+        warn!(rx_log, "could not get setup reply from Downstairs");
+        return;
+    };
+
+    // Send the very first message (HereIAm) to the main task
+    if let Err(e) = tx_to_main_task.send((msg, connection_id)).await {
+        error!(rx_log, "failed to send message to main task: {e:?}");
+        return;
+    }
+
+    // The rx task **mostly** just decodes and forwards messages to the
+    // Downstairs task.
+    let mut rx_task = tokio::task::spawn(async move {
+        while let Some(m) = fr.next().await {
+            let m = match m {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(rx_log, "got invalid message: {e}");
+                    break;
                 }
-                // If this is a message with an upstairs / session ID, then
-                // check them against our UpstairsConnection
-                match check_incoming_message(m, upstairs_connection.as_ref()) {
-                    Ok(m) => {
-                        if let Err(e) =
-                            tx_to_main_task.send((m, connection_id)).await
-                        {
-                            error!(
-                                rx_log,
-                                "failed to send message to main task: {e}"
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // The incoming message requires an immediate reply and
-                        // should not be handled by the main Downstairs task.
-                        // Send the reply to the IO socket task directly.
-                        if let Err(e) = response_tx.send(e).await {
-                            error!(
-                                rx_log,
-                                "failed to send error to tx task: {e}"
-                            );
-                            break;
-                        }
-                    }
-                }
+            };
+            if let Err(e) = tx_to_main_task.send((m, connection_id)).await {
+                error!(rx_log, "failed to send message to main task: {e}");
+                break;
             }
         }
     });
@@ -680,16 +694,6 @@ async fn socket_io_loop<RT, WT>(
                     break;
                 }
             }
-            m = rx_from_tx_task.recv() => {
-                let Some(m) = m else {
-                    warn!(log, "rx_from_tx_task closed, exiting");
-                    break;
-                };
-                if let Err(e) = fw.send(m).await {
-                    error!(log, "could not send packet: {e}");
-                    break;
-                }
-            }
         }
     }
 
@@ -702,83 +706,72 @@ async fn socket_io_loop<RT, WT>(
 /// `Err(e)` if we should reply to the message immediately
 fn check_incoming_message(
     msg: Message,
-    upstairs_connection: Option<&UpstairsConnection>,
+    upstairs_connection: UpstairsConnection,
 ) -> Result<Message, Message> {
-    // Reply immediately to pings, regardless of UpstairsConnection state
-    if matches!(&msg, Message::Ruok) {
-        return Err(Message::Imok);
-    }
+    match &msg {
+        Message::Ruok => Err(Message::Imok),
 
-    if let Some(upstairs_connection) = upstairs_connection {
-        match &msg {
-            Message::Ruok => Err(Message::Imok),
-
-            // Check upstairs and session ID for mismatches
-            Message::Write {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::Flush {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::WriteUnwritten {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::ReadRequest {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::ExtentLiveClose {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::ExtentLiveFlushClose {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::ExtentLiveRepair {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::ExtentLiveReopen {
-                upstairs_id,
-                session_id,
-                ..
-            }
-            | Message::ExtentLiveNoOp {
-                upstairs_id,
-                session_id,
-                ..
-            } => {
-                if upstairs_connection.upstairs_id != *upstairs_id {
-                    Err(Message::UuidMismatch {
-                        expected_id: upstairs_connection.upstairs_id,
-                    })
-                } else if upstairs_connection.session_id != *session_id {
-                    Err(Message::UuidMismatch {
-                        expected_id: upstairs_connection.session_id,
-                    })
-                } else {
-                    Ok(msg)
-                }
-            }
-
-            // All other messages are handled by the Downstairs
-            _ => Ok(msg),
+        // Check upstairs and session ID for mismatches
+        Message::Write {
+            upstairs_id,
+            session_id,
+            ..
         }
-    } else {
-        // If we haven't learned our UpstairsConnection yet, always pass the
-        // message to the Downstairs task
-        Ok(msg)
+        | Message::Flush {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::WriteUnwritten {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::ReadRequest {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::ExtentLiveClose {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::ExtentLiveFlushClose {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::ExtentLiveRepair {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::ExtentLiveReopen {
+            upstairs_id,
+            session_id,
+            ..
+        }
+        | Message::ExtentLiveNoOp {
+            upstairs_id,
+            session_id,
+            ..
+        } => {
+            if upstairs_connection.upstairs_id != *upstairs_id {
+                Err(Message::UuidMismatch {
+                    expected_id: upstairs_connection.upstairs_id,
+                })
+            } else if upstairs_connection.session_id != *session_id {
+                Err(Message::UuidMismatch {
+                    expected_id: upstairs_connection.session_id,
+                })
+            } else {
+                Ok(msg)
+            }
+        }
+
+        // All other messages are handled by the Downstairs
+        _ => Ok(msg),
     }
 }
 
@@ -792,29 +785,8 @@ enum NegotiationState {
 
 #[derive(Debug)]
 enum UpstairsState {
-    Negotiating {
-        negotiated: NegotiationState,
-        upstairs_connection: Option<UpstairsConnection>,
-    },
-    Running {
-        work: Work,
-        upstairs_connection: UpstairsConnection,
-    },
-}
-
-impl UpstairsState {
-    fn upstairs_connection(&self) -> Option<&UpstairsConnection> {
-        match self {
-            UpstairsState::Negotiating {
-                upstairs_connection,
-                ..
-            } => upstairs_connection.as_ref(),
-            UpstairsState::Running {
-                upstairs_connection,
-                ..
-            } => Some(upstairs_connection),
-        }
-    }
+    Negotiating { negotiated: NegotiationState },
+    Running { work: Work },
 }
 
 /// Represents a single Upstairs connection
@@ -822,16 +794,12 @@ impl UpstairsState {
 struct Upstairs {
     state: UpstairsState,
 
+    upstairs_connection: UpstairsConnection,
+
     /// Handle to send messages to the dedicated socket IO task
     ///
     /// (messages are received on the shared `Downstairs` channel)
     message_tx: mpsc::Sender<Message>,
-
-    /// IO worker task handle
-    ///
-    /// This should not join until we exit; if it does join, it indicates an
-    /// error and that this Upstairs connection should be dropped.
-    io_task: tokio::task::JoinHandle<()>,
 
     /// Deadline at which point we declare this Upstairs dead
     timeout_deadline: tokio::time::Instant,
@@ -845,7 +813,7 @@ impl Upstairs {
     /// # Panics
     /// If this upstairs is still negotiating
     fn upstairs_connection(&self) -> UpstairsConnection {
-        *self.state.upstairs_connection().unwrap()
+        self.upstairs_connection
     }
 
     /// Returns a mutable reference to the work map for a running Upstairs
@@ -913,8 +881,8 @@ pub struct Downstairs {
     /// this queue, because they would pop out into the same task)
     message_tx_handle: mpsc::Sender<(Message, ConnectionId)>,
 
-    /// Queue to receive new connections
-    connection_rx: mpsc::Receiver<WrappedStream>,
+    /// Queue to receive new connections from the socket listener
+    connection_rx: mpsc::Receiver<NewConnectionRequest>,
 
     /// Marks whether `connection_rx` is still receiving values
     ///
@@ -927,13 +895,13 @@ pub struct Downstairs {
 
 /// IO handle to communicate with the downstairs
 pub struct DownstairsIoHandle {
-    stream_tx: mpsc::Sender<WrappedStream>,
+    stream_tx: mpsc::Sender<NewConnectionRequest>,
 }
 
 /// Actions that can be applied to the [`Downstairs`]
 enum Action {
     /// The socket has accepted a new connection
-    NewConnection(WrappedStream),
+    NewConnection(NewConnectionRequest),
 
     /// The given connection timed out
     Timeout(ConnectionId),
@@ -941,11 +909,8 @@ enum Action {
     /// We received a message on the given connection
     Message(Message, ConnectionId),
 
-    /// An invalid event was received and should be ignored
+    /// The main socket listener has dropped its end of the channel
     ConnectionChannelClosed,
-
-    /// The IO task stopped for the given connection
-    IoTaskStopped(ConnectionId),
 }
 
 /// Internal unique ID for each new connection
@@ -1008,9 +973,6 @@ impl Downstairs {
                     _ = sleep_until(up.timeout_deadline) => {
                         Action::Timeout(id)
                     }
-                    _ = &mut up.io_task => {
-                        Action::IoTaskStopped(id)
-                    }
                 }
             });
         }
@@ -1042,34 +1004,37 @@ impl Downstairs {
 
     async fn apply(&mut self, action: Action) {
         match action {
-            Action::NewConnection(stream) => {
+            Action::NewConnection(req) => {
                 let connection_id = self.next_connection_id();
                 let tx_to_main_task = self.message_tx_handle.clone();
                 let (tx, rx) = mpsc::channel(500);
-                let io_task = tokio::task::spawn(socket_io_task(
-                    connection_id,
-                    stream,
-                    tx_to_main_task,
-                    rx,
-                    self.log.new(o!("conn" => format!("{}", connection_id.0))),
-                ));
+
                 self.connections.insert(
                     connection_id,
                     Upstairs {
                         state: UpstairsState::Negotiating {
                             negotiated: NegotiationState::Start,
-                            upstairs_connection: None,
                         },
+                        upstairs_connection: req.upstairs_connection,
                         message_tx: tx,
-                        io_task,
                         timeout_deadline: deadline_secs(5),
                         log: self.log.new(
                             o!("upstairs" => format!("{}", connection_id.0)),
                         ),
                     },
                 );
-
-                // spawn IO task
+                if req
+                    .done
+                    .send(NewConnectionReply {
+                        connection_id,
+                        tx_to_main_task,
+                        rx_from_main_task: rx,
+                    })
+                    .is_err()
+                {
+                    error!(self.log, "io task ignored our reply");
+                    self.connections.remove(&connection_id);
+                }
             }
             Action::Message(m, id) => {
                 let r = self.handle_message(m, id).await;
@@ -1080,10 +1045,6 @@ impl Downstairs {
             }
             Action::Timeout(id) => {
                 warn!(self.log, "got timeout from connection {id:?}");
-                self.drop_connection(id);
-            }
-            Action::IoTaskStopped(id) => {
-                warn!(self.log, "IO task for connection {id:?} stopped");
                 self.drop_connection(id);
             }
             Action::ConnectionChannelClosed => {
@@ -1104,23 +1065,24 @@ impl Downstairs {
         let up = self.connections.remove(&id).unwrap();
         warn!(up.log, "removing connection {id:?}");
 
-        if let Some(uc) = up.state.upstairs_connection() {
-            warn!(
-                up.log,
-                "removing possibly-active upstairs for {id:?}: {uc:?}"
-            );
-            self.active_upstairs.remove(&uc.upstairs_id);
-        }
-
-        if let UpstairsState::Running {
-            work,
-            upstairs_connection,
-        } = up.state
+        if self
+            .active_upstairs
+            .remove(&up.upstairs_connection.upstairs_id)
+            .is_some()
         {
             warn!(
                 up.log,
-                "dropping {} active jobs from {upstairs_connection:?}",
-                work.active.len()
+                "removing possibly-active upstairs for {id:?}: {:?}",
+                up.upstairs_connection.upstairs_id
+            );
+        }
+
+        if let UpstairsState::Running { work } = up.state {
+            warn!(
+                up.log,
+                "dropping {} active jobs from {:?}",
+                work.active.len(),
+                up.upstairs_connection
             );
         }
 
@@ -1251,6 +1213,22 @@ impl Downstairs {
         // some too long.
         up.timeout_deadline = deadline_secs(50);
 
+        // Special handling for messages which require an immediate reply
+        let upstairs_connection = up.upstairs_connection();
+        let m = match check_incoming_message(m, upstairs_connection) {
+            Ok(m) => m,
+            Err(e) => {
+                // The incoming message requires an immediate reply, so do that
+                //
+                // If we can't send the reply, then return an error (which will
+                // cause us to bail out of the connection)
+                if let Err(e) = up.message_tx.send(e).await {
+                    bail!("failed to send automatic reply to tx task: {e}");
+                }
+                return Ok(());
+            }
+        };
+
         match &mut up.state {
             UpstairsState::Negotiating { .. } => {
                 let r = self.continue_negotiation(m, target).await;
@@ -1280,11 +1258,7 @@ impl Downstairs {
         target: ConnectionId,
     ) -> Result<()> {
         let up = self.connections.get_mut(&target).unwrap();
-        let UpstairsState::Negotiating {
-            negotiated,
-            upstairs_connection,
-        } = &mut up.state
-        else {
+        let UpstairsState::Negotiating { negotiated } = &mut up.state else {
             panic!("invalid state");
         };
 
@@ -1385,15 +1359,20 @@ impl Downstairs {
                 }
 
                 *negotiated = NegotiationState::ConnectedToUpstairs;
-                *upstairs_connection = Some(UpstairsConnection {
-                    upstairs_id,
-                    session_id,
-                    gen,
-                });
+                // We created this Upstairs based on this same HereIAm message
+                // (in the socket_io_task), so it must match!
+                assert_eq!(
+                    up.upstairs_connection,
+                    UpstairsConnection {
+                        upstairs_id,
+                        session_id,
+                        gen,
+                    }
+                );
                 info!(
                     up.log,
                     "upstairs {:?} connected, version {}",
-                    upstairs_connection.unwrap(),
+                    up.upstairs_connection,
                     CRUCIBLE_MESSAGE_VERSION
                 );
 
@@ -1418,16 +1397,15 @@ impl Downstairs {
                 }
 
                 // Only allowed to promote or demote self
-                let mut upstairs_connection = upstairs_connection.unwrap();
-                let matches_self = upstairs_connection.upstairs_id
+                let matches_self = up.upstairs_connection.upstairs_id
                     == upstairs_id
-                    && upstairs_connection.session_id == session_id;
+                    && up.upstairs_connection.session_id == session_id;
 
                 if !matches_self {
                     if let Err(e) = up
                         .message_tx
                         .send(Message::UuidMismatch {
-                            expected_id: upstairs_connection.upstairs_id,
+                            expected_id: up.upstairs_connection.upstairs_id,
                         })
                         .await
                     {
@@ -1437,23 +1415,23 @@ impl Downstairs {
                         "Upstairs connection expected \
                          upstairs_id:{} session_id:{}; received \
                          upstairs_id:{} session_id:{}",
-                        upstairs_connection.upstairs_id,
-                        upstairs_connection.session_id,
+                        up.upstairs_connection.upstairs_id,
+                        up.upstairs_connection.session_id,
                         upstairs_id,
                         session_id
                     );
                 } else {
-                    if upstairs_connection.gen != gen {
+                    if up.upstairs_connection.gen != gen {
                         warn!(
                             up.log,
                             "warning: generation number at \
                              negotiation was {} and {} at \
                              activation, updating",
-                            upstairs_connection.gen,
+                            up.upstairs_connection.gen,
                             gen,
                         );
 
-                        upstairs_connection.gen = gen;
+                        up.upstairs_connection.gen = gen;
                     }
 
                     let r = self.promote_to_active(target).await;
@@ -1507,10 +1485,7 @@ impl Downstairs {
                 work.last_flush = last_flush_number;
 
                 // Consume the Negotiating state; we're now running
-                up.state = UpstairsState::Running {
-                    work,
-                    upstairs_connection: upstairs_connection.take().unwrap(),
-                };
+                up.state = UpstairsState::Running { work };
                 info!(up.log, "Set last flush {}", last_flush_number);
 
                 if let Err(e) = up
@@ -1536,7 +1511,6 @@ impl Downstairs {
 
                 up.state = UpstairsState::Running {
                     work: Work::new(), // last flush?
-                    upstairs_connection: upstairs_connection.take().unwrap(),
                 };
                 let meta_info = match self.region.meta_info().await {
                     Ok(meta_info) => meta_info,
@@ -2976,10 +2950,10 @@ pub async fn start_downstairs(
                      */
                     dss.add_connection();
 
-                    if let Err(e) = ds_channel.stream_tx.send(stream).await {
-                        error!(log, "ds_channel closed early: {e:?}");
-                        break Err(e.into());
-                    }
+                    let req_tx = ds_channel.stream_tx.clone();
+                    let log = log.clone();
+                    tokio::task::spawn(
+                        socket_io_task(stream, req_tx, log));
                 }
                 r = &mut ds_task => {
                     error!(log, "ds_task finished early: {r:?}");
@@ -3097,10 +3071,8 @@ mod test {
         ds.connections.insert(
             id,
             fake_upstairs(
-                UpstairsState::Running {
-                    work: Work::new(),
-                    upstairs_connection,
-                },
+                UpstairsState::Running { work: Work::new() },
+                upstairs_connection,
                 &ds.log,
             ),
         );
@@ -3108,22 +3080,20 @@ mod test {
     }
 
     /// Build a fake `Upstairs` that ignores all messages and sends nothing
-    ///
-    /// This is necessary because we need a `JoinHandle`.
-    fn fake_upstairs(state: UpstairsState, log: &Logger) -> Upstairs {
-        let (tx, mut rx) = mpsc::channel(500);
-        let fake_io_task = tokio::task::spawn(async move {
-            while let Some(_v) = rx.recv().await {
-                // Nothing to do here
-            }
-        });
+    fn fake_upstairs(
+        state: UpstairsState,
+        upstairs_connection: UpstairsConnection,
+        log: &Logger,
+    ) -> Upstairs {
+        let (tx, rx) = mpsc::channel(500);
+        std::mem::forget(rx);
 
         Upstairs {
             state,
+            upstairs_connection,
             message_tx: tx,
             timeout_deadline: deadline_secs(10),
             log: log.new(o!("role" => "test_upstairs")),
-            io_task: fake_io_task,
         }
     }
 
@@ -3138,8 +3108,8 @@ mod test {
             fake_upstairs(
                 UpstairsState::Negotiating {
                     negotiated: NegotiationState::ConnectedToUpstairs,
-                    upstairs_connection: Some(c),
                 },
+                c,
                 &ds.log,
             ),
         );
@@ -3149,11 +3119,7 @@ mod test {
     /// Switch the given connection's state to Running
     fn make_running(ds: &mut Downstairs, id: ConnectionId) {
         let up = ds.connections.get_mut(&id).unwrap();
-        let upstairs_connection = up.upstairs_connection();
-        up.state = UpstairsState::Running {
-            work: Work::new(),
-            upstairs_connection,
-        };
+        up.state = UpstairsState::Running { work: Work::new() };
     }
 
     fn test_do_work(work: &mut Work, ids: Vec<JobId>, iops: Vec<IOop>) {
@@ -4936,8 +4902,8 @@ mod test {
             fake_upstairs(
                 UpstairsState::Negotiating {
                     negotiated: NegotiationState::ConnectedToUpstairs,
-                    upstairs_connection: Some(upstairs_connection),
                 },
+                upstairs_connection,
                 &ds.log,
             ),
         );
@@ -4963,8 +4929,8 @@ mod test {
             fake_upstairs(
                 UpstairsState::Negotiating {
                     negotiated: NegotiationState::ConnectedToUpstairs,
-                    upstairs_connection: Some(upstairs_connection),
                 },
+                upstairs_connection,
                 &ds.log,
             ),
         );
