@@ -572,6 +572,14 @@ async fn socket_io_task(
     }
 }
 
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UpstairsConnection {
+    upstairs_id: Uuid,
+    session_id: Uuid,
+    gen: u64,
+}
+
 /// Handles IO to and from the socket
 ///
 /// Under the hood, this spawns a separate task to receive data from the socket,
@@ -686,14 +694,6 @@ async fn socket_io_loop<RT, WT>(
     }
 
     rx_task.abort(); // no-op if the task already stopped
-}
-
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct UpstairsConnection {
-    upstairs_id: Uuid,
-    session_id: Uuid,
-    gen: u64,
 }
 
 /// Checks an incoming message for initial validity
