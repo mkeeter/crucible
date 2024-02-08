@@ -531,7 +531,7 @@ pub mod cdt {
 
 async fn socket_io_task(
     stream: WrappedStream,
-    downstairs_req: mpsc::Sender<NewConnectionRequest>,
+    tx_to_main_task: mpsc::Sender<DownstairsRequest>,
     log: Logger,
 ) {
     match stream {
@@ -541,7 +541,7 @@ async fn socket_io_task(
             let fr = FramedRead::new(read, CrucibleDecoder::new());
             let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            socket_io_loop(fr, fw, downstairs_req, log).await
+            socket_io_loop(fr, fw, tx_to_main_task, log).await
         }
         WrappedStream::Https(stream) => {
             let (read, write) = tokio::io::split(stream);
@@ -549,7 +549,7 @@ async fn socket_io_task(
             let fr = FramedRead::new(read, CrucibleDecoder::new());
             let fw = FramedWrite::new(write, CrucibleEncoder::new());
 
-            socket_io_loop(fr, fw, downstairs_req, log).await
+            socket_io_loop(fr, fw, tx_to_main_task, log).await
         }
     }
 }
@@ -571,8 +571,6 @@ struct NewConnectionRequest {
 /// Connection data returned to a `socket_io_loop` by the `Downstairs` task
 struct NewConnectionReply {
     connection_id: ConnectionId,
-
-    tx_to_main_task: mpsc::Sender<(Message, ConnectionId)>,
     rx_from_main_task: mpsc::Receiver<Message>,
 }
 
@@ -583,7 +581,7 @@ struct NewConnectionReply {
 async fn socket_io_loop<RT, WT>(
     mut fr: FramedRead<RT, CrucibleDecoder>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
-    downstairs_req: mpsc::Sender<NewConnectionRequest>,
+    tx_to_main_task: mpsc::Sender<DownstairsRequest>,
     log: Logger,
 ) where
     RT: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send + 'static,
@@ -632,11 +630,11 @@ async fn socket_io_loop<RT, WT>(
     // Now that we've got our connection, ask the Downstairs to allocate a
     // connection ID for us.
     let (done, rx) = oneshot::channel();
-    if let Err(e) = downstairs_req
-        .send(NewConnectionRequest {
+    if let Err(e) = tx_to_main_task
+        .send(DownstairsRequest::Connection(NewConnectionRequest {
             upstairs_connection,
             done,
-        })
+        }))
         .await
     {
         warn!(rx_log, "could not send setup req to Downstairs: {e:?}");
@@ -645,7 +643,6 @@ async fn socket_io_loop<RT, WT>(
 
     let Ok(NewConnectionReply {
         connection_id,
-        tx_to_main_task,
         mut rx_from_main_task,
     }) = rx.await
     else {
@@ -654,7 +651,10 @@ async fn socket_io_loop<RT, WT>(
     };
 
     // Send the very first message (HereIAm) to the main task
-    if let Err(e) = tx_to_main_task.send((msg, connection_id)).await {
+    if let Err(e) = tx_to_main_task
+        .send(DownstairsRequest::Message { msg, connection_id })
+        .await
+    {
         error!(rx_log, "failed to send message to main task: {e:?}");
         return;
     }
@@ -662,15 +662,18 @@ async fn socket_io_loop<RT, WT>(
     // The rx task **mostly** just decodes and forwards messages to the
     // Downstairs task.
     let mut rx_task = tokio::task::spawn(async move {
-        while let Some(m) = fr.next().await {
-            let m = match m {
-                Ok(m) => m,
+        while let Some(msg) = fr.next().await {
+            let msg = match msg {
+                Ok(msg) => msg,
                 Err(e) => {
                     error!(rx_log, "got invalid message: {e}");
                     break;
                 }
             };
-            if let Err(e) = tx_to_main_task.send((m, connection_id)).await {
+            if let Err(e) = tx_to_main_task
+                .send(DownstairsRequest::Message { msg, connection_id })
+                .await
+            {
                 error!(rx_log, "failed to send message to main task: {e}");
                 break;
             }
@@ -873,29 +876,28 @@ pub struct Downstairs {
     pub repair_address: Option<SocketAddr>,
 
     /// Queue to receive new messages, tagged with their connection
-    message_rx: mpsc::Receiver<(Message, ConnectionId)>,
+    rx: mpsc::Receiver<DownstairsRequest>,
 
-    /// `Sender` counterpart to `message_rx`, stored here to pass into IO tasks
-    ///
-    /// (It would be silly to send messages from the main Downstairs task into
-    /// this queue, because they would pop out into the same task)
-    message_tx_handle: mpsc::Sender<(Message, ConnectionId)>,
-
-    /// Queue to receive new connections from the socket listener
-    connection_rx: mpsc::Receiver<NewConnectionRequest>,
-
-    /// Marks whether `connection_rx` is still receiving values
-    ///
-    /// If not, then we can never receive an `Action::NewConnection`, and can
-    /// safely exit if all other connections are closed.
-    has_connection_rx: bool,
+    /// Indicates that the socket listener and all IO tasks are done
+    done: bool,
 
     log: Logger,
 }
 
+/// All messages to the Downstairs come through this channel
+enum DownstairsRequest {
+    /// We have received a message from the given socket connection
+    Message {
+        msg: Message,
+        connection_id: ConnectionId,
+    },
+    /// We have received a connection request from the main socket listener
+    Connection(NewConnectionRequest),
+}
+
 /// IO handle to communicate with the downstairs
 pub struct DownstairsIoHandle {
-    stream_tx: mpsc::Sender<NewConnectionRequest>,
+    tx: mpsc::Sender<DownstairsRequest>,
 }
 
 /// Actions that can be applied to the [`Downstairs`]
@@ -909,8 +911,11 @@ enum Action {
     /// We received a message on the given connection
     Message(Message, ConnectionId),
 
-    /// The main socket listener has dropped its end of the channel
-    ConnectionChannelClosed,
+    /// The rx channel has closed
+    ///
+    /// This can only happen if all the IO tasks and the main socket listener
+    /// have all quit, because they each hold a copy of the `Sender`
+    RxChannelClosed,
 }
 
 /// Internal unique ID for each new connection
@@ -934,8 +939,7 @@ impl Downstairs {
                 region.def().uuid(),
             ))),
         };
-        let (connection_tx, connection_rx) = mpsc::channel(500);
-        let (message_tx, message_rx) = mpsc::channel(500);
+        let (tx, rx) = mpsc::channel(500);
         (
             Downstairs {
                 region,
@@ -951,15 +955,11 @@ impl Downstairs {
                 address: None,
                 repair_address: None,
                 next_connection_id: 0,
-                message_tx_handle: message_tx,
-                message_rx,
-                connection_rx,
-                has_connection_rx: true,
+                done: false,
+                rx,
                 log,
             },
-            DownstairsIoHandle {
-                stream_tx: connection_tx,
-            },
+            DownstairsIoHandle { tx },
         )
     }
 
@@ -972,25 +972,19 @@ impl Downstairs {
             .min_by_key(|(_id, up)| up.timeout_deadline);
 
         tokio::select! {
-            r = self.message_rx.recv() => {
-                if let Some((message, id)) = r {
-                    Action::Message(message, id)
-                } else {
-                    // This should never occur, even on exit (the usual time
-                    // when such preconditions fail), because we hold a copy of
-                    // the sender in **this very `Downstairs`**.
-                    panic!("message_rx should never be dropped")
+            r = self.rx.recv() => {
+                match r {
+                    Some(DownstairsRequest::Message { msg, connection_id }) =>
+                        Action::Message(msg, connection_id),
+                    Some(DownstairsRequest::Connection(r)) =>
+                        Action::NewConnection(r),
+                    None => {
+                        warn!(self.log, "downstairs tx was dropped");
+                        Action::RxChannelClosed
+                    }
                 }
             }
-            w = self.connection_rx.recv(), if self.has_connection_rx => {
-                if let Some(w) = w {
-                    Action::NewConnection(w)
-                } else {
-                    warn!(self.log, "connection_tx was dropped");
-                    Action::ConnectionChannelClosed
-                }
-            }
-            id = async move {
+            timeout_id = async move {
                 if let Some((id, t)) = next_timeout {
                     sleep_until(t.timeout_deadline).await;
                     id
@@ -998,7 +992,7 @@ impl Downstairs {
                     futures::future::pending().await
                 }
             } => {
-                Action::Timeout(*id)
+                Action::Timeout(*timeout_id)
             }
         }
     }
@@ -1007,7 +1001,6 @@ impl Downstairs {
         match action {
             Action::NewConnection(req) => {
                 let connection_id = self.next_connection_id();
-                let tx_to_main_task = self.message_tx_handle.clone();
                 let (tx, rx) = mpsc::channel(500);
 
                 self.connections.insert(
@@ -1028,7 +1021,6 @@ impl Downstairs {
                     .done
                     .send(NewConnectionReply {
                         connection_id,
-                        tx_to_main_task,
                         rx_from_main_task: rx,
                     })
                     .is_err()
@@ -1048,9 +1040,8 @@ impl Downstairs {
                 warn!(self.log, "got timeout from connection {id:?}");
                 self.drop_connection(id);
             }
-            Action::ConnectionChannelClosed => {
-                // The main socket listener has stopped listening.  RIP.
-                self.has_connection_rx = false;
+            Action::RxChannelClosed => {
+                self.done = true;
             }
         }
 
@@ -1177,7 +1168,7 @@ impl Downstairs {
     /// and have no active connections remaining, which means that we can never
     /// get another.
     fn done(&self) -> bool {
-        !self.has_connection_rx
+        self.done
             && self.active_upstairs.is_empty()
             && self.connections.is_empty()
     }
@@ -2951,7 +2942,7 @@ pub async fn start_downstairs(
                      */
                     dss.add_connection();
 
-                    let req_tx = ds_channel.stream_tx.clone();
+                    let req_tx = ds_channel.tx.clone();
                     let log = log.clone();
                     tokio::task::spawn(
                         socket_io_task(stream, req_tx, log));
