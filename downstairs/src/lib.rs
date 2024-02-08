@@ -356,7 +356,7 @@ pub fn show_work(ds: &mut Downstairs) {
             kvec.sort_unstable();
             for id in kvec.iter() {
                 let dsw = work.active.get(id).unwrap();
-                let (dsw_type, dep_list) = match &dsw.work {
+                let (dsw_type, dep_list) = match &dsw {
                     IOop::Read { dependencies, .. } => ("Read", dependencies),
                     IOop::Write { dependencies, .. } => ("Write", dependencies),
                     IOop::Flush { dependencies, .. } => ("Flush", dependencies),
@@ -1905,16 +1905,14 @@ impl Downstairs {
             }
         }
 
-        let dsw = DownstairsWork { ds_id, work };
-
         let up = &mut self.connections.get_mut(&target).unwrap();
-        up.work_mut().unwrap().add_work(ds_id, dsw);
+        up.work_mut().unwrap().add_work(ds_id, work);
 
         Ok(())
     }
 
     #[cfg(test)]
-    fn get_job(&self, id: ConnectionId, ds_id: JobId) -> &DownstairsWork {
+    fn get_job(&self, id: ConnectionId, ds_id: JobId) -> &IOop {
         let up = self.connections.get(&id).unwrap();
         let work = up.work().unwrap();
         work.active.get(&ds_id).unwrap()
@@ -1925,11 +1923,7 @@ impl Downstairs {
     /// This imitates the middle of `do_io_work_for`
     #[cfg(test)]
     #[must_use]
-    fn in_progress(
-        &mut self,
-        id: ConnectionId,
-        ds_id: JobId,
-    ) -> Option<DownstairsWork> {
+    fn in_progress(&mut self, id: ConnectionId, ds_id: JobId) -> Option<IOop> {
         let up = &mut self.connections.get_mut(&id).unwrap();
         let work = up.work_mut().unwrap();
         work.in_progress(ds_id, self.log.clone())
@@ -1941,11 +1935,11 @@ impl Downstairs {
     /// `Message` (and logged).
     async fn do_work(
         &mut self,
-        job: &DownstairsWork,
+        job_id: JobId,
+        work: &IOop,
         upstairs_connection: UpstairsConnection,
     ) -> Message {
-        let job_id = job.ds_id;
-        match &job.work {
+        match &work {
             IOop::Read {
                 dependencies,
                 requests,
@@ -2073,7 +2067,7 @@ impl Downstairs {
                 Message::ExtentLiveCloseAck {
                     upstairs_id: upstairs_connection.upstairs_id,
                     session_id: upstairs_connection.session_id,
-                    job_id: job.ds_id,
+                    job_id,
                     result,
                 }
             }
@@ -2114,7 +2108,7 @@ impl Downstairs {
                 Message::ExtentLiveCloseAck {
                     upstairs_id: upstairs_connection.upstairs_id,
                     session_id: upstairs_connection.session_id,
-                    job_id: job.ds_id,
+                    job_id,
                     result,
                 }
             }
@@ -2231,11 +2225,11 @@ impl Downstairs {
          * sorted before it is returned so this function iterates through jobs
          * in order.
          */
-        while let Some(new_id) = new_work.pop_front() {
+        while let Some(ds_id) = new_work.pop_front() {
             if self.lossy && random() && random() {
                 // Skip a job that needs to be done. Sometimes
-                info!(self.log, "[lossy] skipping {}", new_id);
-                new_work.push_back(new_id);
+                info!(self.log, "[lossy] skipping {}", ds_id);
+                new_work.push_back(ds_id);
                 continue;
             }
 
@@ -2250,7 +2244,7 @@ impl Downstairs {
              */
             // TODO should we really be making a new log for every job?
             let r = work.in_progress(
-                new_id,
+                ds_id,
                 self.log.new(o!("role" => "work".to_string())),
             );
 
@@ -2258,10 +2252,9 @@ impl Downstairs {
                 continue;
             };
 
-            let job_id = ds_work.ds_id;
-            cdt::work__process!(|| job_id.0);
+            cdt::work__process!(|| ds_id.0);
 
-            let m = self.do_work(&ds_work, upstairs_connection).await;
+            let m = self.do_work(ds_id, &ds_work, upstairs_connection).await;
 
             if let Some(error) = m.err() {
                 // Reborrow `up`
@@ -2271,7 +2264,7 @@ impl Downstairs {
                     .send(Message::ErrorReport {
                         upstairs_id: upstairs_connection.upstairs_id,
                         session_id: upstairs_connection.session_id,
-                        job_id: new_id,
+                        job_id: ds_id,
                         error: error.clone(),
                     })
                     .await?;
@@ -2279,8 +2272,8 @@ impl Downstairs {
                 // If the job errored, do not consider it completed.
                 // Retry it, putting it back in the map.
                 let work = up.work_mut().unwrap(); // reborrow
-                new_work.push_back(new_id);
-                work.active.insert(job_id, ds_work);
+                new_work.push_back(ds_id);
+                work.active.insert(ds_id, ds_work);
 
                 // If this is a repair job, and that repair failed, we
                 // can do no more work on this downstairs and should
@@ -2297,7 +2290,7 @@ impl Downstairs {
                 }
             } else {
                 // Update our stats
-                self.complete_work_stat(&m, job_id);
+                self.complete_work_stat(&m, ds_id);
 
                 // Notify the upstairs before completing work
                 let is_flush = matches!(m, Message::FlushAck { .. });
@@ -2308,13 +2301,13 @@ impl Downstairs {
 
                 let work = up.work_mut().unwrap();
                 if is_flush {
-                    work.last_flush = job_id;
+                    work.last_flush = ds_id;
                     work.completed.clear();
                 } else {
-                    work.completed.insert(job_id);
+                    work.completed.insert(ds_id);
                 }
 
-                cdt::work__done!(|| job_id.0);
+                cdt::work__done!(|| ds_id.0);
             }
         }
         Ok(())
@@ -2533,7 +2526,7 @@ impl Downstairs {
  */
 #[derive(Debug)]
 pub struct Work {
-    active: HashMap<JobId, DownstairsWork>,
+    active: HashMap<JobId, IOop>,
     outstanding_deps: HashMap<JobId, usize>,
 
     /*
@@ -2544,12 +2537,6 @@ pub struct Work {
      */
     last_flush: JobId,
     completed: HashSet<JobId>,
-}
-
-#[derive(Debug, Clone)]
-struct DownstairsWork {
-    ds_id: JobId,
-    work: IOop,
 }
 
 impl Work {
@@ -2567,17 +2554,12 @@ impl Work {
      * been waiting for other dependencies to finish.
      */
     fn new_work(&self) -> VecDeque<JobId> {
-        let mut result = Vec::with_capacity(self.active.len());
-
-        for job in self.active.values() {
-            result.push(job.ds_id);
-        }
-
-        result.sort_unstable();
-        result.into_iter().collect()
+        let mut results = self.active.keys().cloned().collect::<Vec<_>>();
+        results.sort_unstable();
+        results.into_iter().collect()
     }
 
-    fn add_work(&mut self, ds_id: JobId, dsw: DownstairsWork) {
+    fn add_work(&mut self, ds_id: JobId, dsw: IOop) {
         self.active.insert(ds_id, dsw);
     }
 
@@ -2591,16 +2573,12 @@ impl Work {
 
     /// If the requested job is still new and the dependencies are all met,
     /// or the job is InProgress, remove the job from the map and return the
-    /// DownstairsWork object.
+    /// IOop object.
     ///
     /// If the dependencies are not met, move the state to DepWait and keep it in
     /// the map.
     #[must_use]
-    fn in_progress(
-        &mut self,
-        ds_id: JobId,
-        log: Logger,
-    ) -> Option<DownstairsWork> {
+    fn in_progress(&mut self, ds_id: JobId, log: Logger) -> Option<IOop> {
         let Some(job) = self.active.remove(&ds_id) else {
             panic!("can't call in_progress on missing job");
         };
@@ -2610,7 +2588,7 @@ impl Work {
          * holding this locked, check the dep list if there is one
          * and make sure all dependencies are completed.
          */
-        let dep_list = job.work.deps();
+        let dep_list = job.deps();
 
         /*
          * See which of our dependencies are met.
@@ -2653,7 +2631,7 @@ impl Work {
                     log,
                     "{} job {} waiting on {} deps",
                     ds_id,
-                    match &job.work {
+                    match &job {
                         IOop::Write { .. } => "Write",
                         IOop::WriteUnwritten { .. } => "WriteUnwritten",
                         IOop::Flush { .. } => "Flush",
@@ -3012,25 +2990,22 @@ mod test {
     ) {
         work.add_work(
             ds_id,
-            DownstairsWork {
-                ds_id,
-                work: if is_flush {
-                    IOop::Flush {
-                        dependencies: deps,
-                        flush_number: 10,
-                        gen_number: 0,
-                        snapshot_details: None,
-                        extent_limit: None,
-                    }
-                } else {
-                    IOop::Read {
-                        dependencies: deps,
-                        requests: vec![ReadRequest {
-                            eid: 1,
-                            offset: Block::new_512(1),
-                        }],
-                    }
-                },
+            if is_flush {
+                IOop::Flush {
+                    dependencies: deps,
+                    flush_number: 10,
+                    gen_number: 0,
+                    snapshot_details: None,
+                    extent_limit: None,
+                }
+            } else {
+                IOop::Read {
+                    dependencies: deps,
+                    requests: vec![ReadRequest {
+                        eid: 1,
+                        offset: Block::new_512(1),
+                    }],
+                }
             },
         );
     }
@@ -3038,20 +3013,17 @@ mod test {
     fn add_work_rf(work: &mut Work, ds_id: JobId, deps: Vec<JobId>) {
         work.add_work(
             ds_id,
-            DownstairsWork {
-                ds_id,
-                work: IOop::WriteUnwritten {
-                    dependencies: deps,
-                    writes: Vec::with_capacity(1),
-                },
+            IOop::WriteUnwritten {
+                dependencies: deps,
+                writes: Vec::with_capacity(1),
             },
         );
     }
 
-    fn complete(work: &mut Work, job: DownstairsWork) {
+    fn complete(work: &mut Work, ds_id: JobId, io: IOop) {
         let is_flush = {
             // validate that deps are done
-            let dep_list = job.work.deps();
+            let dep_list = io.deps();
             for dep in dep_list {
                 let last_flush_satisfied = dep <= &work.last_flush;
                 let complete_satisfied = work.completed.contains(dep);
@@ -3060,7 +3032,7 @@ mod test {
             }
 
             matches!(
-                job.work,
+                io,
                 IOop::Flush {
                     dependencies: _,
                     flush_number: _,
@@ -3071,7 +3043,6 @@ mod test {
             )
         };
 
-        let ds_id = job.ds_id;
         assert!(!work.active.contains_key(&ds_id));
 
         if is_flush {
@@ -3082,7 +3053,8 @@ mod test {
         }
     }
 
-    fn test_push_next_jobs(work: &mut Work) -> Vec<DownstairsWork> {
+    fn test_push_next_jobs(work: &mut Work) -> (Vec<JobId>, Vec<IOop>) {
+        let mut ids = vec![];
         let mut jobs = vec![];
         let new_work = work.new_work();
 
@@ -3090,6 +3062,7 @@ mod test {
             let ds_work = work.in_progress(*new_id, csl());
             match ds_work {
                 Some(ds_work) => {
+                    ids.push(*new_id);
                     jobs.push(ds_work);
                 }
                 None => {
@@ -3098,7 +3071,7 @@ mod test {
             }
         }
 
-        jobs
+        (ids, jobs)
     }
 
     fn create_test_upstairs(ds: &mut Downstairs) -> ConnectionId {
@@ -3170,9 +3143,9 @@ mod test {
         };
     }
 
-    fn test_do_work(work: &mut Work, jobs: Vec<DownstairsWork>) {
-        for job_id in jobs {
-            complete(work, job_id);
+    fn test_do_work(work: &mut Work, ids: Vec<JobId>, iops: Vec<IOop>) {
+        for (job_id, iop) in ids.into_iter().zip(iops) {
+            complete(work, job_id, iop);
         }
     }
 
@@ -3183,15 +3156,14 @@ mod test {
 
         assert_eq!(work.new_work(), vec![JobId(1000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|w| w.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), [JobId(1000)]);
 
-        assert!(test_push_next_jobs(&mut work).is_empty());
+        assert!(test_push_next_jobs(&mut work).0.is_empty());
     }
 
     #[tokio::test]
@@ -3260,9 +3232,8 @@ mod test {
 
         for id in new_work.iter() {
             let ds_work = ds.in_progress(upstairs_id, *id).unwrap();
-            assert_eq!(ds_work.ds_id, *id);
             println!("Do IOop {}", *id);
-            let m = ds.do_work(&ds_work, upstairs_connection).await;
+            let m = ds.do_work(*id, &ds_work, upstairs_connection).await;
             println!("Got m: {:?}", m);
             ds.complete_work(upstairs_id, *id, m);
         }
@@ -3371,9 +3342,8 @@ mod test {
 
         for id in new_work.iter() {
             let ds_work = ds.in_progress(upstairs_id, *id).unwrap();
-            assert_eq!(ds_work.ds_id, *id);
             println!("Do IOop {}", *id);
-            let m = ds.do_work(&ds_work, upstairs_connection).await;
+            let m = ds.do_work(*id, &ds_work, upstairs_connection).await;
             println!("Got m: {:?}", m);
             ds.complete_work(upstairs_id, *id, m);
         }
@@ -3434,7 +3404,7 @@ mod test {
 
         // Process the ExtentClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was unwritten, the close would not have
@@ -3463,7 +3433,7 @@ mod test {
 
         // Process the ExtentFlushClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was unwritten, the close would not have
@@ -3493,7 +3463,7 @@ mod test {
         // Process the two ExtentReopen commands
         for id in (1002..=1003).map(JobId) {
             let ds_work = ds.in_progress(upstairs_id, id).unwrap();
-            let m = ds.do_work(&ds_work, upstairs_connection).await;
+            let m = ds.do_work(id, &ds_work, upstairs_connection).await;
             match m {
                 Message::ExtentLiveAckId {
                     upstairs_id,
@@ -3607,17 +3577,17 @@ mod test {
 
         // Process the first Write
         let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
         ds.complete_work(upstairs_id, JobId(1000), m);
 
         // Process the flush
         let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
         ds.complete_work(upstairs_id, JobId(1001), m);
 
         // Process write 2
         let ds_work = ds.in_progress(upstairs_id, JobId(1002)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1002), &ds_work, upstairs_connection).await;
         ds.complete_work(upstairs_id, JobId(1002), m);
 
         let new_work = ds.new_work(upstairs_id);
@@ -3625,7 +3595,7 @@ mod test {
 
         // Process the ExtentClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1003)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1003), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written but not flushed, the close would
@@ -3699,7 +3669,7 @@ mod test {
 
         // Process the Write
         let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.
         match m {
@@ -3725,7 +3695,7 @@ mod test {
 
         // Process the ExtentClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written but not flushed, the close would
@@ -3801,7 +3771,7 @@ mod test {
 
         // Process the Write
         let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.
         match m {
@@ -3827,7 +3797,7 @@ mod test {
 
         // Process the ExtentFlushClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written, and we sent a "flush and close"
@@ -3923,13 +3893,13 @@ mod test {
         // Process the Writes
         for id in (1000..=1001).map(JobId) {
             let ds_work = ds.in_progress(upstairs_id, id).unwrap();
-            let m = ds.do_work(&ds_work, upstairs_connection).await;
+            let m = ds.do_work(id, &ds_work, upstairs_connection).await;
             ds.complete_work(upstairs_id, id, m);
         }
 
         // Process the ExtentFlushClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1002)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1002), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written, and we sent a "flush and close"
@@ -3958,7 +3928,7 @@ mod test {
 
         // Process the ExtentClose
         let ds_work = ds.in_progress(upstairs_id, JobId(1003)).unwrap();
-        let m = ds.do_work(&ds_work, upstairs_connection).await;
+        let m = ds.do_work(JobId(1003), &ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written, and we sent a "flush and close"
@@ -3998,33 +3968,31 @@ mod test {
 
         assert_eq!(work.new_work(), vec![JobId(1000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
 
-        assert!(test_push_next_jobs(&mut work).is_empty());
+        assert!(test_push_next_jobs(&mut work).0.is_empty());
     }
 
     fn test_misc_work_through_work_queue(ds_id: JobId, ioop: IOop) {
         // Verify that a IOop work request will move through the work queue.
         let mut work = Work::new();
-        work.add_work(ds_id, DownstairsWork { ds_id, work: ioop });
+        work.add_work(ds_id, ioop);
 
         assert_eq!(work.new_work(), vec![ds_id]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![ds_id]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![ds_id]);
 
-        assert!(test_push_next_jobs(&mut work).is_empty());
+        assert!(test_push_next_jobs(&mut work).0.is_empty());
     }
 
     #[test]
@@ -4101,19 +4069,18 @@ mod test {
         assert_eq!(work.new_work(), vec![JobId(1000), JobId(1001)]);
 
         // should push both, they're independent
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000), JobId(1001)]);
 
         // new work returns only jobs in new or dep wait
         assert!(work.new_work().is_empty());
 
         // do work
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000), JobId(1001)]);
 
-        assert!(test_push_next_jobs(&mut work).is_empty());
+        assert!(test_push_next_jobs(&mut work).0.is_empty());
     }
 
     #[test]
@@ -4127,19 +4094,17 @@ mod test {
         assert_eq!(work.new_work(), vec![JobId(1000), JobId(1001)]);
 
         // only one is ready to run
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
 
         // new_work returns all new or dep wait jobs
         assert_eq!(work.new_work(), vec![JobId(1001)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, _next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
     }
 
@@ -4165,28 +4130,25 @@ mod test {
         // only one is ready to run at a time
 
         assert!(work.completed.is_empty());
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
         assert_eq!(work.new_work(), vec![JobId(1001), JobId(1002)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
         assert_eq!(work.new_work(), vec![JobId(1002)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000), JobId(1001)]);
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
         assert!(work.new_work().is_empty());
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(
             work.completed(),
@@ -4217,30 +4179,27 @@ mod test {
         // only one is ready to run at a time
 
         assert!(work.completed.is_empty());
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
         assert_eq!(work.new_work(), vec![JobId(1001), JobId(1002)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1000));
         assert!(work.completed.is_empty());
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
         assert_eq!(work.new_work(), vec![JobId(1002)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1000));
         assert_eq!(work.completed(), vec![JobId(1001)]);
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
         assert!(work.new_work().is_empty());
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1000));
         assert_eq!(work.completed(), vec![JobId(1001), JobId(1002)]);
@@ -4269,29 +4228,26 @@ mod test {
         // only one is ready to run at a time
 
         assert!(work.completed.is_empty());
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
         assert_eq!(work.new_work(), vec![JobId(1001), JobId(1002)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
         assert_eq!(work.new_work(), vec![JobId(1002)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1001));
         assert!(work.completed.is_empty());
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
         assert!(work.new_work().is_empty());
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1001));
         assert_eq!(work.completed(), vec![JobId(1002)]);
@@ -4307,20 +4263,17 @@ mod test {
         add_work(&mut work, JobId(1002), vec![JobId(1000), JobId(1001)], true);
 
         // Downstairs is really fast!
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1002));
         assert!(work.completed.is_empty());
@@ -4340,15 +4293,13 @@ mod test {
             false,
         );
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1003)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1004)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1002));
         assert_eq!(work.completed(), vec![JobId(1003), JobId(1004)]);
@@ -4366,20 +4317,17 @@ mod test {
         // Add one that can't run yet
         add_work(&mut work, JobId(1003), vec![JobId(2000)], false);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(1002));
         assert!(work.completed.is_empty());
@@ -4407,25 +4355,22 @@ mod test {
         add_work(&mut work, JobId(2002), vec![JobId(2000), JobId(2001)], true);
 
         // should do each chain in sequence
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000), JobId(2000)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
         assert_eq!(work.completed(), vec![JobId(1000), JobId(2000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001), JobId(2001)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
         assert_eq!(
             work.completed(),
             vec![JobId(1000), JobId(1001), JobId(2000), JobId(2001)]
         );
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002), JobId(2002)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.last_flush, JobId(2002));
         assert!(work.completed.is_empty());
@@ -4448,8 +4393,7 @@ mod test {
             false,
         );
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
 
         add_work(
@@ -4459,24 +4403,21 @@ mod test {
             false,
         );
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1003)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(
             work.completed(),
@@ -4501,11 +4442,10 @@ mod test {
             false,
         );
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         add_work(
             &mut work,
@@ -4516,20 +4456,17 @@ mod test {
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1003)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(
             work.completed(),
@@ -4554,23 +4491,21 @@ mod test {
             false,
         );
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1000)]);
 
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(work.completed(), vec![JobId(1000)]);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1001)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         // can't run anything, dep not satisfied
-        let next_jobs = test_push_next_jobs(&mut work);
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert!(next_jobs.is_empty());
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         add_work(
             &mut work,
@@ -4579,15 +4514,13 @@ mod test {
             false,
         );
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1002)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
-        let next_jobs = test_push_next_jobs(&mut work);
-        let ids = next_jobs.iter().map(|d| d.ds_id).collect::<Vec<_>>();
+        let (ids, next_jobs) = test_push_next_jobs(&mut work);
         assert_eq!(ids, vec![JobId(1003)]);
-        test_do_work(&mut work, next_jobs);
+        test_do_work(&mut work, ids, next_jobs);
 
         assert_eq!(
             work.completed(),
@@ -5277,11 +5210,8 @@ mod test {
         let job_1 = ds.get_job(id_1, JobId(1000));
         let job_2 = ds.get_job(id_2, JobId(1000));
 
-        assert_eq!(job_1.ds_id, JobId(1000));
-        assert_eq!(job_1.work, read_1);
-
-        assert_eq!(job_2.ds_id, JobId(1000));
-        assert_eq!(job_2.work, read_2);
+        assert_eq!(job_1, &read_1);
+        assert_eq!(job_2, &read_2);
 
         Ok(())
     }
