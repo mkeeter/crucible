@@ -965,17 +965,11 @@ impl Downstairs {
 
     /// Selects from many possible actions
     async fn select(&mut self) -> Action {
-        let mut up_actions = futures::stream::FuturesUnordered::new();
-        let has_connections = !self.connections.is_empty();
-        for (&id, up) in &mut self.connections {
-            up_actions.push(async move {
-                tokio::select! {
-                    _ = sleep_until(up.timeout_deadline) => {
-                        Action::Timeout(id)
-                    }
-                }
-            });
-        }
+        // Pick the next timeout among the various upstairs connections
+        let next_timeout = self
+            .connections
+            .iter()
+            .min_by_key(|(_id, up)| up.timeout_deadline);
 
         tokio::select! {
             r = self.message_rx.recv() => {
@@ -996,8 +990,15 @@ impl Downstairs {
                     Action::ConnectionChannelClosed
                 }
             }
-            a = up_actions.next(), if has_connections => {
-                a.unwrap()
+            id = async move {
+                if let Some((id, t)) = next_timeout {
+                    sleep_until(t.timeout_deadline).await;
+                    id
+                } else {
+                    futures::future::pending().await
+                }
+            } => {
+                Action::Timeout(*id)
             }
         }
     }
