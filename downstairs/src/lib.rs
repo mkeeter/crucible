@@ -1871,11 +1871,12 @@ impl Downstairs {
         Ok(())
     }
 
+    /// Removes and returns all jobs which are ready
     #[cfg(test)]
-    fn new_work(&self, target: ConnectionId) -> VecDeque<JobId> {
-        let up = self.connections.get(&target).unwrap();
-        let work = up.work().unwrap();
-        work.new_work()
+    fn take_ready_work(&mut self, target: ConnectionId) -> Vec<(JobId, IOop)> {
+        let up = self.connections.get_mut(&target).unwrap();
+        let work = up.work_mut().unwrap();
+        work.take_ready_work(&self.log)
     }
 
     // Add work to the Downstairs
@@ -1909,24 +1910,6 @@ impl Downstairs {
         up.work_mut().unwrap().add_work(ds_id, work);
 
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn get_job(&self, id: ConnectionId, ds_id: JobId) -> &IOop {
-        let up = self.connections.get(&id).unwrap();
-        let work = up.work().unwrap();
-        work.active.get(&ds_id).unwrap()
-    }
-
-    /// Helper function to mark a particular job as in-progress
-    ///
-    /// This imitates the middle of `do_io_work_for`
-    #[cfg(test)]
-    #[must_use]
-    fn in_progress(&mut self, id: ConnectionId, ds_id: JobId) -> Option<IOop> {
-        let up = &mut self.connections.get_mut(&id).unwrap();
-        let work = up.work_mut().unwrap();
-        work.in_progress(ds_id, self.log.clone())
     }
 
     /// Perform actual IO work on the disk
@@ -2207,17 +2190,36 @@ impl Downstairs {
 
     /// Perform all pending IO work for a single Upstairs connection
     async fn do_io_work_for(&mut self, target: ConnectionId) -> Result<()> {
+        while self.do_one_round_of_io_work_for(target).await? {
+            // keep going until all pending work is done
+        }
+        Ok(())
+    }
+
+    /// Perform all currently pending IO work for a single Upstairs connection
+    ///
+    /// This may cause other jobs to become active!
+    ///
+    /// Returns `Ok(true)` if work was done, or `false` otherwise.
+    async fn do_one_round_of_io_work_for(
+        &mut self,
+        target: ConnectionId,
+    ) -> Result<bool> {
         let up = &mut self.connections.get_mut(&target).unwrap();
         let upstairs_connection = up.upstairs_connection();
         let Some(work) = up.work_mut() else {
-            return Ok(());
+            return Ok(false);
         };
 
         /*
          * Build ourselves a list of all the jobs on the work hashmap that
          * are New or DepWait.
          */
-        let mut new_work = work.new_work();
+        let mut new_work: VecDeque<(JobId, IOop)> =
+            work.take_ready_work(&self.log).into();
+        if new_work.is_empty() {
+            return Ok(false);
+        }
 
         /*
          * We don't have to do jobs in order, but the dependencies are, at
@@ -2225,32 +2227,13 @@ impl Downstairs {
          * sorted before it is returned so this function iterates through jobs
          * in order.
          */
-        while let Some(ds_id) = new_work.pop_front() {
+        while let Some((ds_id, ds_work)) = new_work.pop_front() {
             if self.lossy && random() && random() {
                 // Skip a job that needs to be done. Sometimes
                 info!(self.log, "[lossy] skipping {}", ds_id);
-                new_work.push_back(ds_id);
+                new_work.push_back((ds_id, ds_work));
                 continue;
             }
-
-            // Reborrow `up` and `work`
-            let up = &mut self.connections.get_mut(&target).unwrap();
-            let work = up.work_mut().unwrap();
-
-            /*
-             * If this job is still new, take it and go to work. The
-             * in_progress method will only return a job if all
-             * dependencies are met.
-             */
-            // TODO should we really be making a new log for every job?
-            let r = work.in_progress(
-                ds_id,
-                self.log.new(o!("role" => "work".to_string())),
-            );
-
-            let Some(ds_work) = r else {
-                continue;
-            };
 
             cdt::work__process!(|| ds_id.0);
 
@@ -2269,11 +2252,9 @@ impl Downstairs {
                     })
                     .await?;
 
-                // If the job errored, do not consider it completed.
-                // Retry it, putting it back in the map.
-                let work = up.work_mut().unwrap(); // reborrow
-                new_work.push_back(ds_id);
-                work.active.insert(ds_id, ds_work);
+                // If the job errored, do not consider it completed; add it back
+                // to the `new_work` queue for another attempt.
+                new_work.push_back((ds_id, ds_work));
 
                 // If this is a repair job, and that repair failed, we
                 // can do no more work on this downstairs and should
@@ -2310,10 +2291,13 @@ impl Downstairs {
                 cdt::work__done!(|| ds_id.0);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Helper function to call `complete_work` if the `Message` is available
+    ///
+    /// Normally, this happens in the `do_io_work_for` loop after sending the
+    /// message to the upstairs.
     #[cfg(test)]
     fn complete_work(&mut self, id: ConnectionId, ds_id: JobId, m: Message) {
         let up = &mut self.connections.get_mut(&id).unwrap();
@@ -2549,14 +2533,77 @@ impl Work {
         }
     }
 
-    /**
-     * Return a list of downstairs request IDs that are new or have
-     * been waiting for other dependencies to finish.
-     */
-    fn new_work(&self) -> VecDeque<JobId> {
-        let mut results = self.active.keys().cloned().collect::<Vec<_>>();
-        results.sort_unstable();
-        results.into_iter().collect()
+    /// Removes and returns all work whose dependencies are met
+    ///
+    /// After this function returns, the work must either be completed or
+    /// returned to the active map (otherwise, it will be lost).
+    #[must_use]
+    fn take_ready_work(&mut self, log: &Logger) -> Vec<(JobId, IOop)> {
+        let mut ready = vec![];
+        for (ds_id, io) in &self.active {
+            // The Downstairs currently assumes that all jobs previous to the
+            // last flush have completed, hence the comparison against
+            // `self.last_flush`
+            //
+            // Currently, `work.completed` is cleared out when
+            // `Downstairs::complete_work` (or `complete` in mod test) is called
+            // with a FlushAck, so this comparison cannot be removed unless that
+            // is changed too.
+            let num_deps = io
+                .deps()
+                .iter()
+                .cloned()
+                .filter(|d| *d > self.last_flush && !self.completed.contains(d))
+                .count();
+
+            if num_deps == 0 {
+                ready.push(*ds_id);
+            } else {
+                // If the number of dependencies has changed, then print some
+                // info about them.
+                let print = if let Some(n) = self.outstanding_deps.get(ds_id) {
+                    *n != num_deps
+                } else {
+                    false
+                };
+
+                if print {
+                    warn!(
+                        log,
+                        "{} job {} waiting on {} deps",
+                        ds_id,
+                        match io {
+                            IOop::Write { .. } => "Write",
+                            IOop::WriteUnwritten { .. } => "WriteUnwritten",
+                            IOop::Flush { .. } => "Flush",
+                            IOop::Read { .. } => "Read",
+                            IOop::ExtentClose { .. } => "ECLose",
+                            IOop::ExtentFlushClose { .. } => "EFlushCLose",
+                            IOop::ExtentLiveRepair { .. } => "ELiveRepair",
+                            IOop::ExtentLiveReopen { .. } => "ELiveReopen",
+                            IOop::ExtentLiveNoOp { .. } => "NoOp",
+                        },
+                        num_deps,
+                    );
+                }
+                self.outstanding_deps.insert(*ds_id, num_deps);
+            }
+        }
+        ready.sort_unstable();
+
+        // Remove all ready jobs from the work map
+        ready
+            .into_iter()
+            .map(|ds_id| (ds_id, self.active.remove(&ds_id).unwrap()))
+            .collect()
+    }
+
+    /// Returns a list of work that is active in the map
+    #[cfg(test)]
+    fn new_work(&self) -> Vec<JobId> {
+        let mut out: Vec<JobId> = self.active.keys().cloned().collect();
+        out.sort_unstable();
+        out
     }
 
     fn add_work(&mut self, ds_id: JobId, dsw: IOop) {
@@ -2569,91 +2616,6 @@ impl Work {
         let mut out: Vec<_> = self.completed.iter().cloned().collect();
         out.sort_unstable();
         out
-    }
-
-    /// If the requested job is still new and the dependencies are all met,
-    /// or the job is InProgress, remove the job from the map and return the
-    /// IOop object.
-    ///
-    /// If the dependencies are not met, move the state to DepWait and keep it in
-    /// the map.
-    #[must_use]
-    fn in_progress(&mut self, ds_id: JobId, log: Logger) -> Option<IOop> {
-        let Some(job) = self.active.remove(&ds_id) else {
-            panic!("can't call in_progress on missing job");
-        };
-
-        /*
-         * Before we can make this in_progress, we have to, while
-         * holding this locked, check the dep list if there is one
-         * and make sure all dependencies are completed.
-         */
-        let dep_list = job.deps();
-
-        /*
-         * See which of our dependencies are met.
-         * XXX Make this better/faster by removing the ones that
-         * are met, so next lap we don't have to check again?  There
-         * may be some debug value to knowing what the dep list was,
-         * so consider that before making this faster.
-         */
-        let mut deps_outstanding: Vec<JobId> =
-            Vec::with_capacity(dep_list.len());
-
-        for dep in dep_list.iter() {
-            // The Downstairs currently assumes that all jobs previous
-            // to the last flush have completed, hence this early out.
-            //
-            // Currently `work.completed` is cleared out when
-            // `Downstairs::complete_work` (or `complete` in mod test)
-            // is called with a FlushAck so this early out cannot be
-            // removed unless that is changed too.
-            if dep <= &self.last_flush {
-                continue;
-            }
-
-            if !self.completed.contains(dep) {
-                deps_outstanding.push(*dep);
-            }
-        }
-
-        if !deps_outstanding.is_empty() {
-            let print = if let Some(existing_outstanding_deps) =
-                self.outstanding_deps.get(&ds_id)
-            {
-                *existing_outstanding_deps != deps_outstanding.len()
-            } else {
-                false
-            };
-
-            if print {
-                warn!(
-                    log,
-                    "{} job {} waiting on {} deps",
-                    ds_id,
-                    match &job {
-                        IOop::Write { .. } => "Write",
-                        IOop::WriteUnwritten { .. } => "WriteUnwritten",
-                        IOop::Flush { .. } => "Flush",
-                        IOop::Read { .. } => "Read",
-                        IOop::ExtentClose { .. } => "ECLose",
-                        IOop::ExtentFlushClose { .. } => "EFlushCLose",
-                        IOop::ExtentLiveRepair { .. } => "ELiveRepair",
-                        IOop::ExtentLiveReopen { .. } => "ELiveReopen",
-                        IOop::ExtentLiveNoOp { .. } => "NoOp",
-                    },
-                    deps_outstanding.len(),
-                );
-            }
-
-            let _ = self.outstanding_deps.insert(ds_id, deps_outstanding.len());
-
-            // Return the job to the map
-            self.active.insert(ds_id, job);
-            return None;
-        }
-
-        Some(job)
     }
 }
 
@@ -3056,19 +3018,9 @@ mod test {
     fn test_push_next_jobs(work: &mut Work) -> (Vec<JobId>, Vec<IOop>) {
         let mut ids = vec![];
         let mut jobs = vec![];
-        let new_work = work.new_work();
-
-        for new_id in new_work.iter() {
-            let ds_work = work.in_progress(*new_id, csl());
-            match ds_work {
-                Some(ds_work) => {
-                    ids.push(*new_id);
-                    jobs.push(ds_work);
-                }
-                None => {
-                    continue;
-                }
-            }
+        for (ds_id, ds_work) in work.take_ready_work(&csl()) {
+            ids.push(ds_id);
+            jobs.push(ds_work);
         }
 
         (ids, jobs)
@@ -3226,16 +3178,18 @@ mod test {
         show_work(&mut ds);
 
         // Now we mimic what happens in the do_work_task()
-        let new_work = ds.new_work(upstairs_id);
-        println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 2);
+        let chunk_sizes = [1, 1, 0]; // each job is independent
+        for c in chunk_sizes {
+            let new_work = ds.take_ready_work(upstairs_id);
+            println!("Got new work: {:?}", new_work);
+            assert_eq!(new_work.len(), c);
 
-        for id in new_work.iter() {
-            let ds_work = ds.in_progress(upstairs_id, *id).unwrap();
-            println!("Do IOop {}", *id);
-            let m = ds.do_work(*id, &ds_work, upstairs_connection).await;
-            println!("Got m: {:?}", m);
-            ds.complete_work(upstairs_id, *id, m);
+            for (ds_id, ds_work) in new_work {
+                println!("Do IOop {}", ds_id);
+                let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
+                println!("Got m: {:?}", m);
+                ds.complete_work(upstairs_id, ds_id, m);
+            }
         }
         show_work(&mut ds);
         Ok(())
@@ -3335,21 +3289,27 @@ mod test {
         println!("Before doing work we have:");
         show_work(&mut ds);
 
-        // Now we mimic what happens in the do_work_task()
-        let new_work = ds.new_work(upstairs_id);
-        println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 5);
+        // Now we mimic what happens in Downstairs::do_io_work_for()
+        let chunk_sizes = [
+            2, // ExtentClose + ExtentFlushClose
+            1, // Read
+            1, // NoOp
+            1, // ExtentLiveReopen
+            0, // no work remaining
+        ];
+        for c in chunk_sizes {
+            let new_work = ds.take_ready_work(upstairs_id);
+            println!("Got new work: {:?}", new_work);
+            assert_eq!(new_work.len(), c);
 
-        for id in new_work.iter() {
-            let ds_work = ds.in_progress(upstairs_id, *id).unwrap();
-            println!("Do IOop {}", *id);
-            let m = ds.do_work(*id, &ds_work, upstairs_connection).await;
-            println!("Got m: {:?}", m);
-            ds.complete_work(upstairs_id, *id, m);
+            for (id, ds_work) in new_work {
+                println!("Do IOop {}", id);
+                let m = ds.do_work(id, &ds_work, upstairs_connection).await;
+                println!("Got m: {:?}", m);
+                ds.complete_work(upstairs_id, id, m);
+            }
         }
 
-        let new_work = ds.new_work(upstairs_id);
-        assert_eq!(new_work.len(), 0);
         Ok(())
     }
 
@@ -3398,13 +3358,15 @@ mod test {
         ds.add_work(upstairs_id, JobId(1003), rio)?;
         show_work(&mut ds);
 
-        let new_work = ds.new_work(upstairs_id);
+        // At this point, the ExtentClose and ExtentFlushClose should be ready
+        let new_work = ds.take_ready_work(upstairs_id);
         println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 4);
+        assert_eq!(new_work.len(), 2);
 
         // Process the ExtentClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1000));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was unwritten, the close would not have
@@ -3432,8 +3394,9 @@ mod test {
         ds.complete_work(upstairs_id, JobId(1000), m);
 
         // Process the ExtentFlushClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[1];
+        assert_eq!(*ds_id, JobId(1001));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was unwritten, the close would not have
@@ -3461,9 +3424,11 @@ mod test {
         ds.complete_work(upstairs_id, JobId(1001), m);
 
         // Process the two ExtentReopen commands
-        for id in (1002..=1003).map(JobId) {
-            let ds_work = ds.in_progress(upstairs_id, id).unwrap();
-            let m = ds.do_work(id, &ds_work, upstairs_connection).await;
+        let new_work = ds.take_ready_work(upstairs_id);
+        println!("Got new work: {:?}", new_work);
+        assert_eq!(new_work.len(), 2);
+        for (ds_id, ds_work) in new_work {
+            let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
             match m {
                 Message::ExtentLiveAckId {
                     upstairs_id,
@@ -3473,18 +3438,18 @@ mod test {
                 } => {
                     assert_eq!(upstairs_id, upstairs_connection.upstairs_id);
                     assert_eq!(session_id, upstairs_connection.session_id);
-                    assert_eq!(job_id, id);
+                    assert_eq!(job_id, ds_id);
                     assert!(result.is_ok());
                 }
                 _ => {
-                    panic!("Incorrect message: {:?} for id: {}", m, id);
+                    panic!("Incorrect message: {:?} for id: {}", m, ds_id);
                 }
             }
-            ds.complete_work(upstairs_id, id, m);
+            ds.complete_work(upstairs_id, ds_id, m);
         }
 
         // Nothing should be left on the queue.
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3571,31 +3536,31 @@ mod test {
 
         show_work(&mut ds);
 
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 4);
 
-        // Process the first Write
-        let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
-        ds.complete_work(upstairs_id, JobId(1000), m);
-
-        // Process the flush
-        let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
-        ds.complete_work(upstairs_id, JobId(1001), m);
+        // The first write and flush should be ready now
+        assert_eq!(new_work.len(), 2);
+        for (i, (ds_id, ds_work)) in new_work.into_iter().enumerate() {
+            assert_eq!(ds_id, JobId(1000 + i as u64));
+            let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
+            ds.complete_work(upstairs_id, ds_id, m);
+        }
 
         // Process write 2
-        let ds_work = ds.in_progress(upstairs_id, JobId(1002)).unwrap();
-        let m = ds.do_work(JobId(1002), &ds_work, upstairs_connection).await;
-        ds.complete_work(upstairs_id, JobId(1002), m);
-
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 1);
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1002));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
+        ds.complete_work(upstairs_id, *ds_id, m);
 
         // Process the ExtentClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1003)).unwrap();
-        let m = ds.do_work(JobId(1003), &ds_work, upstairs_connection).await;
+        let new_work = ds.take_ready_work(upstairs_id);
+        assert_eq!(new_work.len(), 1);
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1003));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written but not flushed, the close would
@@ -3620,10 +3585,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1003), m);
+        ds.complete_work(upstairs_id, *ds_id, m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3663,13 +3628,14 @@ mod test {
 
         show_work(&mut ds);
 
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 2);
+        assert_eq!(new_work.len(), 1);
 
         // Process the Write
-        let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1000));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.
         match m {
@@ -3688,14 +3654,17 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1000), m);
+        ds.complete_work(upstairs_id, *ds_id, m);
 
-        let new_work = ds.new_work(upstairs_id);
+        // Now, the ExtentClose should be ready
+        let new_work = ds.take_ready_work(upstairs_id);
+        println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 1);
 
         // Process the ExtentClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1001));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written but not flushed, the close would
@@ -3723,7 +3692,7 @@ mod test {
         ds.complete_work(upstairs_id, JobId(1001), m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3765,13 +3734,14 @@ mod test {
 
         show_work(&mut ds);
 
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 2);
+        assert_eq!(new_work.len(), 1);
 
         // Process the Write
-        let ds_work = ds.in_progress(upstairs_id, JobId(1000)).unwrap();
-        let m = ds.do_work(JobId(1000), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1000));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.
         match m {
@@ -3792,12 +3762,13 @@ mod test {
         }
         ds.complete_work(upstairs_id, JobId(1000), m);
 
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 1);
 
         // Process the ExtentFlushClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1001)).unwrap();
-        let m = ds.do_work(JobId(1001), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1001));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written, and we sent a "flush and close"
@@ -3825,7 +3796,7 @@ mod test {
         ds.complete_work(upstairs_id, JobId(1001), m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3886,20 +3857,27 @@ mod test {
 
         show_work(&mut ds);
 
-        let new_work = ds.new_work(upstairs_id);
+        // The two writes will both show up as ready work
+        let new_work = ds.take_ready_work(upstairs_id);
         println!("Got new work: {:?}", new_work);
-        assert_eq!(new_work.len(), 4);
+        assert_eq!(new_work.len(), 2);
 
         // Process the Writes
-        for id in (1000..=1001).map(JobId) {
-            let ds_work = ds.in_progress(upstairs_id, id).unwrap();
-            let m = ds.do_work(id, &ds_work, upstairs_connection).await;
-            ds.complete_work(upstairs_id, id, m);
+        for (i, (ds_id, ds_work)) in new_work.into_iter().enumerate() {
+            assert_eq!(ds_id, JobId(1000 + i as u64));
+            let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
+            ds.complete_work(upstairs_id, ds_id, m);
         }
 
+        // Now, the ExtentFlushClose and ExtentClose should both be ready
+        let new_work = ds.take_ready_work(upstairs_id);
+        println!("Got new work: {:?}", new_work);
+        assert_eq!(new_work.len(), 2);
+
         // Process the ExtentFlushClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1002)).unwrap();
-        let m = ds.do_work(JobId(1002), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[0];
+        assert_eq!(*ds_id, JobId(1002));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written, and we sent a "flush and close"
@@ -3924,11 +3902,12 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1002), m);
+        ds.complete_work(upstairs_id, *ds_id, m);
 
         // Process the ExtentClose
-        let ds_work = ds.in_progress(upstairs_id, JobId(1003)).unwrap();
-        let m = ds.do_work(JobId(1003), &ds_work, upstairs_connection).await;
+        let (ds_id, ds_work) = &new_work[1];
+        assert_eq!(*ds_id, JobId(1003));
+        let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
         // Verify that we not only have composed the correct ACK, but the
         // result inside that ACK is also what we expect.  In this case
         // because the extent was written, and we sent a "flush and close"
@@ -3953,9 +3932,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1003), m);
+        ds.complete_work(upstairs_id, *ds_id, m);
+
         // Nothing should be left on the queue.
-        let new_work = ds.new_work(upstairs_id);
+        let new_work = ds.take_ready_work(upstairs_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -5202,16 +5182,14 @@ mod test {
         };
         ds.add_work(id_2, JobId(1000), read_2.clone())?;
 
-        let work_1 = ds.new_work(id_1);
-        let work_2 = ds.new_work(id_2);
+        let work_1 = ds.take_ready_work(id_1);
+        let work_2 = ds.take_ready_work(id_2);
+        assert_eq!(work_1.len(), 1);
+        assert_eq!(work_2.len(), 1);
 
-        assert_eq!(work_1, work_2);
-
-        let job_1 = ds.get_job(id_1, JobId(1000));
-        let job_2 = ds.get_job(id_2, JobId(1000));
-
-        assert_eq!(job_1, &read_1);
-        assert_eq!(job_2, &read_2);
+        assert_eq!(work_1[0].0, work_2[0].0, "mismatched JobIds");
+        assert_eq!(work_1[0].1, read_1);
+        assert_eq!(work_2[0].1, read_2);
 
         Ok(())
     }
