@@ -673,7 +673,7 @@ async fn socket_io_loop<RT, WT>(
                             break;
                         }
                         None => {
-                            error!(rx_log, "rx channel closed");
+                            warn!(rx_log, "rx channel closed");
                             break;
                         }
                     };
