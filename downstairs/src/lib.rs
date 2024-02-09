@@ -411,7 +411,7 @@ pub mod cdt {
     fn submit__read__start(_: u64) {}
     fn ds__lock__time(_: u64) {}
     fn add__work__len(_: u64) {}
-    fn new__work__len(_: u64) {}
+    fn new__work__len(_: u64, _: u64, _: u64, _: u64) {}
     fn total_work_done(_: u64) {}
     fn submit__writeunwritten__start(_: u64) {}
     fn submit__write__start(_: u64) {}
@@ -2841,9 +2841,20 @@ impl Work {
     fn new_work(&self, upstairs_connection: UpstairsConnection) -> Vec<JobId> {
         let mut result = Vec::with_capacity(self.active.len());
 
+        let mut new_jobs = 0;
+        let mut dep_wait = 0;
+        let mut in_progress = 0;
+        let mut done = 0;
         for job in self.active.values() {
             if job.upstairs_connection != upstairs_connection {
                 panic!("Old Upstairs Job in new_work!");
+            }
+
+            match job.state {
+                WorkState::New => new_jobs += 1,
+                WorkState::DepWait => dep_wait += 1,
+                WorkState::InProgress => in_progress += 1,
+                WorkState::Done => done += 1,
             }
 
             if job.state == WorkState::New || job.state == WorkState::DepWait {
@@ -2852,7 +2863,7 @@ impl Work {
         }
 
         result.sort_unstable();
-        cdt::new__work__len!(|| result.len() as u64);
+        cdt::new__work__len!(|| (new_jobs, dep_wait, in_progress, done));
 
         result
     }
