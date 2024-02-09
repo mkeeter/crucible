@@ -410,6 +410,9 @@ pub mod cdt {
     use crate::Arg;
     fn submit__read__start(_: u64) {}
     fn ds__lock__time(_: u64) {}
+    fn add__work__len(_: u64) {}
+    fn new__work__len(_: u64) {}
+    fn total_work_done(_: u64) {}
     fn submit__writeunwritten__start(_: u64) {}
     fn submit__write__start(_: u64) {}
     fn submit__flush__start(_: u64) {}
@@ -1024,6 +1027,7 @@ async fn do_work_task(
          * sorted before it is returned so this function iterates through jobs
          * in order.
          */
+        let mut jobs_done = 0u64;
         while let Some(new_id) = new_work.pop_front() {
             if is_lossy && random() && random() {
                 // Skip a job that needs to be done, moving it to the back of
@@ -1056,6 +1060,7 @@ async fn do_work_task(
                 .await
                 .do_work(upstairs_connection, job_id)
                 .await?;
+            jobs_done += 1;
 
             // If a different downstairs was promoted, then `do_work` returns
             // `None` and we ignore the job.
@@ -1114,6 +1119,7 @@ async fn do_work_task(
                 cdt::work__done!(|| job_id.0);
             }
         }
+        cdt::total_work_done!(|| jobs_done);
     }
 
     // None means the channel is closed
@@ -2846,12 +2852,14 @@ impl Work {
         }
 
         result.sort_unstable();
+        cdt::new__work__len!(|| result.len() as u64);
 
         result
     }
 
     fn add_work(&mut self, ds_id: JobId, dsw: DownstairsWork) {
         self.active.insert(ds_id, dsw);
+        cdt::add__work__len!(|| self.active.len() as u64);
     }
 
     #[cfg(test)]
