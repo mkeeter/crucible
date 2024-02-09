@@ -14,7 +14,7 @@ use std::time::Duration;
 use crucible::*;
 use crucible_common::{build_logger, Block, CrucibleError, MAX_BLOCK_SIZE};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::BytesMut;
 use futures::{
     future::{ready, BoxFuture, Either},
@@ -1071,11 +1071,88 @@ impl Downstairs {
                 ds_work,
                 connection_id,
                 msg,
-            } => panic!(),
+            } => {
+                if let Err(e) = self
+                    .handle_io_completion(connection_id, ds_id, ds_work, msg)
+                    .await
+                {
+                    warn!(
+                        self.log,
+                        "got error {e:?} while handling IO completion {ds_id}"
+                    );
+                    self.drop_connection(connection_id);
+                }
+            }
         }
 
         // Now, perform all pending IO work
         self.submit_ready_ios().await;
+    }
+
+    async fn handle_io_completion(
+        &mut self,
+        connection_id: ConnectionId,
+        ds_id: JobId,
+        ds_work: IOop,
+        msg: Message,
+    ) -> Result<()> {
+        let Some(up) = self.connections.get_mut(&connection_id) else {
+            warn!(
+                self.log,
+                "Ignoring IO completion {ds_id} because the connection is gone"
+            );
+            return Ok(());
+        };
+
+        if let Some(error) = msg.err() {
+            up.message_tx
+                .send(Message::ErrorReport {
+                    upstairs_id: up.upstairs_connection.upstairs_id,
+                    session_id: up.upstairs_connection.session_id,
+                    job_id: ds_id,
+                    error: error.clone(),
+                })
+                .await?;
+
+            // If this is a repair job, and that repair failed, we
+            // can do no more work on this downstairs and should
+            // force everything to come down before more work arrives.
+            //
+            // We have replied to the Upstairs above, which lets the
+            // upstairs take action to abort the repair and continue
+            // working in some degraded state.
+            //
+            // If you change this, change how the Upstairs processes
+            // ErrorReports!
+            if matches!(msg, Message::ExtentLiveRepairAckId { .. }) {
+                Err(anyhow!("Repair has failed, exiting task"))
+            } else {
+                // If the job errored, do not consider it completed; return it
+                // so that it can be requeued.
+                let work = up.work_mut().unwrap();
+                work.add_work(ds_id, ds_work);
+                Ok(())
+            }
+        } else {
+            // Update our stats
+            self.complete_work_stat(&msg, ds_id);
+            let is_flush = matches!(msg, Message::FlushAck { .. });
+
+            // Notify the upstairs before completing work
+            let up = &mut self.connections.get_mut(&connection_id).unwrap();
+            up.message_tx.send(msg).await?;
+
+            let work = up.work_mut().unwrap();
+            if is_flush {
+                work.last_flush = ds_id;
+                work.completed.clear();
+            } else {
+                work.completed.insert(ds_id);
+            }
+
+            cdt::work__done!(|| ds_id.0);
+            Ok(())
+        }
     }
 
     /// Drops the given connection
@@ -1599,8 +1676,7 @@ impl Downstairs {
                     writes,
                 };
 
-                self.try_do_work_and_reply(target, job_id, new_write)
-                    .await?;
+                self.try_submit_work(target, job_id, new_write).await?;
                 Some(job_id)
             }
             Message::Flush {
@@ -1622,8 +1698,7 @@ impl Downstairs {
                     extent_limit,
                 };
 
-                self.try_do_work_and_reply(target, job_id, new_flush)
-                    .await?;
+                self.try_submit_work(target, job_id, new_flush).await?;
                 Some(job_id)
             }
             Message::WriteUnwritten {
@@ -1639,8 +1714,7 @@ impl Downstairs {
                     writes,
                 };
 
-                self.try_do_work_and_reply(target, job_id, new_write)
-                    .await?;
+                self.try_submit_work(target, job_id, new_write).await?;
                 Some(job_id)
             }
             Message::ReadRequest {
@@ -1656,7 +1730,7 @@ impl Downstairs {
                     requests,
                 };
 
-                self.try_do_work_and_reply(target, job_id, new_read).await?;
+                self.try_submit_work(target, job_id, new_read).await?;
                 Some(job_id)
             }
             // These are for repair while taking live IO
@@ -1673,8 +1747,7 @@ impl Downstairs {
                     extent: extent_id,
                 };
 
-                self.try_do_work_and_reply(target, job_id, ext_close)
-                    .await?;
+                self.try_submit_work(target, job_id, ext_close).await?;
                 Some(job_id)
             }
             Message::ExtentLiveFlushClose {
@@ -1694,8 +1767,7 @@ impl Downstairs {
                     gen_number,
                 };
 
-                self.try_do_work_and_reply(target, job_id, new_flush)
-                    .await?;
+                self.try_submit_work(target, job_id, new_flush).await?;
                 Some(job_id)
             }
             Message::ExtentLiveRepair {
@@ -1714,8 +1786,7 @@ impl Downstairs {
                 };
 
                 debug!(up.log, "Received ExtentLiveRepair {}", job_id);
-                self.try_do_work_and_reply(target, job_id, new_repair)
-                    .await?;
+                self.try_submit_work(target, job_id, new_repair).await?;
                 Some(job_id)
             }
             Message::ExtentLiveReopen {
@@ -1730,7 +1801,7 @@ impl Downstairs {
                     extent: extent_id,
                 };
 
-                self.try_do_work_and_reply(target, job_id, new_open).await?;
+                self.try_submit_work(target, job_id, new_open).await?;
                 Some(job_id)
             }
             Message::ExtentLiveNoOp {
@@ -1742,7 +1813,7 @@ impl Downstairs {
                 let new_open = IOop::ExtentLiveNoOp { dependencies };
 
                 debug!(up.log, "Received NoOP {}", job_id);
-                self.try_do_work_and_reply(target, job_id, new_open).await?;
+                self.try_submit_work(target, job_id, new_open).await?;
                 Some(job_id)
             }
 
@@ -1905,6 +1976,37 @@ impl Downstairs {
         let up = &mut self.connections.get_mut(&target).unwrap();
         up.work_mut().unwrap().add_work(ds_id, work);
 
+        Ok(())
+    }
+
+    /// If the given job has all of its dependencies met, submit it
+    ///
+    /// If the IO work is not ready (or failed), adds the job to the active jobs
+    /// list.
+    ///
+    /// Returns an error if there was an internal error and we should bail out
+    /// of this connection entirely.
+    async fn try_submit_work(
+        &mut self,
+        connection_id: ConnectionId,
+        ds_id: JobId,
+        ds_work: IOop,
+    ) -> Result<()> {
+        let up = &mut self.connections.get_mut(&connection_id).unwrap();
+        let work = up.work().unwrap();
+        if work.unfinished_deps(&ds_work) == 0 {
+            let upstairs_connection = up.upstairs_connection;
+            let fut =
+                self.submit_work(ds_id, &ds_work, upstairs_connection).await;
+            self.pending.push_back(PendingWork {
+                ds_id,
+                ds_work,
+                fut,
+                connection_id,
+            });
+        } else {
+            self.add_work(connection_id, ds_id, ds_work)?;
+        }
         Ok(())
     }
 
@@ -2212,6 +2314,7 @@ impl Downstairs {
     ///
     /// This is infallible, because any errors are encoded in the returned
     /// `Message` (and logged).
+    #[cfg(test)]
     async fn do_work(
         &mut self,
         job_id: JobId,
@@ -2279,105 +2382,6 @@ impl Downstairs {
                 fut,
                 connection_id,
             });
-        }
-    }
-
-    /// If the given job has all of its dependencies met, do its work and reply
-    ///
-    /// If the IO work is not ready (or failed), adds the job to the active jobs
-    /// list.
-    ///
-    /// Returns an error if there was an internal error and we should bail out
-    /// of this connection entirely.
-    async fn try_do_work_and_reply(
-        &mut self,
-        target: ConnectionId,
-        ds_id: JobId,
-        ds_work: IOop,
-    ) -> Result<()> {
-        let up = &mut self.connections.get_mut(&target).unwrap();
-        let work = up.work().unwrap();
-        if work.unfinished_deps(&ds_work) == 0 {
-            if let Some((ds_id, ds_work)) =
-                self.do_work_and_reply(ds_id, ds_work, target).await?
-            {
-                self.add_work(target, ds_id, ds_work)?;
-            }
-        } else {
-            self.add_work(target, ds_id, ds_work)?;
-        }
-        Ok(())
-    }
-
-    /// Do the given IO work and send a reply to the upstairs
-    ///
-    /// The given job must be runnable, i.e. have all of its dependencies met.
-    ///
-    /// Returns `Ok(Some(..))` if the IO work failed and we should retry it.
-    ///
-    /// Returns an error if there was an internal error and we should bail out
-    /// of this connection entirely.
-    async fn do_work_and_reply(
-        &mut self,
-        ds_id: JobId,
-        ds_work: IOop,
-        target: ConnectionId,
-    ) -> Result<Option<(JobId, IOop)>> {
-        let up = &mut self.connections.get_mut(&target).unwrap();
-        let upstairs_connection = up.upstairs_connection();
-        let m = self.do_work(ds_id, &ds_work, upstairs_connection).await;
-
-        if let Some(error) = m.err() {
-            // Reborrow `up`
-            let up = &mut self.connections.get_mut(&target).unwrap();
-
-            up.message_tx
-                .send(Message::ErrorReport {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id: ds_id,
-                    error: error.clone(),
-                })
-                .await?;
-
-            // If this is a repair job, and that repair failed, we
-            // can do no more work on this downstairs and should
-            // force everything to come down before more work arrives.
-            //
-            // We have replied to the Upstairs above, which lets the
-            // upstairs take action to abort the repair and continue
-            // working in some degraded state.
-            //
-            // If you change this, change how the Upstairs processes
-            // ErrorReports!
-            if matches!(m, Message::ExtentLiveRepairAckId { .. }) {
-                bail!("Repair has failed, exiting task");
-            } else {
-                // If the job errored, do not consider it completed; return it
-                // so that it can be requeued.
-                Ok(Some((ds_id, ds_work)))
-            }
-        } else {
-            // Update our stats
-            self.complete_work_stat(&m, ds_id);
-
-            // Notify the upstairs before completing work
-            let is_flush = matches!(m, Message::FlushAck { .. });
-
-            // Send the reply
-            let up = &mut self.connections.get_mut(&target).unwrap();
-            up.message_tx.send(m).await?;
-
-            let work = up.work_mut().unwrap();
-            if is_flush {
-                work.last_flush = ds_id;
-                work.completed.clear();
-            } else {
-                work.completed.insert(ds_id);
-            }
-
-            cdt::work__done!(|| ds_id.0);
-            Ok(None)
         }
     }
 
