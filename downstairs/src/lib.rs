@@ -892,7 +892,26 @@ pub struct Downstairs {
     /// Indicates that the socket listener and all IO tasks are done
     done: bool,
 
+    pending: VecDeque<PendingWork>,
+
     log: Logger,
+}
+
+struct PendingWork {
+    connection_id: ConnectionId,
+    ds_id: JobId,
+    ds_work: IOop,
+    fut: BoxFuture<'static, Message>,
+}
+
+impl std::fmt::Debug for PendingWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("PendingWork")
+            .field("ds_id", &self.ds_id)
+            .field("ds_work", &self.ds_work)
+            .field("fut", &"[..]")
+            .finish()
+    }
 }
 
 /// IO handle to communicate with the downstairs
@@ -910,6 +929,14 @@ enum Action {
 
     /// We received a message on the given connection
     Message(Message, ConnectionId),
+
+    /// A pending IO message has finished
+    IoComplete {
+        connection_id: ConnectionId,
+        ds_id: JobId,
+        ds_work: IOop,
+        msg: Message,
+    },
 
     /// The rx channel has closed
     ///
@@ -956,6 +983,7 @@ impl Downstairs {
                 repair_address: None,
                 next_connection_id: 0,
                 done: false,
+                pending: VecDeque::new(),
                 rx,
                 log,
             },
@@ -965,11 +993,30 @@ impl Downstairs {
 
     /// Selects from many possible actions
     async fn select(&mut self) -> Action {
-        match self.rx.recv().await {
-            Some(m) => m,
-            None => {
-                warn!(self.log, "downstairs tx was dropped");
-                Action::RxChannelClosed
+        tokio::select! {
+            r = self.rx.recv() =>  {
+                match r {
+                    Some(m) => m,
+                    None => {
+                        warn!(self.log, "downstairs tx was dropped");
+                        Action::RxChannelClosed
+                    }
+                }
+            }
+            msg = async {
+                if self.pending.is_empty() {
+                    futures::future::pending().await
+                } else {
+                    (&mut self.pending.front_mut().unwrap().fut).await
+                }
+            } => {
+                let d = self.pending.pop_front().unwrap();
+                Action::IoComplete {
+                    connection_id: d.connection_id,
+                    msg,
+                    ds_id: d.ds_id,
+                    ds_work: d.ds_work,
+                }
             }
         }
     }
@@ -1019,10 +1066,16 @@ impl Downstairs {
             Action::RxChannelClosed => {
                 self.done = true;
             }
+            Action::IoComplete {
+                ds_id,
+                ds_work,
+                connection_id,
+                msg,
+            } => panic!(),
         }
 
         // Now, perform all pending IO work
-        self.do_io_work().await;
+        self.submit_ready_ios().await;
     }
 
     /// Drops the given connection
@@ -1857,14 +1910,19 @@ impl Downstairs {
 
     /// Submit actual IO work to the IO task
     ///
+    /// The returned value is a future that resolves when the IO is complete
+    /// with the resulting `Message`.  The IO itself is self-driving; we need
+    /// not await the future to cause it to progress.
+    ///
     /// This is infallible, because any errors are encoded in the returned
     /// `Message` (and logged).
+    #[must_use]
     async fn submit_work(
         &mut self,
         job_id: JobId,
         work: &IOop,
         upstairs_connection: UpstairsConnection,
-    ) -> BoxFuture<Message> {
+    ) -> BoxFuture<'static, Message> {
         let log = self.log.clone();
         match &work {
             IOop::Read {
@@ -2165,7 +2223,7 @@ impl Downstairs {
     }
 
     /// Process all available IO work
-    async fn do_io_work(&mut self) {
+    async fn submit_ready_ios(&mut self) {
         // Add a little time to completion for this operation.
         if self.lossy && random() && random() {
             info!(self.log, "[lossy] sleeping 1 second");
@@ -2176,36 +2234,17 @@ impl Downstairs {
         // function on &mut self below.
         let vs = self.active_upstairs.values().cloned().collect::<Vec<_>>();
         for i in vs {
-            if let Err(e) = self.do_io_work_for(i).await {
-                warn!(
-                    self.log,
-                    "got error {e:?} while doing io work for {i:?}"
-                );
-                self.drop_connection(i);
-            }
+            self.submit_ready_ios_for(i).await
         }
     }
 
-    /// Perform all pending IO work for a single Upstairs connection
-    async fn do_io_work_for(&mut self, target: ConnectionId) -> Result<()> {
-        while self.do_one_round_of_io_work_for(target).await? {
-            // keep going until all pending work is done
-        }
-        Ok(())
-    }
-
-    /// Perform all currently pending IO work for a single Upstairs connection
+    /// Submit all currently pending IO work for a single Upstairs connection
     ///
-    /// This may cause other jobs to become active!
-    ///
-    /// Returns `Ok(true)` if work was done, or `false` otherwise.
-    async fn do_one_round_of_io_work_for(
-        &mut self,
-        target: ConnectionId,
-    ) -> Result<bool> {
-        let up = &mut self.connections.get_mut(&target).unwrap();
+    /// This is infallible; it simply submits jobs to the IO worker task
+    async fn submit_ready_ios_for(&mut self, connection_id: ConnectionId) {
+        let up = &mut self.connections.get_mut(&connection_id).unwrap();
         let Some(work) = up.work_mut() else {
-            return Ok(false);
+            return;
         };
 
         /*
@@ -2214,9 +2253,8 @@ impl Downstairs {
          */
         let mut new_work: VecDeque<(JobId, IOop)> =
             work.take_ready_work(&self.log).into();
-        if new_work.is_empty() {
-            return Ok(false);
-        }
+
+        let upstairs_connection = up.upstairs_connection();
 
         /*
          * We don't have to do jobs in order, but the dependencies are, at
@@ -2233,15 +2271,15 @@ impl Downstairs {
             }
 
             cdt::work__process!(|| ds_id.0);
-            if let Some((ds_id, ds_work)) =
-                self.do_work_and_reply(ds_id, ds_work, target).await?
-            {
-                // If the job errored, do not consider it completed; add it back
-                // to the `new_work` queue for another attempt.
-                new_work.push_back((ds_id, ds_work));
-            }
+            let fut =
+                self.submit_work(ds_id, &ds_work, upstairs_connection).await;
+            self.pending.push_back(PendingWork {
+                ds_id,
+                ds_work,
+                fut,
+                connection_id,
+            });
         }
-        Ok(true)
     }
 
     /// If the given job has all of its dependencies met, do its work and reply
