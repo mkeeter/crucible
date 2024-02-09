@@ -358,8 +358,8 @@ pub fn show_work(ds: &mut Downstairs) {
             println!("Crucible Downstairs work queue:");
             kvec.sort_unstable();
             for id in kvec.iter() {
-                let dsw = work.active.get(id).unwrap();
-                let (dsw_type, dep_list) = match &dsw {
+                let dsw = &work.active.get(id).unwrap().0;
+                let (dsw_type, dep_list) = match dsw {
                     IOop::Read { dependencies, .. } => ("Read", dependencies),
                     IOop::Write { dependencies, .. } => ("Write", dependencies),
                     IOop::Flush { dependencies, .. } => ("Flush", dependencies),
@@ -1145,9 +1145,10 @@ impl Downstairs {
             let work = up.work_mut().unwrap();
             if is_flush {
                 work.last_flush = ds_id;
+                work.mark_complete(ds_id);
                 work.completed.clear();
             } else {
-                work.completed.insert(ds_id);
+                work.mark_complete(ds_id);
             }
 
             cdt::work__done!(|| ds_id.0);
@@ -1943,7 +1944,7 @@ impl Downstairs {
     fn take_ready_work(&mut self, target: ConnectionId) -> Vec<(JobId, IOop)> {
         let up = self.connections.get_mut(&target).unwrap();
         let work = up.work_mut().unwrap();
-        work.take_ready_work(&self.log)
+        work.take_ready_work()
     }
 
     // Add work to the Downstairs
@@ -1994,7 +1995,7 @@ impl Downstairs {
     ) -> Result<()> {
         let up = &mut self.connections.get_mut(&connection_id).unwrap();
         let work = up.work().unwrap();
-        if work.unfinished_deps(&ds_work) == 0 {
+        if work.unfinished_deps(&ds_work).count() == 0 {
             let upstairs_connection = up.upstairs_connection;
             let fut =
                 self.submit_work(ds_id, &ds_work, upstairs_connection).await;
@@ -2355,7 +2356,7 @@ impl Downstairs {
          * are New or DepWait.
          */
         let mut new_work: VecDeque<(JobId, IOop)> =
-            work.take_ready_work(&self.log).into();
+            work.take_ready_work().into();
 
         let upstairs_connection = up.upstairs_connection();
 
@@ -2398,9 +2399,10 @@ impl Downstairs {
         // Complete the job
         if matches!(m, Message::FlushAck { .. }) {
             work.last_flush = ds_id;
+            work.mark_complete(ds_id);
             work.completed.clear();
         } else {
-            work.completed.insert(ds_id);
+            work.mark_complete(ds_id);
         }
     }
 
@@ -2598,12 +2600,21 @@ impl Downstairs {
 }
 
 /*
- * The structure that tracks downstairs work in progress
+ * The structure that tracks pending downstairs work
  */
 #[derive(Debug)]
 pub struct Work {
-    active: HashMap<JobId, IOop>,
-    outstanding_deps: HashMap<JobId, usize>,
+    /// Map from a job ID to a (work, unsatisfied dependencies) tuple
+    ///
+    /// The latter is decremented as dependencies are met; once it hits zero,
+    /// the job is removed from this map and moved to `ready_work`.
+    active: HashMap<JobId, (IOop, usize)>,
+
+    /// Jobs with all dependencies met
+    ready_work: Vec<(JobId, IOop)>,
+
+    /// Map from a job ID to jobs which have it as a dependent
+    dependents: HashMap<JobId, Vec<JobId>>,
 
     /*
      * We have to keep track of all IOs that have been issued since
@@ -2619,14 +2630,18 @@ impl Work {
     fn new() -> Self {
         Work {
             active: HashMap::new(),
-            outstanding_deps: HashMap::new(),
-            last_flush: JobId(0), // TODO(matt) make this an Option?
+            ready_work: Vec::new(),
+            dependents: HashMap::new(),
+            last_flush: JobId(0),
             completed: HashSet::with_capacity(32),
         }
     }
 
     /// Count the number of unfinished deps for the given IOop
-    fn unfinished_deps(&self, io: &IOop) -> usize {
+    fn unfinished_deps<'a>(
+        &'a self,
+        io: &'a IOop,
+    ) -> impl Iterator<Item = JobId> + 'a {
         // The Downstairs currently assumes that all jobs previous to the
         // last flush have completed, hence the comparison against
         // `self.last_flush`
@@ -2639,7 +2654,6 @@ impl Work {
             .iter()
             .cloned()
             .filter(|d| *d > self.last_flush && !self.completed.contains(d))
-            .count()
     }
 
     /// Removes and returns all work whose dependencies are met
@@ -2647,62 +2661,61 @@ impl Work {
     /// After this function returns, the work must either be completed or
     /// returned to the active map (otherwise, it will be lost).
     #[must_use]
-    fn take_ready_work(&mut self, log: &Logger) -> Vec<(JobId, IOop)> {
-        let mut ready = vec![];
-        for (ds_id, io) in &self.active {
-            let num_deps = self.unfinished_deps(io);
-            if num_deps == 0 {
-                ready.push(*ds_id);
-            } else {
-                // If the number of dependencies has changed, then print some
-                // info about them.
-                let print = if let Some(n) = self.outstanding_deps.get(ds_id) {
-                    *n != num_deps
-                } else {
-                    false
-                };
-
-                if print {
-                    warn!(
-                        log,
-                        "{} job {} waiting on {} deps",
-                        ds_id,
-                        match io {
-                            IOop::Write { .. } => "Write",
-                            IOop::WriteUnwritten { .. } => "WriteUnwritten",
-                            IOop::Flush { .. } => "Flush",
-                            IOop::Read { .. } => "Read",
-                            IOop::ExtentClose { .. } => "ECLose",
-                            IOop::ExtentFlushClose { .. } => "EFlushCLose",
-                            IOop::ExtentLiveRepair { .. } => "ELiveRepair",
-                            IOop::ExtentLiveReopen { .. } => "ELiveReopen",
-                            IOop::ExtentLiveNoOp { .. } => "NoOp",
-                        },
-                        num_deps,
-                    );
-                }
-                self.outstanding_deps.insert(*ds_id, num_deps);
-            }
-        }
-        ready.sort_unstable();
-
-        // Remove all ready jobs from the work map
+    fn take_ready_work(&mut self) -> Vec<(JobId, IOop)> {
+        let mut ready = std::mem::take(&mut self.ready_work);
+        ready.sort_unstable_by_key(|v| v.0);
         ready
-            .into_iter()
-            .map(|ds_id| (ds_id, self.active.remove(&ds_id).unwrap()))
-            .collect()
     }
 
     /// Returns a list of work that is active in the map
     #[cfg(test)]
     fn new_work(&self) -> Vec<JobId> {
-        let mut out: Vec<JobId> = self.active.keys().cloned().collect();
+        let mut out: Vec<JobId> = self
+            .active
+            .keys()
+            .cloned()
+            .chain(self.ready_work.iter().map(|v| v.0))
+            .collect();
         out.sort_unstable();
         out
     }
 
     fn add_work(&mut self, ds_id: JobId, dsw: IOop) {
-        self.active.insert(ds_id, dsw);
+        let mut n = 0;
+        // Steal `self.dependents` so we can call `self.unfinished_deps`
+        let mut deps = std::mem::take(&mut self.dependents);
+        for parent in self.unfinished_deps(&dsw) {
+            deps.entry(parent).or_default().push(ds_id);
+            n += 1;
+        }
+        self.dependents = deps;
+
+        if n == 0 {
+            self.ready_work.push((ds_id, dsw));
+        } else {
+            self.active.insert(ds_id, (dsw, n));
+        }
+    }
+
+    /// Mark the given job as complete
+    ///
+    /// This may cause some of its children to be marked as ready
+    fn mark_complete(&mut self, ds_id: JobId) {
+        let children = self.dependents.remove(&ds_id);
+        for child_id in children.iter().flatten() {
+            let Some((_, child_deps)) = self.active.get_mut(child_id) else {
+                // Parents only know about their children once the children are
+                // added to the map, so it should be impossible for a child to
+                // have gone missing here
+                panic!("child has gone missing");
+            };
+            *child_deps -= 1;
+            if *child_deps == 0 {
+                let (child_work, _) = self.active.remove(child_id).unwrap();
+                self.ready_work.push((*child_id, child_work));
+            }
+        }
+        self.completed.insert(ds_id);
     }
 
     /// Returns completed work as a sorted `Vec`
@@ -3104,16 +3117,17 @@ mod test {
 
         if is_flush {
             work.last_flush = ds_id;
+            work.mark_complete(ds_id);
             work.completed.clear();
         } else {
-            work.completed.insert(ds_id);
+            work.mark_complete(ds_id);
         }
     }
 
     fn test_push_next_jobs(work: &mut Work) -> (Vec<JobId>, Vec<IOop>) {
         let mut ids = vec![];
         let mut jobs = vec![];
-        for (ds_id, ds_work) in work.take_ready_work(&csl()) {
+        for (ds_id, ds_work) in work.take_ready_work() {
             ids.push(ds_id);
             jobs.push(ds_work);
         }
