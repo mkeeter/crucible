@@ -3138,9 +3138,9 @@ mod test {
         )
         .await?;
 
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let rio = IOop::Read {
             dependencies: Vec::new(),
@@ -3149,7 +3149,7 @@ mod test {
                 offset: Block::new_512(1),
             }],
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         let deps = vec![JobId(1000)];
         let rio = IOop::Read {
@@ -3159,14 +3159,14 @@ mod test {
                 offset: Block::new_512(1),
             }],
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         show_work(&mut ds);
 
         // Now we mimic what happens in the do_work_task()
         let chunk_sizes = [1, 1, 0]; // each job is independent
         for c in chunk_sizes {
-            let new_work = ds.take_ready_work(upstairs_id);
+            let new_work = ds.take_ready_work(conn_id);
             println!("Got new work: {:?}", new_work);
             assert_eq!(new_work.len(), c);
 
@@ -3174,7 +3174,7 @@ mod test {
                 println!("Do IOop {}", ds_id);
                 let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
                 println!("Got m: {:?}", m);
-                ds.complete_work(upstairs_id, ds_id, m);
+                ds.complete_work(conn_id, ds_id, m);
             }
         }
         show_work(&mut ds);
@@ -3233,15 +3233,15 @@ mod test {
         let (mut ds, _chan) =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
 
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let rio = IOop::ExtentClose {
             dependencies: Vec::new(),
             extent: 0,
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         let rio = IOop::ExtentFlushClose {
             dependencies: vec![],
@@ -3249,7 +3249,7 @@ mod test {
             flush_number: 1,
             gen_number: 2,
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         let deps = vec![JobId(1000), JobId(1001)];
         let rio = IOop::Read {
@@ -3259,18 +3259,18 @@ mod test {
                 offset: Block::new_512(1),
             }],
         };
-        ds.add_work(upstairs_id, JobId(1002), rio)?;
+        ds.add_work(conn_id, JobId(1002), rio)?;
 
         let deps = vec![JobId(1000), JobId(1001), JobId(1002)];
         let rio = IOop::ExtentLiveNoOp { dependencies: deps };
-        ds.add_work(upstairs_id, JobId(1003), rio)?;
+        ds.add_work(conn_id, JobId(1003), rio)?;
 
         let deps = vec![JobId(1000), JobId(1001), JobId(1002), JobId(1003)];
         let rio = IOop::ExtentLiveReopen {
             dependencies: deps,
             extent: 0,
         };
-        ds.add_work(upstairs_id, JobId(1004), rio)?;
+        ds.add_work(conn_id, JobId(1004), rio)?;
 
         println!("Before doing work we have:");
         show_work(&mut ds);
@@ -3284,7 +3284,7 @@ mod test {
             0, // no work remaining
         ];
         for c in chunk_sizes {
-            let new_work = ds.take_ready_work(upstairs_id);
+            let new_work = ds.take_ready_work(conn_id);
             println!("Got new work: {:?}", new_work);
             assert_eq!(new_work.len(), c);
 
@@ -3292,7 +3292,7 @@ mod test {
                 println!("Do IOop {}", id);
                 let m = ds.do_work(id, &ds_work, upstairs_connection).await;
                 println!("Got m: {:?}", m);
-                ds.complete_work(upstairs_id, id, m);
+                ds.complete_work(conn_id, id, m);
             }
         }
 
@@ -3313,15 +3313,15 @@ mod test {
 
         let (mut ds, _chan) =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let rio = IOop::ExtentClose {
             dependencies: Vec::new(),
             extent: 0,
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         let rio = IOop::ExtentFlushClose {
             dependencies: vec![],
@@ -3329,23 +3329,23 @@ mod test {
             flush_number: 1,
             gen_number: gen,
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         // Add the two reopen commands for the two extents we closed.
         let rio = IOop::ExtentLiveReopen {
             dependencies: vec![JobId(1000)],
             extent: 0,
         };
-        ds.add_work(upstairs_id, JobId(1002), rio)?;
+        ds.add_work(conn_id, JobId(1002), rio)?;
         let rio = IOop::ExtentLiveReopen {
             dependencies: vec![JobId(1001)],
             extent: 1,
         };
-        ds.add_work(upstairs_id, JobId(1003), rio)?;
+        ds.add_work(conn_id, JobId(1003), rio)?;
         show_work(&mut ds);
 
         // At this point, the ExtentClose and ExtentFlushClose should be ready
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 2);
 
@@ -3377,7 +3377,7 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1000), m);
+        ds.complete_work(conn_id, JobId(1000), m);
 
         // Process the ExtentFlushClose
         let (ds_id, ds_work) = &new_work[1];
@@ -3407,10 +3407,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1001), m);
+        ds.complete_work(conn_id, JobId(1001), m);
 
         // Process the two ExtentReopen commands
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 2);
         for (ds_id, ds_work) in new_work {
@@ -3431,11 +3431,11 @@ mod test {
                     panic!("Incorrect message: {:?} for id: {}", m, ds_id);
                 }
             }
-            ds.complete_work(upstairs_id, ds_id, m);
+            ds.complete_work(conn_id, ds_id, m);
         }
 
         // Nothing should be left on the queue.
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3480,9 +3480,9 @@ mod test {
 
         let (mut ds, _chan) =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let eid = 3;
 
@@ -3492,7 +3492,7 @@ mod test {
             dependencies: Vec::new(),
             writes,
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         // add work for flush 1001
         let rio = IOop::Flush {
@@ -3502,7 +3502,7 @@ mod test {
             snapshot_details: None,
             extent_limit: None,
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         // Add work for 2nd write 1002
         let writes = create_generic_test_write(eid);
@@ -3511,18 +3511,18 @@ mod test {
             dependencies: vec![JobId(1000), JobId(1001)],
             writes,
         };
-        ds.add_work(upstairs_id, JobId(1002), rio)?;
+        ds.add_work(conn_id, JobId(1002), rio)?;
 
         // Now close the extent
         let rio = IOop::ExtentClose {
             dependencies: vec![JobId(1000), JobId(1001), JobId(1002)],
             extent: eid as usize,
         };
-        ds.add_work(upstairs_id, JobId(1003), rio)?;
+        ds.add_work(conn_id, JobId(1003), rio)?;
 
         show_work(&mut ds);
 
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
 
         // The first write and flush should be ready now
@@ -3530,19 +3530,19 @@ mod test {
         for (i, (ds_id, ds_work)) in new_work.into_iter().enumerate() {
             assert_eq!(ds_id, JobId(1000 + i as u64));
             let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
-            ds.complete_work(upstairs_id, ds_id, m);
+            ds.complete_work(conn_id, ds_id, m);
         }
 
         // Process write 2
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 1);
         let (ds_id, ds_work) = &new_work[0];
         assert_eq!(*ds_id, JobId(1002));
         let m = ds.do_work(*ds_id, ds_work, upstairs_connection).await;
-        ds.complete_work(upstairs_id, *ds_id, m);
+        ds.complete_work(conn_id, *ds_id, m);
 
         // Process the ExtentClose
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 1);
         let (ds_id, ds_work) = &new_work[0];
         assert_eq!(*ds_id, JobId(1003));
@@ -3571,10 +3571,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, *ds_id, m);
+        ds.complete_work(conn_id, *ds_id, m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3592,9 +3592,9 @@ mod test {
 
         let (mut ds, _chan) =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let eid = 0;
 
@@ -3604,17 +3604,17 @@ mod test {
             dependencies: Vec::new(),
             writes,
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         let rio = IOop::ExtentClose {
             dependencies: vec![JobId(1000)],
             extent: eid as usize,
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         show_work(&mut ds);
 
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 1);
 
@@ -3640,10 +3640,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, *ds_id, m);
+        ds.complete_work(conn_id, *ds_id, m);
 
         // Now, the ExtentClose should be ready
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 1);
 
@@ -3675,10 +3675,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1001), m);
+        ds.complete_work(conn_id, JobId(1001), m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3696,9 +3696,9 @@ mod test {
 
         let (mut ds, _chan) =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let eid = 1;
 
@@ -3708,7 +3708,7 @@ mod test {
             dependencies: Vec::new(),
             writes,
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         let rio = IOop::ExtentFlushClose {
             dependencies: vec![JobId(1000)],
@@ -3716,11 +3716,11 @@ mod test {
             flush_number: 3,
             gen_number: gen,
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         show_work(&mut ds);
 
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 1);
 
@@ -3746,9 +3746,9 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1000), m);
+        ds.complete_work(conn_id, JobId(1000), m);
 
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 1);
 
         // Process the ExtentFlushClose
@@ -3779,10 +3779,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, JobId(1001), m);
+        ds.complete_work(conn_id, JobId(1001), m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
@@ -3802,9 +3802,9 @@ mod test {
 
         let (mut ds, _chan) =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
-        let upstairs_id = create_test_upstairs(&mut ds);
+        let conn_id = create_test_upstairs(&mut ds);
         let upstairs_connection =
-            ds.connections[&upstairs_id].upstairs_connection();
+            ds.connections[&conn_id].upstairs_connection();
 
         let eid_one = 1;
         let eid_two = 2;
@@ -3815,7 +3815,7 @@ mod test {
             dependencies: Vec::new(),
             writes,
         };
-        ds.add_work(upstairs_id, JobId(1000), rio)?;
+        ds.add_work(conn_id, JobId(1000), rio)?;
 
         // Create the write for extent 2
         let writes = create_generic_test_write(eid_two);
@@ -3823,7 +3823,7 @@ mod test {
             dependencies: Vec::new(),
             writes,
         };
-        ds.add_work(upstairs_id, JobId(1001), rio)?;
+        ds.add_work(conn_id, JobId(1001), rio)?;
 
         // Flush and close extent 1
         let rio = IOop::ExtentFlushClose {
@@ -3832,19 +3832,19 @@ mod test {
             flush_number: 6,
             gen_number: gen,
         };
-        ds.add_work(upstairs_id, JobId(1002), rio)?;
+        ds.add_work(conn_id, JobId(1002), rio)?;
 
         // Just close extent 2
         let rio = IOop::ExtentClose {
             dependencies: vec![JobId(1001)],
             extent: eid_two as usize,
         };
-        ds.add_work(upstairs_id, JobId(1003), rio)?;
+        ds.add_work(conn_id, JobId(1003), rio)?;
 
         show_work(&mut ds);
 
         // The two writes will both show up as ready work
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 2);
 
@@ -3852,11 +3852,11 @@ mod test {
         for (i, (ds_id, ds_work)) in new_work.into_iter().enumerate() {
             assert_eq!(ds_id, JobId(1000 + i as u64));
             let m = ds.do_work(ds_id, &ds_work, upstairs_connection).await;
-            ds.complete_work(upstairs_id, ds_id, m);
+            ds.complete_work(conn_id, ds_id, m);
         }
 
         // Now, the ExtentFlushClose and ExtentClose should both be ready
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         println!("Got new work: {:?}", new_work);
         assert_eq!(new_work.len(), 2);
 
@@ -3888,7 +3888,7 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, *ds_id, m);
+        ds.complete_work(conn_id, *ds_id, m);
 
         // Process the ExtentClose
         let (ds_id, ds_work) = &new_work[1];
@@ -3918,10 +3918,10 @@ mod test {
                 panic!("Incorrect message: {:?}", m);
             }
         }
-        ds.complete_work(upstairs_id, *ds_id, m);
+        ds.complete_work(conn_id, *ds_id, m);
 
         // Nothing should be left on the queue.
-        let new_work = ds.take_ready_work(upstairs_id);
+        let new_work = ds.take_ready_work(conn_id);
         assert_eq!(new_work.len(), 0);
         Ok(())
     }
