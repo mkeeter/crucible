@@ -16,7 +16,10 @@ use crucible_common::{build_logger, Block, CrucibleError, MAX_BLOCK_SIZE};
 
 use anyhow::{bail, Result};
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt};
+use futures::{
+    future::{ready, BoxFuture, Either},
+    SinkExt, StreamExt,
+};
 use rand::prelude::*;
 use slog::{debug, error, info, o, warn, Logger};
 use tokio::net::TcpListener;
@@ -1852,16 +1855,17 @@ impl Downstairs {
         Ok(())
     }
 
-    /// Perform actual IO work on the disk
+    /// Submit actual IO work to the IO task
     ///
     /// This is infallible, because any errors are encoded in the returned
     /// `Message` (and logged).
-    async fn do_work(
+    async fn submit_work(
         &mut self,
         job_id: JobId,
         work: &IOop,
         upstairs_connection: UpstairsConnection,
-    ) -> Message {
+    ) -> BoxFuture<Message> {
+        let log = self.log.clone();
         match &work {
             IOop::Read {
                 dependencies,
@@ -1871,72 +1875,99 @@ impl Downstairs {
                  * Any error from an IO should be intercepted here and passed
                  * back to the upstairs.
                  */
-                let responses = if self.read_errors && random() && random() {
+                let fut = if self.read_errors && random() && random() {
                     warn!(self.log, "returning error on read!");
-                    Err(CrucibleError::GenericError("test error".to_string()))
+                    Either::Left(ready(Err(CrucibleError::GenericError(
+                        "test error".to_string(),
+                    ))))
                 } else {
-                    self.region.region_read(requests, job_id).await
+                    Either::Right(
+                        self.region.submit_region_read(requests, job_id).await,
+                    )
                 };
-                debug!(
-                    self.log,
-                    "Read      :{} deps:{:?} res:{}",
-                    job_id,
-                    dependencies,
-                    responses.is_ok(),
-                );
+                let deps = dependencies.clone(); // to move into future
+                Box::pin(async move {
+                    let responses = fut.await;
+                    debug!(
+                        log,
+                        "Read      :{} deps:{:?} res:{}",
+                        job_id,
+                        deps,
+                        responses.is_ok(),
+                    );
 
-                Message::ReadResponse {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    responses,
-                }
+                    Message::ReadResponse {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        responses,
+                    }
+                })
             }
             IOop::WriteUnwritten { writes, .. } => {
                 /*
                  * Any error from an IO should be intercepted here and passed
                  * back to the upstairs.
                  */
-                let result = if self.write_errors && random() && random() {
+                let fut = if self.write_errors && random() && random() {
                     warn!(self.log, "returning error on writeunwritten!");
-                    Err(CrucibleError::GenericError("test error".to_string()))
+                    Either::Left(ready(Err(CrucibleError::GenericError(
+                        "test error".to_string(),
+                    ))))
                 } else {
                     // The region_write will handle what happens to each block
                     // based on if they have data or not.
-                    self.region.region_write(writes, job_id, true).await
+                    Either::Right(
+                        self.region
+                            .submit_region_write(writes, job_id, true)
+                            .await,
+                    )
                 };
 
-                Message::WriteUnwrittenAck {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                Box::pin(async move {
+                    let result = fut.await;
+                    Message::WriteUnwrittenAck {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::Write {
                 dependencies,
                 writes,
             } => {
-                let result = if self.write_errors && random() && random() {
+                let fut = if self.write_errors && random() && random() {
                     warn!(self.log, "returning error on write!");
-                    Err(CrucibleError::GenericError("test error".to_string()))
+                    Either::Left(ready(Err(CrucibleError::GenericError(
+                        "test error".to_string(),
+                    ))))
                 } else {
-                    self.region.region_write(writes, job_id, false).await
+                    Either::Right(
+                        self.region
+                            .submit_region_write(writes, job_id, false)
+                            .await,
+                    )
                 };
-                debug!(
-                    self.log,
-                    "Write     :{} deps:{:?} res:{}",
-                    job_id,
-                    dependencies,
-                    result.is_ok(),
-                );
+                let deps = dependencies.clone(); // to move into future
+                Box::pin(async move {
+                    let result = fut.await;
+                    debug!(
+                        log,
+                        "Write     :{} deps:{:?} res:{}",
+                        job_id,
+                        deps,
+                        result.is_ok(),
+                    );
 
-                Message::WriteAck {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                    Message::WriteAck {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::Flush {
                 dependencies,
@@ -1966,12 +1997,15 @@ impl Downstairs {
                     flush_number, gen_number,
                 );
 
-                Message::FlushAck {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                // This future resolves immediately, instead of being deferred
+                Box::pin(async move {
+                    Message::FlushAck {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::ExtentClose {
                 dependencies,
@@ -1987,12 +2021,14 @@ impl Downstairs {
                     result.is_ok(),
                 );
 
-                Message::ExtentLiveCloseAck {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                Box::pin(async move {
+                    Message::ExtentLiveCloseAck {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::ExtentFlushClose {
                 dependencies,
@@ -2028,12 +2064,14 @@ impl Downstairs {
                     gen_number,
                 );
 
-                Message::ExtentLiveCloseAck {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                Box::pin(async move {
+                    Message::ExtentLiveCloseAck {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::ExtentLiveRepair {
                 dependencies,
@@ -2059,12 +2097,14 @@ impl Downstairs {
                     result.is_ok(),
                 );
 
-                Message::ExtentLiveRepairAckId {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                Box::pin(async move {
+                    Message::ExtentLiveRepairAckId {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::ExtentLiveReopen {
                 dependencies,
@@ -2079,12 +2119,14 @@ impl Downstairs {
                     dependencies,
                     result.is_ok(),
                 );
-                Message::ExtentLiveAckId {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                Box::pin(async move {
+                    Message::ExtentLiveAckId {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
             IOop::ExtentLiveNoOp { dependencies } => {
                 debug!(self.log, "Work of: LiveNoOp {}", job_id);
@@ -2096,14 +2138,30 @@ impl Downstairs {
                     dependencies,
                     result.is_ok(),
                 );
-                Message::ExtentLiveAckId {
-                    upstairs_id: upstairs_connection.upstairs_id,
-                    session_id: upstairs_connection.session_id,
-                    job_id,
-                    result,
-                }
+                Box::pin(async move {
+                    Message::ExtentLiveAckId {
+                        upstairs_id: upstairs_connection.upstairs_id,
+                        session_id: upstairs_connection.session_id,
+                        job_id,
+                        result,
+                    }
+                })
             }
         }
+    }
+
+    /// Perform actual IO work on the disk
+    ///
+    /// This is infallible, because any errors are encoded in the returned
+    /// `Message` (and logged).
+    async fn do_work(
+        &mut self,
+        job_id: JobId,
+        work: &IOop,
+        upstairs_connection: UpstairsConnection,
+    ) -> Message {
+        let fut = self.submit_work(job_id, work, upstairs_connection).await;
+        fut.await
     }
 
     /// Process all available IO work
