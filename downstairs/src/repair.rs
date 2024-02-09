@@ -45,7 +45,7 @@ fn build_api() -> ApiDescription<Arc<FileServerContext>> {
 
 /// Returns Ok(listen address) if everything launched ok, Err otherwise
 pub async fn repair_main(
-    ds: &Mutex<Downstairs>,
+    ds: &crate::SpicyMutex<Downstairs>,
     addr: SocketAddr,
     log: &Logger,
 ) -> Result<SocketAddr, String> {

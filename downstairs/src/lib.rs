@@ -117,6 +117,17 @@ impl IOop {
     }
 }
 
+#[derive(Debug)]
+pub struct SpicyMutex<T>(Mutex<T>);
+impl<T> SpicyMutex<T> {
+    pub async fn lock(&self) -> MutexGuard<T> {
+        let t = std::time::Instant::now();
+        let out = self.0.lock().await;
+        cdt::ds__lock__time!(|| t.elapsed().as_micros() as u64);
+        out
+    }
+}
+
 /*
  * Export the contents or partial contents of a Downstairs Region to
  * the file indicated.
@@ -398,6 +409,7 @@ pub async fn show_work(ds: &mut Downstairs) {
 pub mod cdt {
     use crate::Arg;
     fn submit__read__start(_: u64) {}
+    fn ds__lock__time(_: u64) {}
     fn submit__writeunwritten__start(_: u64) {}
     fn submit__write__start(_: u64) {}
     fn submit__flush__start(_: u64) {}
@@ -566,7 +578,7 @@ async fn is_message_valid(
  */
 async fn proc_frame(
     upstairs_connection: UpstairsConnection,
-    ad: &Mutex<Downstairs>,
+    ad: &SpicyMutex<Downstairs>,
     m: Message,
     resp_tx: &mpsc::Sender<Message>,
     job_channel_tx: &mpsc::Sender<()>,
@@ -967,7 +979,7 @@ async fn proc_frame(
 }
 
 async fn do_work_task(
-    ads: &Mutex<Downstairs>,
+    ads: &SpicyMutex<Downstairs>,
     upstairs_connection: UpstairsConnection,
     mut job_channel_rx: mpsc::Receiver<()>,
     resp_tx: mpsc::Sender<Message>,
@@ -1109,7 +1121,7 @@ async fn do_work_task(
 }
 
 async fn proc_stream(
-    ads: &Arc<Mutex<Downstairs>>,
+    ads: &Arc<SpicyMutex<Downstairs>>,
     stream: WrappedStream,
 ) -> Result<()> {
     match stream {
@@ -1147,7 +1159,7 @@ pub struct UpstairsConnection {
  * taking IOs from the upstairs.
  */
 async fn proc<RT, WT>(
-    ads: &Arc<Mutex<Downstairs>>,
+    ads: &Arc<SpicyMutex<Downstairs>>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
 ) -> Result<()>
@@ -1617,7 +1629,7 @@ where
  * downstairs is ready to receive IO.
  */
 async fn resp_loop<RT, WT>(
-    ads: &Arc<Mutex<Downstairs>>,
+    ads: &Arc<SpicyMutex<Downstairs>>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
     fw: FramedWrite<WT, CrucibleEncoder>,
     mut another_upstairs_active_rx: oneshot::Receiver<UpstairsConnection>,
@@ -3121,7 +3133,7 @@ pub async fn build_downstairs_for_region(
     flush_errors: bool,
     read_only: bool,
     log_request: Option<Logger>,
-) -> Result<Arc<Mutex<Downstairs>>> {
+) -> Result<Arc<SpicyMutex<Downstairs>>> {
     build_downstairs_for_region_with_backend(
         data,
         lossy,
@@ -3148,7 +3160,7 @@ pub async fn build_downstairs_for_region_with_backend(
     read_only: bool,
     backend: Backend,
     log_request: Option<Logger>,
-) -> Result<Arc<Mutex<Downstairs>>> {
+) -> Result<Arc<SpicyMutex<Downstairs>>> {
     let log = match log_request {
         Some(log) => log,
         None => build_logger(),
@@ -3173,7 +3185,7 @@ pub async fn build_downstairs_for_region_with_backend(
 
     let encrypted = region.encrypted();
 
-    Ok(Arc::new(Mutex::new(Downstairs::new(
+    Ok(Arc::new(SpicyMutex(Mutex::new(Downstairs::new(
         region,
         lossy,
         read_errors,
@@ -3182,7 +3194,7 @@ pub async fn build_downstairs_for_region_with_backend(
         read_only,
         encrypted,
         log,
-    ))))
+    )))))
 }
 
 /// Returns Ok if everything spawned ok, Err otherwise
@@ -3191,7 +3203,7 @@ pub async fn build_downstairs_for_region_with_backend(
 /// successfully, and Err otherwise.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_downstairs(
-    d: Arc<Mutex<Downstairs>>,
+    d: Arc<SpicyMutex<Downstairs>>,
     address: IpAddr,
     oximeter: Option<SocketAddr>,
     port: u16,
@@ -3366,7 +3378,7 @@ pub async fn start_downstairs(
 /// The source downstairs must have the same RegionDefinition as we do,
 /// and both downstairs must be running in read only mode.
 pub async fn clone_region(
-    d: Arc<Mutex<Downstairs>>,
+    d: Arc<SpicyMutex<Downstairs>>,
     source: SocketAddr,
 ) -> Result<()> {
     let info = crucible_common::BuildInfo::default();
@@ -3682,7 +3694,7 @@ mod test {
         extent_size: u64,
         extent_count: u32,
         dir: &TempDir,
-    ) -> Result<Arc<Mutex<Downstairs>>> {
+    ) -> Result<Arc<SpicyMutex<Downstairs>>> {
         // create region
         let mut region_options: crucible_common::RegionOptions =
             Default::default();
@@ -5567,7 +5579,7 @@ mod test {
 
     async fn build_test_downstairs(
         read_only: bool,
-    ) -> Result<Arc<Mutex<Downstairs>>> {
+    ) -> Result<Arc<SpicyMutex<Downstairs>>> {
         let block_size: u64 = 512;
         let extent_size = 4;
 

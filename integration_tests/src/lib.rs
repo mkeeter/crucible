@@ -33,7 +33,7 @@ mod test {
     struct TestDownstairs {
         address: IpAddr,
         tempdir: TempDir,
-        downstairs: Arc<Mutex<Downstairs>>,
+        downstairs: Arc<SpicyMutex<Downstairs>>,
     }
 
     impl TestDownstairs {
