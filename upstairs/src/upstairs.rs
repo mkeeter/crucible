@@ -456,37 +456,20 @@ impl Upstairs {
             => {
                 UpstairsAction::RepairCheck
             }
-            d = self.deferred_reqs.next(), if !self.deferred_reqs.is_empty()
-            => {
+            d = self.deferred_reqs.next() => {
                 match d {
                     // Normal operation: the deferred task gave us back a
                     // DeferredBlockReq, which we need to handle.
-                    Some(Some(d)) => UpstairsAction::DeferredBlockReq(d),
+                    Some(d) => UpstairsAction::DeferredBlockReq(d),
 
                     // The innermost Option is None if the deferred task handled
                     // the request on its own (and replied to the `BlockReq`
                     // already). This happens if encryption fails, which would
                     // be odd, but possible?
-                    Some(None) => UpstairsAction::NoOp,
-
-                    // The outer Option is None if the FuturesOrdered is empty
-                    None => {
-                        // Calling `deferred_reqs.next()` on an empty queue must
-                        // set the flag marking the deferred futures list as
-                        // empty; assert that here as a sanity check.
-                        assert!(self.deferred_reqs.is_empty());
-                        UpstairsAction::NoOp
-                    }
+                    None => UpstairsAction::NoOp,
                 }
             }
-            m = self.deferred_msgs.next(), if !self.deferred_msgs.is_empty()
-            => {
-                // The outer Option is None if the queue is empty.  If this is
-                // the case, then we check that the empty flag was set.
-                let Some(m) = m else {
-                    assert!(self.deferred_msgs.is_empty());
-                    return UpstairsAction::NoOp;
-                };
+            m = self.deferred_msgs.next() => {
                 UpstairsAction::DeferredMessage(m)
             }
             _ = sleep_until(self.leak_deadline) => {
@@ -668,8 +651,8 @@ impl Upstairs {
     /// want to stall the Upstairs.
     #[cfg(test)]
     async fn await_deferred_reqs(&mut self) {
-        while let Some(req) = self.deferred_reqs.next().await {
-            let req = req.unwrap(); // the deferred request should not fail
+        while !self.deferred_reqs.is_empty() {
+            let req = self.deferred_reqs.next().await.unwrap();
             self.apply(UpstairsAction::DeferredBlockReq(req)).await;
         }
         assert!(self.deferred_reqs.is_empty());
@@ -683,7 +666,8 @@ impl Upstairs {
     /// want to stall the Upstairs.
     #[cfg(test)]
     async fn await_deferred_msgs(&mut self) {
-        while let Some(msg) = self.deferred_msgs.next().await {
+        while !self.deferred_msgs.is_empty() {
+            let msg = self.deferred_msgs.next().await;
             self.apply(UpstairsAction::DeferredMessage(msg)).await;
         }
         assert!(self.deferred_msgs.is_empty());
