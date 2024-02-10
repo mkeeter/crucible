@@ -272,7 +272,7 @@ async fn main() -> Result<()> {
                     .expect("Error init tracing subscriber");
             }
 
-            let d = build_downstairs_for_region(
+            let (d, _chan) = build_downstairs_for_region(
                 &data,
                 false,
                 false,
@@ -404,7 +404,7 @@ async fn main() -> Result<()> {
             }
 
             let read_only = mode == Mode::Ro;
-            let d = build_downstairs_for_region(
+            let (ds, chan) = build_downstairs_for_region(
                 &data,
                 lossy,
                 read_errors,
@@ -415,8 +415,9 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            let downstairs_join_handle = start_downstairs(
-                d,
+            let downstairs = start_downstairs(
+                ds,
+                chan,
                 address,
                 oximeter,
                 port,
@@ -428,7 +429,7 @@ async fn main() -> Result<()> {
             )
             .await?;
 
-            downstairs_join_handle.await?
+            downstairs.task.await?
         }
         Args::RepairAPI => repair::write_openapi(&mut std::io::stdout()),
         Args::Serve {

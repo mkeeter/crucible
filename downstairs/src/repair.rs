@@ -45,7 +45,9 @@ fn build_api() -> ApiDescription<Arc<FileServerContext>> {
 
 /// Returns Ok(listen address) if everything launched ok, Err otherwise
 pub async fn repair_main(
-    ds: &Mutex<Downstairs>,
+    region_dir: PathBuf,
+    read_only: bool,
+    region_definition: RegionDefinition,
     addr: SocketAddr,
     log: &Logger,
 ) -> Result<SocketAddr, String> {
@@ -63,17 +65,6 @@ pub async fn repair_main(
      */
     let api = build_api();
 
-    /*
-     * Record the region directory where all the extents and metadata
-     * files live.
-     */
-    let ds = ds.lock().await;
-    let region_dir = ds.region.dir.clone();
-    let read_only = ds.read_only;
-    let region_definition = ds.region.def();
-    drop(ds);
-
-    info!(log, "Repair listens on {} for path:{:?}", addr, region_dir);
     let context = FileServerContext {
         region_dir,
         read_only,
