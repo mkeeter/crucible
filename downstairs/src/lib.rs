@@ -1875,12 +1875,18 @@ impl Downstairs {
     ///
     /// This is infallible, because any errors are encoded in the returned
     /// `Message` (and logged).
+    ///
+    /// # Panics
+    /// If given upstair is not active
     async fn do_work(
         &mut self,
         job_id: JobId,
         work: &IOop,
         upstairs_connection: UpstairsConnection,
     ) -> Message {
+        assert!(self
+            .active_upstairs
+            .contains_key(&upstairs_connection.upstairs_id));
         match &work {
             IOop::Read {
                 dependencies,
@@ -2065,14 +2071,10 @@ impl Downstairs {
                     extent,
                     source_repair_address
                 );
-                let result = if !self.is_active(upstairs_connection) {
-                    error!(self.log, "Upstairs inactive error");
-                    Err(CrucibleError::UpstairsInactive)
-                } else {
-                    self.region
-                        .repair_extent(*extent, *source_repair_address, false)
-                        .await
-                };
+                let result = self
+                    .region
+                    .repair_extent(*extent, *source_repair_address, false)
+                    .await;
                 debug!(
                     self.log,
                     "LiveRepair:{} extent {} deps:{:?} res:{}",
@@ -2222,7 +2224,19 @@ impl Downstairs {
         ds_id: JobId,
         ds_work: IOop,
     ) -> Result<()> {
-        let up = &mut self.connections.get_mut(&target).unwrap();
+        let up = self.connections.get_mut(&target).unwrap();
+        if !self
+            .active_upstairs
+            .contains_key(&up.upstairs_connection.upstairs_id)
+        {
+            error!(
+                self.log,
+                "Inactive upstairs at {:?} tried to do work",
+                up.upstairs_connection
+            );
+            return Err(CrucibleError::UpstairsInactive.into());
+        }
+
         let work = up.work().unwrap();
         if work.unfinished_deps(&ds_work) == 0 {
             if let Some((ds_id, ds_work)) =
@@ -2509,6 +2523,7 @@ impl Downstairs {
         }
     }
 
+    #[cfg(test)]
     fn is_active(&self, connection: UpstairsConnection) -> bool {
         let uuid = connection.upstairs_id;
         if let Some(id) = self.active_upstairs.get(&uuid) {
