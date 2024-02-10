@@ -981,7 +981,10 @@ impl Downstairs {
         match self.rx.recv().await {
             Some(m) => m,
             None => {
-                warn!(self.log, "downstairs tx was dropped");
+                // Warn the first time the channel is closed
+                if !self.done {
+                    warn!(self.log, "downstairs tx was dropped");
+                }
                 Action::RxChannelClosed
             }
         }
