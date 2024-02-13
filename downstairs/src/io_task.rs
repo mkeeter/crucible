@@ -55,7 +55,6 @@ impl IoTask {
                 IoRequest::NewExtent(index, e) => {
                     let i = index as usize / IO_THREAD_COUNT;
                     if i >= self.extents.len() {
-                        info!(self.log, "MATT resizing to {}", i + 1);
                         self.extents.resize_with(i + 1, || None);
                     }
                     let prev = self.extents[i].replace(e);
