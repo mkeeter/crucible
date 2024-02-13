@@ -631,7 +631,7 @@ impl Extent {
     }
 
     pub async fn dirty(&self) -> bool {
-        self.submit(|done| ExtentRequest::Dirty { done })
+        self.submit_and_wait(|done| ExtentRequest::Dirty { done })
             .await
             .unwrap()
     }
@@ -697,36 +697,6 @@ impl Extent {
         self.number
     }
 
-    /// Submits a read to the IO task
-    pub fn submit_read(
-        &mut self,
-        job_id: JobId,
-        requests: &[crucible_protocol::ReadRequest],
-    ) -> impl Future<
-        Output = Result<Vec<crucible_protocol::ReadResponse>, CrucibleError>,
-    > {
-        cdt::extent__read__start!(|| {
-            (job_id.0, self.number, requests.len() as u64)
-        });
-
-        let requests = requests.to_vec();
-        let request_count = requests.len();
-        let resp = self.submit(move |done| ExtentRequest::Read {
-            job_id,
-            requests,
-            done,
-        });
-
-        let number = self.number;
-        async move {
-            let r = resp.await;
-            cdt::extent__read__done!(|| {
-                (job_id.0, number, request_count as u64)
-            });
-            r
-        }
-    }
-
     /// Read the real data off underlying storage, and get block metadata. If
     /// an error occurs while processing any of the requests, an error is
     /// returned.
@@ -736,20 +706,36 @@ impl Extent {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        self.submit_read(job_id, requests).await
+        cdt::extent__read__start!(|| {
+            (job_id.0, self.number, requests.len() as u64)
+        });
+
+        let requests = requests.to_vec();
+        let request_count = requests.len();
+        let resp = self
+            .submit(move |done| ExtentRequest::Read {
+                job_id,
+                requests,
+                done,
+            })
+            .await;
+
+        cdt::extent__read__done!(|| {
+            (job_id.0, self.number, request_count as u64)
+        });
+        resp
     }
 
     /// Submit a write to the IO task
-    pub fn submit_write(
+    #[instrument]
+    pub async fn write(
         &mut self,
         job_id: JobId,
         writes: &[crucible_protocol::Write],
         only_write_unwritten: bool,
-    ) -> impl Future<Output = Result<(), CrucibleError>> {
+    ) -> Result<(), CrucibleError> {
         if self.read_only {
-            return Either::Left(ready(Err(
-                CrucibleError::ModifyingReadOnlyRegion,
-            )));
+            return Err(CrucibleError::ModifyingReadOnlyRegion);
         }
         cdt::extent__write__start!(|| {
             (job_id.0, self.number, writes.len() as u64)
@@ -759,32 +745,18 @@ impl Extent {
         let write_count = writes.len();
 
         // Send the job to the IO task
-        let resp = self.submit(move |done| ExtentRequest::Write {
+        let resp = self.submit_and_wait(move |done| ExtentRequest::Write {
             job_id,
             writes,
             only_write_unwritten,
             done,
         });
 
-        let number = self.number;
-        Either::Right(async move {
-            let r = resp.await;
-            cdt::extent__write__done!(|| {
-                (job_id.0, number, write_count as u64)
-            });
-            r
-        })
-    }
-
-    #[instrument]
-    pub async fn write(
-        &mut self,
-        job_id: JobId,
-        writes: &[crucible_protocol::Write],
-        only_write_unwritten: bool,
-    ) -> Result<(), CrucibleError> {
-        self.submit_write(job_id, writes, only_write_unwritten)
-            .await
+        let r = resp.await;
+        cdt::extent__write__done!(|| {
+            (job_id.0, self.number, write_count as u64)
+        });
+        r
     }
 
     pub(crate) fn submit_flush<I: Into<JobOrReconciliationId> + Debug>(
@@ -802,14 +774,34 @@ impl Extent {
         })
     }
 
-    #[instrument]
-    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
-        &mut self,
-        new_flush: u64,
-        new_gen: u64,
-        id: I, // only used for logging
-    ) -> Result<(), CrucibleError> {
-        self.submit_flush(new_flush, new_gen, id).await
+    /// Submits a job to the IO task and awaits the result
+    ///
+    /// If we'll be awaiting the future immediately, then this is more efficient
+    /// than `Self::submit`, which uses a more elaborate future construction
+    /// strategy.
+    async fn submit_and_wait<
+        T,
+        F: FnOnce(oneshot::Sender<Result<T, CrucibleError>>) -> ExtentRequest,
+    >(
+        &self,
+        f: F,
+    ) -> Result<T, CrucibleError> {
+        let (done, rx) = oneshot::channel();
+        let r = match self.io_tx.send(IoRequest::Io(self.number, f(done))) {
+            Ok(()) => rx,
+            Err(e) => {
+                error!(self.log, "send error: {e:?}");
+                return Err(CrucibleError::IoTaskError(format!(
+                    "send failed: {e:?}"
+                )));
+            }
+        };
+        match r.await {
+            Ok(v) => v,
+            Err(e) => {
+                Err(CrucibleError::IoTaskError(format!("recv failed: {e:?}")))
+            }
+        }
     }
 
     /// Submits a job to the IO task
@@ -845,7 +837,7 @@ impl Extent {
     }
 
     pub async fn get_meta_info(&self) -> ExtentMeta {
-        self.submit(|done| ExtentRequest::GetMetaInfo { done })
+        self.submit_and_wait(|done| ExtentRequest::GetMetaInfo { done })
             .await
             .unwrap()
     }
@@ -855,7 +847,7 @@ impl Extent {
         &mut self,
         block_context: DownstairsBlockContext,
     ) -> Result<(), CrucibleError> {
-        self.submit(|done| ExtentRequest::SetDirtyAndBlockContext {
+        self.submit_and_wait(|done| ExtentRequest::SetDirtyAndBlockContext {
             block_context,
             done,
         })
@@ -868,7 +860,7 @@ impl Extent {
         block: u64,
         count: u64,
     ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        self.submit(|done| ExtentRequest::GetBlockContexts {
+        self.submit_and_wait(|done| ExtentRequest::GetBlockContexts {
             block,
             count,
             done,
