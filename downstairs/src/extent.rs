@@ -644,7 +644,7 @@ impl Extent {
      */
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
         let r = self
-            .submit(|done| ExtentRequest::Close { done })
+            .submit_and_wait(|done| ExtentRequest::Close { done })
             .await
             .unwrap();
 
@@ -713,7 +713,7 @@ impl Extent {
         let requests = requests.to_vec();
         let request_count = requests.len();
         let resp = self
-            .submit(move |done| ExtentRequest::Read {
+            .submit_and_wait(move |done| ExtentRequest::Read {
                 job_id,
                 requests,
                 done,
