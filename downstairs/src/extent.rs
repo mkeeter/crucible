@@ -12,7 +12,7 @@ use nix::unistd::{sysconf, SysconfVar};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
-use crate::region::JobOrReconciliationId;
+use crate::{io_task::IoRequest, region::JobOrReconciliationId};
 use crucible_common::*;
 use repair_client::types::FileType;
 
@@ -24,15 +24,14 @@ pub struct Extent {
     read_only: bool,
 
     /// The actual extent work takes place in a separate IO task
-    io_tx: std::sync::mpsc::Sender<ExtentRequest>,
+    io_tx: std::sync::mpsc::Sender<IoRequest>,
 
     log: Logger,
 }
 
 /// Data used for the IO task
 #[derive(Debug)]
-struct ExtentRunner {
-    rx: std::sync::mpsc::Receiver<ExtentRequest>,
+pub(crate) struct ExtentRunner {
     iov_max: usize,
     read_only: bool,
 
@@ -46,24 +45,8 @@ struct ExtentRunner {
 }
 
 impl ExtentRunner {
-    /// Runs the IO loop
-    ///
-    /// The IO loop takes messages from `rx` and executes them on `inner`
-    ///
-    /// This function is infallible, because errors are reported to the caller
-    /// (via the `oneshot` in the `ExtentRequest`).
-    fn run(&mut self) {
-        while let Ok(m) = self.rx.recv() {
-            if !self.dispatch(m) {
-                info!(self.log, "io task saw an error, exiting");
-                return;
-            }
-        }
-        info!(self.log, "io task done, exiting");
-    }
-
     /// Process a single extent IO request, sending the reply down the oneshot
-    fn dispatch(&mut self, m: ExtentRequest) -> bool {
+    pub(crate) fn dispatch(&mut self, m: ExtentRequest) -> bool {
         match m {
             ExtentRequest::Dirty { done } => {
                 self.reply(done, self.inner.dirty());
@@ -153,7 +136,7 @@ impl ExtentRunner {
 }
 
 /// Messages to the extent runner task
-enum ExtentRequest {
+pub(crate) enum ExtentRequest {
     Dirty {
         done: oneshot::Sender<Result<bool, CrucibleError>>,
     },
@@ -455,12 +438,13 @@ impl Extent {
     /**
      * Open an existing extent file at the location requested.
      */
-    pub fn open(
+    pub(crate) fn open(
         dir: &Path,
         def: &RegionDefinition,
         number: u32,
         read_only: bool,
         backend: Backend,
+        io_tx: std::sync::mpsc::Sender<IoRequest>,
         log: &Logger,
     ) -> Result<Extent> {
         /*
@@ -612,32 +596,36 @@ impl Extent {
             }
         };
 
-        Self::start(number, read_only, inner, log)
+        Self::start(number, read_only, inner, io_tx, log)
     }
 
     fn start(
         number: u32,
         read_only: bool,
         inner: Box<dyn ExtentInner + Send + Sync>,
+        io_tx: std::sync::mpsc::Sender<IoRequest>,
         log: &Logger,
     ) -> Result<Self> {
         let log = log.new(o!("extent" => number.to_string()));
-        let (io_tx, rx) = std::sync::mpsc::channel();
-        let mut runner = ExtentRunner {
+        let runner = ExtentRunner {
             read_only,
             iov_max: Extent::get_iov_max()?,
             inner,
-            rx,
-            log: log.new(o!("task" => "io".to_string())),
+            log: log.new(o!("extent" => number.to_string())),
         };
-        std::thread::spawn(move || runner.run());
 
         let extent = Extent {
             number,
             read_only,
-            io_tx,
+            io_tx: io_tx.clone(),
             log,
         };
+
+        // The IO thread should never stop while we have a handle to it
+        // (even at shutdown, because it's not a Tokio task)
+        io_tx
+            .send(IoRequest::NewExtent(number, runner))
+            .expect("IO thread should never stop");
 
         Ok(extent)
     }
@@ -650,6 +638,9 @@ impl Extent {
 
     /**
      * Close an extent and the metadata db files for it.
+     *
+     * Notice that this consumes `self`, meaning no one else can use it
+     * afterwards; this ensures the extent is closed.
      */
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
         let r = self
@@ -665,11 +656,12 @@ impl Extent {
      * Start off with the default meta data.
      * Note that this function is not safe to run concurrently.
      */
-    pub fn create(
+    pub(crate) fn create(
         dir: &Path,
         def: &RegionDefinition,
         number: u32,
         backend: Backend,
+        io_tx: std::sync::mpsc::Sender<IoRequest>,
         log: &Logger,
     ) -> Result<Extent> {
         /*
@@ -698,7 +690,7 @@ impl Extent {
             ),
         };
 
-        Self::start(number, false, inner, log)
+        Self::start(number, false, inner, io_tx, log)
     }
 
     pub fn number(&self) -> u32 {
@@ -833,7 +825,7 @@ impl Extent {
         f: F,
     ) -> impl Future<Output = Result<T, CrucibleError>> {
         let (done, rx) = oneshot::channel();
-        let r = match self.io_tx.send(f(done)) {
+        let r = match self.io_tx.send(IoRequest::Io(self.number, f(done))) {
             Ok(()) => Either::Left(rx),
             Err(e) => {
                 error!(self.log, "send error: {e:?}");

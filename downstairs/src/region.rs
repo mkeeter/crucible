@@ -22,9 +22,12 @@ use crucible_protocol::SnapshotDetails;
 use repair_client::Client;
 
 use super::*;
-use crate::extent::{
-    copy_dir, extent_dir, extent_file_name, move_replacement_extent,
-    replace_dir, sync_path, Extent, ExtentMeta, ExtentState, ExtentType,
+use crate::{
+    extent::{
+        copy_dir, extent_dir, extent_file_name, move_replacement_extent,
+        replace_dir, sync_path, Extent, ExtentMeta, ExtentState, ExtentType,
+    },
+    io_task::{IoRequest, IoTask, IO_THREAD_COUNT},
 };
 
 /**
@@ -113,6 +116,9 @@ pub struct Region {
     /// The SQLite backend is only allowed in tests; all new extents must be raw
     /// files
     backend: Backend,
+
+    /// Handles to send IO work to the thread pool
+    io_queues: Vec<std::sync::mpsc::Sender<IoRequest>>,
 }
 
 impl Region {
@@ -245,6 +251,7 @@ impl Region {
             read_only: false,
             log,
             backend,
+            io_queues: vec![],
         };
         region.open_extents(true).await?;
         Ok(region)
@@ -338,6 +345,7 @@ impl Region {
             read_only,
             log: log.clone(),
             backend,
+            io_queues: vec![],
         };
 
         region.open_extents(false).await?;
@@ -379,36 +387,48 @@ impl Region {
      * return error if the file is already present.
      */
     async fn open_extents(&mut self, create: bool) -> Result<()> {
+        // Spawn IO worker threads if necessary
+        if self.io_queues.is_empty() {
+            for _ in 0..IO_THREAD_COUNT {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.io_queues.push(tx);
+                let mut io_task = IoTask::new(rx, &self.log);
+                std::thread::spawn(move || io_task.run());
+            }
+        }
+
         let next_eid = self.extents.len() as u32;
 
         let eid_range = next_eid..self.def.extent_count();
         let mut these_extents = Vec::with_capacity(eid_range.len());
 
         for eid in eid_range {
+            let io_queue =
+                self.io_queues[eid as usize % IO_THREAD_COUNT].clone();
             let extent = if create {
                 Extent::create(
                     &self.dir,
                     &self.def,
                     eid,
                     self.backend,
+                    io_queue,
                     &self.log,
                 )?
             } else {
-                let extent = Extent::open(
+                Extent::open(
                     &self.dir,
                     &self.def,
                     eid,
                     self.read_only,
                     self.backend,
+                    io_queue,
                     &self.log,
-                )?;
-
-                if extent.dirty().await {
-                    self.dirty_extents.insert(eid as usize);
-                }
-
-                extent
+                )?
             };
+
+            if !create && extent.dirty().await {
+                self.dirty_extents.insert(eid as usize);
+            }
 
             these_extents.push(ExtentState::Opened(extent));
         }
@@ -480,6 +500,7 @@ impl Region {
             eid as u32,
             self.read_only,
             Backend::RawFile,
+            self.io_queues[eid % IO_THREAD_COUNT].clone(),
             &self.log,
         )?;
 
