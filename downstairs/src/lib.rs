@@ -2640,8 +2640,8 @@ impl Downstairs {
              * in_progress method will only return a job if all
              * dependencies are met.
              */
-            let job_id =
-                ads.lock().await.in_progress(upstairs_connection, new_id)?;
+            let mut ds = ads.lock().await;
+            let job_id = ds.in_progress(upstairs_connection, new_id)?;
 
             // If the job's dependencies aren't met, then keep going
             let Some(job_id) = job_id else {
@@ -2649,11 +2649,7 @@ impl Downstairs {
             };
 
             cdt::work__process!(|| job_id.0);
-            let m = ads
-                .lock()
-                .await
-                .do_work(upstairs_connection, job_id)
-                .await?;
+            let m = ds.do_work(upstairs_connection, job_id).await?;
 
             // If a different downstairs was promoted, then `do_work` returns
             // `None` and we ignore the job.
@@ -2692,11 +2688,7 @@ impl Downstairs {
                 // The job completed successfully, so inform the
                 // Upstairs
 
-                ads.lock().await.complete_work_stat(
-                    upstairs_connection,
-                    &m,
-                    job_id,
-                )?;
+                ds.complete_work_stat(upstairs_connection, &m, job_id)?;
 
                 // Notify the upstairs before completing work, which
                 // consumes the message (so we'll check whether it's
@@ -2704,11 +2696,7 @@ impl Downstairs {
                 let is_flush = matches!(m, Message::FlushAck { .. });
                 resp_tx.send(m).await?;
 
-                ads.lock().await.complete_work_inner(
-                    upstairs_connection,
-                    job_id,
-                    is_flush,
-                )?;
+                ds.complete_work_inner(upstairs_connection, job_id, is_flush)?;
 
                 cdt::work__done!(|| job_id.0);
             }
