@@ -2403,6 +2403,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, new_write)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::Flush {
@@ -2426,6 +2433,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, new_flush)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::WriteUnwritten {
@@ -2443,6 +2457,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, new_write)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::ReadRequest {
@@ -2460,6 +2481,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, new_read)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             // These are for repair while taking live IO
@@ -2478,6 +2506,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, ext_close)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::ExtentLiveFlushClose {
@@ -2499,6 +2534,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, new_flush)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::ExtentLiveRepair {
@@ -2520,6 +2562,13 @@ impl Downstairs {
                 let mut d = ad.lock().await;
                 debug!(d.log, "Received ExtentLiveRepair {}", job_id);
                 d.add_work(upstairs_connection, job_id, new_repair)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::ExtentLiveReopen {
@@ -2536,6 +2585,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 d.add_work(upstairs_connection, job_id, new_open)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
             Message::ExtentLiveNoOp {
@@ -2549,6 +2605,13 @@ impl Downstairs {
                 let mut d = ad.lock().await;
                 debug!(d.log, "Received NoOP {}", job_id);
                 d.add_work(upstairs_connection, job_id, new_open)?;
+                let _ = d
+                    .try_to_do_work_and_reply(
+                        upstairs_connection,
+                        job_id,
+                        resp_tx,
+                    )
+                    .await?;
                 Some(job_id)
             }
 
