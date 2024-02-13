@@ -1545,6 +1545,82 @@ impl Downstairs {
         }
     }
 
+    /// Try to do IO work for the given job and push a reply to the queue
+    ///
+    /// Returns an error if something has gone **terribly** wrong and we should
+    /// bail out of the entire connection; normal errors are instead reported
+    /// upstairs via `resp_tx`.
+    ///
+    /// If the job did not complete and should be retried, it is returned in the
+    /// `Option`.  Otherwise, `Ok(None)` is returned, indicating that the job
+    /// was completed successfully.
+    async fn try_to_do_work_and_reply(
+        &mut self,
+        upstairs_connection: UpstairsConnection,
+        job_id: JobId,
+        resp_tx: &mpsc::Sender<Message>,
+    ) -> Result<Option<JobId>> {
+        let job_id = self.in_progress(upstairs_connection, job_id)?;
+
+        // If the job's dependencies aren't met, then keep going
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+
+        cdt::work__process!(|| job_id.0);
+        let m = self.do_work(upstairs_connection, job_id).await?;
+
+        // If a different downstairs was promoted, then `do_work` returns
+        // `None` and we ignore the job.
+        let Some(m) = m else {
+            return Ok(None);
+        };
+
+        if let Some(error) = m.err() {
+            resp_tx
+                .send(Message::ErrorReport {
+                    upstairs_id: upstairs_connection.upstairs_id,
+                    session_id: upstairs_connection.session_id,
+                    job_id,
+                    error: error.clone(),
+                })
+                .await?;
+
+            // If this is a repair job, and that repair failed, we
+            // can do no more work on this downstairs and should
+            // force everything to come down before more work arrives.
+            //
+            // We have replied to the Upstairs above, which lets the
+            // upstairs take action to abort the repair and continue
+            // working in some degraded state.
+            //
+            // If you change this, change how the Upstairs processes
+            // ErrorReports!
+            if matches!(m, Message::ExtentLiveRepairAckId { .. }) {
+                bail!("Repair has failed, exiting task");
+            } else {
+                // If the job errored, do not consider it completed.
+                // Return it so that it can be retried
+                Ok(Some(job_id))
+            }
+        } else {
+            // The job completed successfully, so inform the
+            // Upstairs
+            self.complete_work_stat(upstairs_connection, &m, job_id)?;
+
+            // Notify the upstairs before completing work, which
+            // consumes the message (so we'll check whether it's
+            // a FlushAck beforehand)
+            let is_flush = matches!(m, Message::FlushAck { .. });
+            resp_tx.send(m).await?;
+
+            self.complete_work_inner(upstairs_connection, job_id, is_flush)?;
+
+            cdt::work__done!(|| job_id.0);
+            Ok(None)
+        }
+    }
+
     // Given a job ID, do the work for that IO.
     //
     // Take a IOop type and (after some error checking), do the work
@@ -2641,64 +2717,12 @@ impl Downstairs {
              * dependencies are met.
              */
             let mut ds = ads.lock().await;
-            let job_id = ds.in_progress(upstairs_connection, new_id)?;
 
-            // If the job's dependencies aren't met, then keep going
-            let Some(job_id) = job_id else {
-                continue;
-            };
-
-            cdt::work__process!(|| job_id.0);
-            let m = ds.do_work(upstairs_connection, job_id).await?;
-
-            // If a different downstairs was promoted, then `do_work` returns
-            // `None` and we ignore the job.
-            let Some(m) = m else {
-                continue;
-            };
-
-            if let Some(error) = m.err() {
-                resp_tx
-                    .send(Message::ErrorReport {
-                        upstairs_id: upstairs_connection.upstairs_id,
-                        session_id: upstairs_connection.session_id,
-                        job_id: new_id,
-                        error: error.clone(),
-                    })
-                    .await?;
-
-                // If the job errored, do not consider it completed.
-                // Retry it.
-                new_work.push_back(new_id);
-
-                // If this is a repair job, and that repair failed, we
-                // can do no more work on this downstairs and should
-                // force everything to come down before more work arrives.
-                //
-                // We have replied to the Upstairs above, which lets the
-                // upstairs take action to abort the repair and continue
-                // working in some degraded state.
-                //
-                // If you change this, change how the Upstairs processes
-                // ErrorReports!
-                if matches!(m, Message::ExtentLiveRepairAckId { .. }) {
-                    bail!("Repair has failed, exiting task");
-                }
-            } else {
-                // The job completed successfully, so inform the
-                // Upstairs
-
-                ds.complete_work_stat(upstairs_connection, &m, job_id)?;
-
-                // Notify the upstairs before completing work, which
-                // consumes the message (so we'll check whether it's
-                // a FlushAck beforehand)
-                let is_flush = matches!(m, Message::FlushAck { .. });
-                resp_tx.send(m).await?;
-
-                ds.complete_work_inner(upstairs_connection, job_id, is_flush)?;
-
-                cdt::work__done!(|| job_id.0);
+            if let Some(failed_job_id) = ds
+                .try_to_do_work_and_reply(upstairs_connection, new_id, resp_tx)
+                .await?
+            {
+                new_work.push_back(failed_job_id);
             }
         }
         Ok(())
