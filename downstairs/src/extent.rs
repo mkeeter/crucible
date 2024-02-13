@@ -24,7 +24,7 @@ pub struct Extent {
     read_only: bool,
 
     /// The actual extent work takes place in a separate IO task
-    io_tx: mpsc::Sender<ExtentRequest>,
+    io_tx: std::sync::mpsc::Sender<ExtentRequest>,
 
     log: Logger,
 }
@@ -32,7 +32,7 @@ pub struct Extent {
 /// Data used for the IO task
 #[derive(Debug)]
 struct ExtentRunner {
-    rx: mpsc::Receiver<ExtentRequest>,
+    rx: std::sync::mpsc::Receiver<ExtentRequest>,
     iov_max: usize,
     read_only: bool,
 
@@ -52,20 +52,11 @@ impl ExtentRunner {
     ///
     /// This function is infallible, because errors are reported to the caller
     /// (via the `oneshot` in the `ExtentRequest`).
-    async fn run(&mut self) {
-        let can_block_in_place = matches!(
-            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        );
-
-        while let Some(m) = self.rx.recv().await {
-            let r = if can_block_in_place {
-                tokio::task::block_in_place(|| self.dispatch(m))
-            } else {
-                self.dispatch(m)
-            };
-            if !r {
-                break;
+    fn run(&mut self) {
+        while let Ok(m) = self.rx.recv() {
+            if !self.dispatch(m) {
+                info!(self.log, "io task saw an error, exiting");
+                return;
             }
         }
         info!(self.log, "io task done, exiting");
@@ -631,7 +622,7 @@ impl Extent {
         log: &Logger,
     ) -> Result<Self> {
         let log = log.new(o!("extent" => number.to_string()));
-        let (io_tx, rx) = mpsc::channel(64);
+        let (io_tx, rx) = std::sync::mpsc::channel();
         let mut runner = ExtentRunner {
             read_only,
             iov_max: Extent::get_iov_max()?,
@@ -639,7 +630,7 @@ impl Extent {
             rx,
             log: log.new(o!("task" => "io".to_string())),
         };
-        tokio::task::spawn(async move { runner.run().await });
+        std::thread::spawn(move || runner.run());
 
         let extent = Extent {
             number,
@@ -654,7 +645,6 @@ impl Extent {
     pub async fn dirty(&self) -> bool {
         self.submit(|done| ExtentRequest::Dirty { done })
             .await
-            .await
             .unwrap()
     }
 
@@ -664,7 +654,6 @@ impl Extent {
     pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
         let r = self
             .submit(|done| ExtentRequest::Close { done })
-            .await
             .await
             .unwrap();
 
@@ -717,7 +706,7 @@ impl Extent {
     }
 
     /// Submits a read to the IO task
-    pub async fn submit_read(
+    pub fn submit_read(
         &mut self,
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
@@ -730,13 +719,11 @@ impl Extent {
 
         let requests = requests.to_vec();
         let request_count = requests.len();
-        let resp = self
-            .submit(move |done| ExtentRequest::Read {
-                job_id,
-                requests,
-                done,
-            })
-            .await;
+        let resp = self.submit(move |done| ExtentRequest::Read {
+            job_id,
+            requests,
+            done,
+        });
 
         let number = self.number;
         async move {
@@ -757,11 +744,11 @@ impl Extent {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        self.submit_read(job_id, requests).await.await
+        self.submit_read(job_id, requests).await
     }
 
     /// Submit a write to the IO task
-    pub async fn submit_write(
+    pub fn submit_write(
         &mut self,
         job_id: JobId,
         writes: &[crucible_protocol::Write],
@@ -780,14 +767,12 @@ impl Extent {
         let write_count = writes.len();
 
         // Send the job to the IO task
-        let resp = self
-            .submit(move |done| ExtentRequest::Write {
-                job_id,
-                writes,
-                only_write_unwritten,
-                done,
-            })
-            .await;
+        let resp = self.submit(move |done| ExtentRequest::Write {
+            job_id,
+            writes,
+            only_write_unwritten,
+            done,
+        });
 
         let number = self.number;
         Either::Right(async move {
@@ -808,10 +793,9 @@ impl Extent {
     ) -> Result<(), CrucibleError> {
         self.submit_write(job_id, writes, only_write_unwritten)
             .await
-            .await
     }
 
-    pub(crate) async fn submit_flush<I: Into<JobOrReconciliationId> + Debug>(
+    pub(crate) fn submit_flush<I: Into<JobOrReconciliationId> + Debug>(
         &mut self,
         new_flush: u64,
         new_gen: u64,
@@ -824,7 +808,6 @@ impl Extent {
             new_gen,
             done,
         })
-        .await
     }
 
     #[instrument]
@@ -834,21 +817,15 @@ impl Extent {
         new_gen: u64,
         id: I, // only used for logging
     ) -> Result<(), CrucibleError> {
-        self.submit_flush(new_flush, new_gen, id).await.await
+        self.submit_flush(new_flush, new_gen, id).await
     }
 
     /// Submits a job to the IO task
     ///
-    /// `submit` is an async function which **returns a future**, so it must be
-    /// doubly awaited.  This is because the function only returns **after** the
-    /// job has been sent to the IO task, which requres pushing it into an
-    /// `mpsc::Sender` (and `Sender::send` is async because it waits until there
-    /// is available room).
-    ///
-    /// Once this function returns, the IO operation is in flight and will be
-    /// completed autonomously; we do not need to `await` the returned future to
-    /// drive the IO operation to completion.
-    async fn submit<
+    /// `submit` returns a future that resolves when the IO task is complete.
+    /// The IO task  will be completed autonomously; we do not need to `await`
+    /// the returned future to drive the IO operation to completion.
+    fn submit<
         T,
         F: FnOnce(oneshot::Sender<Result<T, CrucibleError>>) -> ExtentRequest,
     >(
@@ -856,7 +833,7 @@ impl Extent {
         f: F,
     ) -> impl Future<Output = Result<T, CrucibleError>> {
         let (done, rx) = oneshot::channel();
-        let r = match self.io_tx.send(f(done)).await {
+        let r = match self.io_tx.send(f(done)) {
             Ok(()) => Either::Left(rx),
             Err(e) => {
                 error!(self.log, "send error: {e:?}");
@@ -878,7 +855,6 @@ impl Extent {
     pub async fn get_meta_info(&self) -> ExtentMeta {
         self.submit(|done| ExtentRequest::GetMetaInfo { done })
             .await
-            .await
             .unwrap()
     }
 
@@ -891,7 +867,6 @@ impl Extent {
             block_context,
             done,
         })
-        .await
         .await
     }
 
@@ -906,7 +881,6 @@ impl Extent {
             count,
             done,
         })
-        .await
         .await
     }
 }

@@ -772,7 +772,7 @@ impl Region {
         Ok(())
     }
 
-    pub async fn submit_region_write(
+    pub fn submit_region_write(
         &mut self,
         writes: &[crucible_protocol::Write],
         job_id: JobId,
@@ -813,11 +813,11 @@ impl Region {
         for eid in batched_writes.keys() {
             let extent = self.get_opened_extent_mut(*eid);
             let writes = batched_writes.get(eid).unwrap();
-            jobs.push(
-                extent
-                    .submit_write(job_id, &writes[..], only_write_unwritten)
-                    .await,
-            );
+            jobs.push(extent.submit_write(
+                job_id,
+                &writes[..],
+                only_write_unwritten,
+            ));
         }
 
         // Mark any extents we sent a write-command to as potentially dirty
@@ -845,10 +845,9 @@ impl Region {
     ) -> Result<(), CrucibleError> {
         self.submit_region_write(writes, job_id, only_write_unwritten)
             .await
-            .await
     }
 
-    pub async fn submit_region_read(
+    pub fn submit_region_read(
         &mut self,
         requests: &[crucible_protocol::ReadRequest],
         job_id: JobId,
@@ -874,9 +873,7 @@ impl Region {
                     batched_reads.push(request.clone());
                 } else {
                     let extent = self.get_opened_extent_mut(_eid as usize);
-                    jobs.push(
-                        extent.submit_read(job_id, &batched_reads[..]).await,
-                    );
+                    jobs.push(extent.submit_read(job_id, &batched_reads[..]));
 
                     eid = Some(request.eid);
                     batched_reads.clear();
@@ -891,7 +888,7 @@ impl Region {
 
         if let Some(_eid) = eid {
             let extent = self.get_opened_extent_mut(_eid as usize);
-            jobs.push(extent.submit_read(job_id, &batched_reads[..]).await);
+            jobs.push(extent.submit_read(job_id, &batched_reads[..]));
         }
 
         let mut responses = Vec::with_capacity(requests.len());
@@ -910,7 +907,7 @@ impl Region {
         requests: &[crucible_protocol::ReadRequest],
         job_id: JobId,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        self.submit_region_read(requests, job_id).await.await
+        self.submit_region_read(requests, job_id).await
     }
 
     /*
@@ -990,7 +987,7 @@ impl Region {
         let mut got_err = None;
         for eid in &dirty_extents {
             let e = self.get_opened_extent_mut(*eid);
-            fut.push(e.submit_flush(flush_number, gen_number, job_id).await);
+            fut.push(e.submit_flush(flush_number, gen_number, job_id));
         }
 
         // Process all of the futures, storing the last error in `got_err`
