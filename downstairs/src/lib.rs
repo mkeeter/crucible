@@ -561,24 +561,24 @@ async fn is_message_valid(
 async fn do_work_task(
     ads: &Mutex<Downstairs>,
     upstairs_connection: UpstairsConnection,
-    mut job_channel_rx: mpsc::Receiver<()>,
+    mut message_channel_rx: mpsc::Receiver<Message>,
     resp_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
     // The lossy attribute currently does not change at runtime. To avoid
     // continually locking the downstairs, cache the result here.
     let is_lossy = ads.lock().await.lossy;
 
-    /*
-     * job_channel_rx is a notification that we should look for new work.
-     */
-    while job_channel_rx.recv().await.is_some() {
+    while let Some(m) = message_channel_rx.recv().await {
         // Add a little time to completion for this operation.
         if is_lossy && random() && random() {
             info!(ads.lock().await.log, "[lossy] sleeping 1 second");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-
-        Downstairs::do_work_for(ads, upstairs_connection, &resp_tx).await?;
+        if let Err(e) =
+            Downstairs::proc_frame(ads, upstairs_connection, m, &resp_tx).await
+        {
+            bail!("Proc frame returns error: {}", e);
+        }
     }
 
     // None means the channel is closed
@@ -1107,14 +1107,11 @@ where
         + std::marker::Send
         + 'static,
 {
-    let mut lossy_interval = deadline_secs(5);
     // Create the log for this task to use.
     let log = ads.lock().await.log.new(o!("task" => "main".to_string()));
 
     // Give our work queue a little more space than we expect the upstairs
     // to ever send us.
-    let (job_channel_tx, job_channel_rx) = mpsc::channel(MAX_ACTIVE_COUNT + 50);
-
     let (resp_channel_tx, resp_channel_rx) =
         mpsc::channel(MAX_ACTIVE_COUNT + 50);
     let mut framed_write_task = tokio::spawn(reply_task(resp_channel_rx, fw));
@@ -1149,17 +1146,19 @@ where
      *        │  ┌────────┘     │frame             │responses
      *        │  │              │errors            │
      *        │  │              │                  │
-     *   ┌────▼──┴─┐ message   ┌┴──────┐  job     ┌┴────────┐
-     *   │resp_loop├──────────►│pf_task├─────────►│ dw_task │
-     *   └─────────┘ channel   └──┬────┘ channel  └▲────────┘
+     *   ┌────▼──┴─┐ message   ┌┴────────────────────────┐
+     *   │resp_loop├──────────►│         dw_task         │
+     *   └─────────┘ channel   └──┬────────────────▲─────┘
      *                            │                │
      *                         add│work         new│work
      *   per-connection           │                │
      *  ========================= │ ============== │ ===============
-     *   shared state          ┌──▼────────────────┴────────────┐
-     *                         │           Downstairs           │
-     *                         └────────────────────────────────┘
+     *   shared state          ┌──▼────────────────┴─────┐
+     *                         │        Downstairs       │
+     *                         └─────────────────────────┘
      */
+    let (message_channel_tx, message_channel_rx) =
+        mpsc::channel(MAX_ACTIVE_COUNT + 50);
     let mut dw_task = {
         let adc = ads.clone();
         let resp_channel_tx = resp_channel_tx.clone();
@@ -1167,70 +1166,20 @@ where
             do_work_task(
                 &adc,
                 upstairs_connection,
-                job_channel_rx,
+                message_channel_rx,
                 resp_channel_tx,
             )
             .await
         })
     };
 
-    let (message_channel_tx, mut message_channel_rx) =
-        mpsc::channel(MAX_ACTIVE_COUNT + 50);
-    let mut pf_task = {
-        let adc = ads.clone();
-        let tx = job_channel_tx.clone();
-        let resp_channel_tx = resp_channel_tx.clone();
-        tokio::spawn(async move {
-            while let Some(m) = message_channel_rx.recv().await {
-                match Downstairs::proc_frame(
-                    &adc,
-                    upstairs_connection,
-                    m,
-                    &resp_channel_tx,
-                )
-                .await
-                {
-                    // If we added work, tell the work task to get busy.
-                    Ok(Some(new_ds_id)) => {
-                        cdt::work__start!(|| new_ds_id.0);
-                        tx.send(()).await?;
-                    }
-                    // If we handled the job locally, nothing to do here
-                    Ok(None) => (),
-                    Err(e) => {
-                        bail!("Proc frame returns error: {}", e);
-                    }
-                }
-            }
-
-            Ok(())
-        })
-    };
-
-    // The lossy attribute currently does not change at runtime. To avoid
-    // continually locking the downstairs, cache the result here.
-    let lossy = ads.lock().await.lossy;
-
     loop {
         tokio::select! {
             e = &mut dw_task => {
                 bail!("do_work_task task has ended: {:?}", e);
             }
-            e = &mut pf_task => {
-                bail!("pf task ended: {:?}", e);
-            }
             e = &mut framed_write_task => {
                 bail!("framed write task ended: {:?}", e);
-            }
-            /*
-             * If we have set "lossy", then we need to check every now and
-             * then that there were not skipped jobs that we need to go back
-             * and finish up. If lossy is not set, then this should only
-             * trigger once then never again.
-             */
-            _ = sleep_until(lossy_interval), if lossy => {
-                job_channel_tx.send(()).await?;
-                lossy_interval = deadline_secs(5);
             }
             /*
              * Don't wait more than 50 seconds to hear from the other side.
@@ -1517,6 +1466,7 @@ impl Downstairs {
         resp_tx: &mpsc::Sender<Message>,
     ) -> Result<()> {
         self.add_work(upstairs_connection, ds_id, work)?;
+        cdt::work__start!(|| ds_id.0);
         if let Some(ds_id) = self
             .try_to_do_work_and_reply(upstairs_connection, ds_id, resp_tx)
             .await?
@@ -2342,7 +2292,7 @@ impl Downstairs {
         upstairs_connection: UpstairsConnection,
         m: Message,
         resp_tx: &mpsc::Sender<Message>,
-    ) -> Result<Option<JobId>> {
+    ) -> Result<()> {
         // Initial check against upstairs and session ID
         match m {
             Message::Write {
@@ -2398,13 +2348,14 @@ impl Downstairs {
                 )
                 .await?
                 {
-                    return Ok(None);
+                    // We already replied in `is_message_valid`
+                    return Ok(());
                 }
             }
             _ => (),
         }
 
-        let r = match m {
+        let jobs_may_have_changed = match m {
             Message::Write {
                 job_id,
                 dependencies,
@@ -2426,7 +2377,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::Flush {
                 job_id,
@@ -2455,7 +2406,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::WriteUnwritten {
                 job_id,
@@ -2478,7 +2429,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::ReadRequest {
                 job_id,
@@ -2501,7 +2452,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             // These are for repair while taking live IO
             Message::ExtentLiveClose {
@@ -2525,7 +2476,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::ExtentLiveFlushClose {
                 job_id,
@@ -2552,7 +2503,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::ExtentLiveRepair {
                 job_id,
@@ -2579,7 +2530,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::ExtentLiveReopen {
                 job_id,
@@ -2601,7 +2552,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
             Message::ExtentLiveNoOp {
                 job_id,
@@ -2620,7 +2571,7 @@ impl Downstairs {
                     resp_tx,
                 )
                 .await?;
-                Some(job_id)
+                true
             }
 
             // These messages arrive during initial reconciliation.
@@ -2661,7 +2612,7 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                None
+                false
             }
             Message::ExtentClose {
                 repair_id,
@@ -2680,7 +2631,7 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                None
+                false
             }
             Message::ExtentRepair {
                 repair_id,
@@ -2714,7 +2665,7 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                None
+                false
             }
             Message::ExtentReopen {
                 repair_id,
@@ -2733,11 +2684,15 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                None
+                false
             }
             x => bail!("unexpected frame {:?}", x),
         };
-        Ok(r)
+
+        if jobs_may_have_changed {
+            Downstairs::do_work_for(ad, upstairs_connection, resp_tx).await?;
+        }
+        Ok(())
     }
 
     async fn do_work_for(
