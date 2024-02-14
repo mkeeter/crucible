@@ -2355,7 +2355,7 @@ impl Downstairs {
             _ => (),
         }
 
-        let jobs_may_have_changed = match m {
+        let new_io = match m {
             Message::Write {
                 job_id,
                 dependencies,
@@ -2369,15 +2369,7 @@ impl Downstairs {
                     writes,
                 };
 
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_write,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_write))
             }
             Message::Flush {
                 job_id,
@@ -2398,15 +2390,7 @@ impl Downstairs {
                     extent_limit,
                 };
 
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_flush,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_flush))
             }
             Message::WriteUnwritten {
                 job_id,
@@ -2420,16 +2404,7 @@ impl Downstairs {
                     dependencies,
                     writes,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_write,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_write))
             }
             Message::ReadRequest {
                 job_id,
@@ -2443,16 +2418,7 @@ impl Downstairs {
                     dependencies,
                     requests,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_read,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_read))
             }
             // These are for repair while taking live IO
             Message::ExtentLiveClose {
@@ -2467,16 +2433,7 @@ impl Downstairs {
                     dependencies,
                     extent: extent_id,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    ext_close,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, ext_close))
             }
             Message::ExtentLiveFlushClose {
                 job_id,
@@ -2494,16 +2451,7 @@ impl Downstairs {
                     flush_number,
                     gen_number,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_flush,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_flush))
             }
             Message::ExtentLiveRepair {
                 job_id,
@@ -2520,17 +2468,7 @@ impl Downstairs {
 
                     source_repair_address,
                 };
-
-                let mut d = ad.lock().await;
-                debug!(d.log, "Received ExtentLiveRepair {}", job_id);
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_repair,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_repair))
             }
             Message::ExtentLiveReopen {
                 job_id,
@@ -2543,16 +2481,7 @@ impl Downstairs {
                     dependencies,
                     extent: extent_id,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_open,
-                    resp_tx,
-                )
-                .await?;
-                true
+                Some((job_id, new_open))
             }
             Message::ExtentLiveNoOp {
                 job_id,
@@ -2560,18 +2489,8 @@ impl Downstairs {
                 ..
             } => {
                 cdt::submit__el__noop__start!(|| job_id.0);
-                let new_open = IOop::ExtentLiveNoOp { dependencies };
-
-                let mut d = ad.lock().await;
-                debug!(d.log, "Received NoOP {}", job_id);
-                d.add_and_try_to_do_work(
-                    upstairs_connection,
-                    job_id,
-                    new_open,
-                    resp_tx,
-                )
-                .await?;
-                true
+                let new_noop = IOop::ExtentLiveNoOp { dependencies };
+                Some((job_id, new_noop))
             }
 
             // These messages arrive during initial reconciliation.
@@ -2612,7 +2531,7 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                false
+                None
             }
             Message::ExtentClose {
                 repair_id,
@@ -2631,7 +2550,7 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                false
+                None
             }
             Message::ExtentRepair {
                 repair_id,
@@ -2665,7 +2584,7 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                false
+                None
             }
             Message::ExtentReopen {
                 repair_id,
@@ -2684,12 +2603,23 @@ impl Downstairs {
                     }
                 };
                 resp_tx.send(msg).await?;
-                false
+                None
             }
             x => bail!("unexpected frame {:?}", x),
         };
 
-        if jobs_may_have_changed {
+        if let Some((ds_id, ds_work)) = new_io {
+            {
+                // Scope for the initial borrow
+                let mut ds = ad.lock().await;
+                ds.add_and_try_to_do_work(
+                    upstairs_connection,
+                    ds_id,
+                    ds_work,
+                    resp_tx,
+                )
+                .await?;
+            }
             Downstairs::do_work_for(ad, upstairs_connection, resp_tx).await?;
         }
         Ok(())
