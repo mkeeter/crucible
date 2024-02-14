@@ -1509,6 +1509,23 @@ impl Downstairs {
         Ok(())
     }
 
+    async fn add_and_try_to_do_work(
+        &mut self,
+        upstairs_connection: UpstairsConnection,
+        ds_id: JobId,
+        work: IOop,
+        resp_tx: &mpsc::Sender<Message>,
+    ) -> Result<()> {
+        self.add_work(upstairs_connection, ds_id, work)?;
+        if let Some(ds_id) = self
+            .try_to_do_work_and_reply(upstairs_connection, ds_id, resp_tx)
+            .await?
+        {
+            self.work_mut(upstairs_connection).unwrap().set_new(ds_id)
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn get_job(
         &self,
@@ -2402,14 +2419,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_write)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_write,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::Flush {
@@ -2432,14 +2448,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_flush)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_flush,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::WriteUnwritten {
@@ -2456,14 +2471,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_write)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_write,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::ReadRequest {
@@ -2480,14 +2494,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_read)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_read,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             // These are for repair while taking live IO
@@ -2505,14 +2518,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, ext_close)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    ext_close,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::ExtentLiveFlushClose {
@@ -2533,14 +2545,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_flush)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_flush,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::ExtentLiveRepair {
@@ -2561,14 +2572,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 debug!(d.log, "Received ExtentLiveRepair {}", job_id);
-                d.add_work(upstairs_connection, job_id, new_repair)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_repair,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::ExtentLiveReopen {
@@ -2584,14 +2594,13 @@ impl Downstairs {
                 };
 
                 let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_open)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_open,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
             Message::ExtentLiveNoOp {
@@ -2604,14 +2613,13 @@ impl Downstairs {
 
                 let mut d = ad.lock().await;
                 debug!(d.log, "Received NoOP {}", job_id);
-                d.add_work(upstairs_connection, job_id, new_open)?;
-                let _ = d
-                    .try_to_do_work_and_reply(
-                        upstairs_connection,
-                        job_id,
-                        resp_tx,
-                    )
-                    .await?;
+                d.add_and_try_to_do_work(
+                    upstairs_connection,
+                    job_id,
+                    new_open,
+                    resp_tx,
+                )
+                .await?;
                 Some(job_id)
             }
 
@@ -2863,6 +2871,17 @@ impl Work {
 
     fn add_work(&mut self, ds_id: JobId, dsw: DownstairsWork) {
         self.active.insert(ds_id, dsw);
+    }
+
+    /// Moves a job from `InProgress` back to `New`
+    ///
+    /// This is needed if we tried to handle a job immediately upon receiving
+    /// the message, but failed due to an IO error; the job must be reset to the
+    /// `New` state so that `do_all_work` sees it
+    fn set_new(&mut self, ds_id: JobId) {
+        let job = self.active.get_mut(&ds_id).unwrap();
+        assert_eq!(job.state, WorkState::InProgress);
+        job.state = WorkState::New;
     }
 
     #[cfg(test)]
