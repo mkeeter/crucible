@@ -187,6 +187,18 @@ pub struct BlockContext {
     pub encryption_context: Option<EncryptionContext>,
 }
 
+impl BlockContext {
+    /// Checks whether `self.hash` matches the given data
+    pub fn check_hash(&self, data: &[u8]) -> bool {
+        let expected = if let Some(ctx) = self.encryption_context {
+            crucible_common::integrity_hash(&[&ctx.nonce, &ctx.tag, &data])
+        } else {
+            crucible_common::integrity_hash(&[&data])
+        };
+        self.hash == expected
+    }
+}
+
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EncryptionContext {

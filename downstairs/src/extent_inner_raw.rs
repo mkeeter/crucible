@@ -5,7 +5,7 @@ use crate::{
         check_input, extent_path, DownstairsBlockContext, ExtentInner,
         EXTENT_META_RAW,
     },
-    integrity_hash, mkdir_for_file,
+    mkdir_for_file,
     region::{BatchedPwritev, JobOrReconciliationId},
     Block, BlockContext, CrucibleError, JobId, ReadResponse, RegionDefinition,
 };
@@ -20,11 +20,10 @@ use std::io::{BufReader, IoSliceMut, Read};
 use std::os::fd::AsFd;
 use std::path::Path;
 
-/// Equivalent to `DownstairsBlockContext`, but without one's own block number
+/// Equivalent to `DownstairsBlockContext`, but without block number and hash
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OnDiskDownstairsBlockContext {
     pub block_context: BlockContext,
-    pub on_disk_hash: u64,
 }
 
 /// Equivalent to `ExtentMeta`, but ordered for efficient on-disk serialization
@@ -583,7 +582,6 @@ impl RawInner {
                     }
                     file_buffered.read_exact(&mut buf)?;
                     last_seek_block = block + 1; // since we just read a block
-                    let hash = integrity_hash(&[&buf]);
 
                     let mut matching_slot = None;
                     let mut empty_slot = None;
@@ -591,7 +589,7 @@ impl RawInner {
                     for slot in [ContextSlot::A, ContextSlot::B] {
                         let context = [context_a, context_b][slot as usize];
                         if let Some(context) = context {
-                            if context.on_disk_hash == hash {
+                            if context.block_context.check_hash(&buf) {
                                 matching_slot = Some(slot);
                             }
                         } else if empty_slot.is_none() {
@@ -655,7 +653,6 @@ impl RawInner {
                 self.extent_number
             ))
         })?;
-        let hash = integrity_hash(&[&buf]);
 
         // Then, read the slot data and decide if either slot
         // (1) is present and
@@ -671,7 +668,7 @@ impl RawInner {
             let context = context.pop().unwrap();
 
             if let Some(context) = context {
-                if context.on_disk_hash == hash {
+                if context.block_context.check_hash(&buf) {
                     matching_slot = Some(slot);
                 }
             } else if empty_slot.is_none() {
@@ -1111,9 +1108,9 @@ impl RawInner {
             .iter()
             .filter(|write| !writes_to_skip.contains(&write.offset.value))
             .map(|write| {
-                // TODO it would be nice if we could profile what % of time we're
-                // spending on hashes locally vs writing to disk
-                let on_disk_hash = integrity_hash(&[&write.data[..]]);
+                // Use a dummy value for on_disk_hash, because we don't actually
+                // use it here!
+                let on_disk_hash = u64::MAX;
 
                 DownstairsBlockContext {
                     block_context: write.block_context,
@@ -1293,7 +1290,6 @@ impl RawLayout {
             buf.extend([0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]);
             let d = block_context.map(|b| OnDiskDownstairsBlockContext {
                 block_context: b.block_context,
-                on_disk_hash: b.on_disk_hash,
             });
             bincode::serialize_into(&mut buf[n..], &d).unwrap();
         }
@@ -1331,7 +1327,7 @@ impl RawLayout {
             out.push(ctx.map(|c| DownstairsBlockContext {
                 block: block_start + i as u64,
                 block_context: c.block_context,
-                on_disk_hash: c.on_disk_hash,
+                on_disk_hash: u64::MAX, // fake value
             }));
         }
         Ok(out)
@@ -1462,6 +1458,7 @@ mod test {
     use super::*;
     use anyhow::Result;
     use bytes::{Bytes, BytesMut};
+    use crucible_common::integrity_hash;
     use crucible_protocol::EncryptionContext;
     use crucible_protocol::ReadRequest;
     use rand::Rng;
@@ -1512,7 +1509,6 @@ mod test {
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
         assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
 
         // Block 1 should still be blank
         assert!(inner.get_block_context(1)?.is_none());
@@ -1540,7 +1536,6 @@ mod test {
         assert_eq!(ctx.block_context.encryption_context.unwrap().nonce, blob1);
         assert_eq!(ctx.block_context.encryption_context.unwrap().tag, blob2);
         assert_eq!(ctx.block_context.hash, 1024);
-        assert_eq!(ctx.on_disk_hash, 65536);
 
         Ok(())
     }
@@ -1558,6 +1553,8 @@ mod test {
         assert!(inner.get_block_context(1)?.is_none());
 
         // Set block 0's and 1's context and dirty flag
+        //
+        // Note that the raw file extent ignores on_disk_hash!
         inner.set_dirty_and_block_context(&DownstairsBlockContext {
             block_context: BlockContext {
                 encryption_context: Some(EncryptionContext {
@@ -1595,7 +1592,6 @@ mod test {
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
         assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
 
         // Verify block 1's context
         let ctx = inner.get_block_context(1)?.unwrap();
@@ -1609,7 +1605,6 @@ mod test {
             [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         assert_eq!(ctx.block_context.hash, 9999);
-        assert_eq!(ctx.on_disk_hash, 1234567890);
 
         // Return both block 0's and block 1's context, and verify
 
@@ -1624,7 +1619,6 @@ mod test {
             [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
         );
         assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
 
         let ctx = ctxs[1].as_ref().unwrap();
         assert_eq!(
@@ -1636,7 +1630,6 @@ mod test {
             [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         assert_eq!(ctx.block_context.hash, 9999);
-        assert_eq!(ctx.on_disk_hash, 1234567890);
 
         // Append a whole bunch of block context rows
         for i in 0..10 {
@@ -1646,7 +1639,7 @@ mod test {
                         nonce: rand::thread_rng().gen::<[u8; 12]>(),
                         tag: rand::thread_rng().gen::<[u8; 16]>(),
                     }),
-                    hash: rand::thread_rng().gen::<u64>(),
+                    hash: i,
                 },
                 block: 0,
                 on_disk_hash: i,
@@ -1657,7 +1650,7 @@ mod test {
                         nonce: rand::thread_rng().gen::<[u8; 12]>(),
                         tag: rand::thread_rng().gen::<[u8; 16]>(),
                     }),
-                    hash: rand::thread_rng().gen::<u64>(),
+                    hash: i,
                 },
                 block: 1,
                 on_disk_hash: i,
@@ -1667,10 +1660,10 @@ mod test {
         let ctxs = inner.get_block_contexts(0, 2)?;
 
         assert!(ctxs[0].is_some());
-        assert_eq!(ctxs[0].as_ref().unwrap().on_disk_hash, 9);
+        assert_eq!(ctxs[0].as_ref().unwrap().block_context.hash, 9);
 
         assert!(ctxs[1].is_some());
-        assert_eq!(ctxs[1].as_ref().unwrap().on_disk_hash, 9);
+        assert_eq!(ctxs[1].as_ref().unwrap().block_context.hash, 9);
 
         Ok(())
     }
@@ -2427,7 +2420,6 @@ mod test {
                     tag: [0xFF; 16],
                 }),
             },
-            on_disk_hash: u64::MAX,
         };
         let mut ctx_buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         bincode::serialize_into(ctx_buf.as_mut_slice(), &Some(c)).unwrap();
