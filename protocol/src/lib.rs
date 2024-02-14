@@ -214,6 +214,22 @@ impl ReadResponse {
         }
     }
 
+    /// Prepare a pre-existing `ReadResponse` for re-use
+    ///
+    /// This will reuse existing allocations if they match, but **will not**
+    /// bother zeroing out the data in `self.data`, because the upcoming read
+    /// operation is about to overwrite it.
+    ///
+    /// As such, it's cheaper than `from_request`, which does a `memset` on a
+    /// fresh `BytesMut` object.
+    pub fn reset(mut self, request: &ReadRequest, bs: usize) -> ReadResponse {
+        self.data.resize(bs, 1);
+        self.eid = request.eid;
+        self.offset = request.offset;
+        self.block_contexts.clear();
+        self
+    }
+
     pub fn from_request_with_data(
         request: &ReadRequest,
         data: &[u8],

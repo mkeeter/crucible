@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use futures::TryStreamExt;
 
+use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crucible_common::*;
@@ -103,6 +104,22 @@ pub struct Region {
 
     read_only: bool,
     log: Logger,
+
+    /// Queue for recycling read responses, to reduce allocation + `memset`
+    ///
+    /// When performing a read, we attempt to pull a spare `ReadResponse` from
+    /// this queue, and allocate if we fail.
+    ///
+    /// Using a `mpsc::UnboundedReceiver` is an easy way to create a pool of
+    /// spare buffers that can be shared between multiple tasks (without
+    /// locking the whole `Arc<Mutex<Downstairs>>`).
+    recycle_rx: mpsc::UnboundedReceiver<ReadResponse>,
+
+    /// The other end of the recycling queue
+    ///
+    /// This sender is passed to the `reply_task`, which then passes back
+    /// `ReadResponses` after they've been serialized out on the `FramedWrite`.
+    pub recycle_tx: mpsc::UnboundedSender<ReadResponse>,
 
     /// Select the backend to use when creating and opening extents
     ///
@@ -233,6 +250,7 @@ impl Region {
         write_json(&cp, &def, false)?;
         info!(log, "Created new region file {:?}", cp);
 
+        let (recycle_tx, recycle_rx) = mpsc::unbounded_channel();
         let mut region = Region {
             dir: dir.as_ref().to_path_buf(),
             def,
@@ -241,6 +259,8 @@ impl Region {
             read_only: false,
             log,
             backend,
+            recycle_tx,
+            recycle_rx,
         };
         region.open_extents(true).await?;
         Ok(region)
@@ -326,6 +346,7 @@ impl Region {
         /*
          * Open every extent that presently exists.
          */
+        let (recycle_tx, recycle_rx) = mpsc::unbounded_channel();
         let mut region = Region {
             dir: dir.as_ref().to_path_buf(),
             def,
@@ -334,6 +355,8 @@ impl Region {
             read_only,
             log: log.clone(),
             backend,
+            recycle_tx,
+            recycle_rx,
         };
 
         region.open_extents(false).await?;
@@ -841,9 +864,21 @@ impl Region {
                 if request.eid == _eid {
                     batched_reads.push(request.clone());
                 } else {
-                    let extent = self.get_opened_extent_mut(_eid as usize);
-                    responses
-                        .extend(extent.read(job_id, &batched_reads[..]).await?);
+                    // manual get_opened_extent_mut to work around borrowcheck
+                    let ExtentState::Opened(extent) =
+                        &mut self.extents[_eid as usize]
+                    else {
+                        panic!("can't get opened extent");
+                    };
+                    responses.extend(
+                        extent
+                            .read(
+                                job_id,
+                                &batched_reads[..],
+                                &mut self.recycle_rx,
+                            )
+                            .await?,
+                    );
 
                     eid = Some(request.eid);
                     batched_reads.clear();
@@ -857,8 +892,16 @@ impl Region {
         }
 
         if let Some(_eid) = eid {
-            let extent = self.get_opened_extent_mut(_eid as usize);
-            responses.extend(extent.read(job_id, &batched_reads[..]).await?);
+            // equivalent to get_opened_extent_mut, to work around borrowcheck
+            let ExtentState::Opened(extent) = &mut self.extents[_eid as usize]
+            else {
+                panic!("can't get opened extent");
+            };
+            responses.extend(
+                extent
+                    .read(job_id, &batched_reads[..], &mut self.recycle_rx)
+                    .await?,
+            );
         }
         cdt::os__read__done!(|| job_id.0);
 

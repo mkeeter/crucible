@@ -13,6 +13,7 @@ use crate::{
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
+use tokio::sync::mpsc;
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -188,6 +189,9 @@ impl ExtentInner for RawInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
+        spare_responses: &mut mpsc::UnboundedReceiver<
+            crucible_protocol::ReadResponse,
+        >,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
         // This code batches up operations for contiguous regions of
         // ReadRequests, so we can perform larger read syscalls queries. This
@@ -226,7 +230,11 @@ impl ExtentInner for RawInner {
             let mut iovecs = Vec::with_capacity(n_contiguous_requests);
             for req in requests[req_run_start..][..n_contiguous_requests].iter()
             {
-                let resp = ReadResponse::from_request(req, block_size as usize);
+                let resp = if let Ok(prev) = spare_responses.try_recv() {
+                    prev.reset(req, block_size as usize)
+                } else {
+                    ReadResponse::from_request(req, block_size as usize)
+                };
                 check_input(self.extent_size, req.offset, &resp.data)?;
                 responses.push(resp);
             }
@@ -1719,7 +1727,13 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
             };
-            let resp = inner.read(JobId(21), &[read], IOV_MAX_TEST)?;
+            let (_, mut recycle_rx) = mpsc::unbounded_channel();
+            let resp = inner.read(
+                JobId(21),
+                &[read],
+                IOV_MAX_TEST,
+                &mut recycle_rx,
+            )?;
 
             // We should not get back our data, because block 0 was written.
             assert_ne!(
@@ -1753,7 +1767,13 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(1),
             };
-            let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
+            let (_, mut recycle_rx) = mpsc::unbounded_channel();
+            let resp = inner.read(
+                JobId(31),
+                &[read],
+                IOV_MAX_TEST,
+                &mut recycle_rx,
+            )?;
 
             // We should get back our data! Block 1 was never written.
             assert_eq!(
@@ -1976,7 +1996,13 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
             };
-            let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
+            let (_, mut recycle_rx) = mpsc::unbounded_channel();
+            let resp = inner.read(
+                JobId(31),
+                &[read],
+                IOV_MAX_TEST,
+                &mut recycle_rx,
+            )?;
 
             // We should get back our data! Block 1 was never written.
             assert_eq!(
@@ -2481,7 +2507,9 @@ mod test {
             eid: 0,
             offset: Block::new_512(0),
         };
-        let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
+        let (_, mut recycle_rx) = mpsc::unbounded_channel();
+        let resp =
+            inner.read(JobId(31), &[read], IOV_MAX_TEST, &mut recycle_rx)?;
 
         let data = Bytes::from(vec![0x03; 512]);
         let hash = integrity_hash(&[&data[..]]);

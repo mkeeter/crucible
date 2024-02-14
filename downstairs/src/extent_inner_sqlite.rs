@@ -11,6 +11,7 @@ use crucible_protocol::EncryptionContext;
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, Transaction};
 use slog::{error, Logger};
+use tokio::sync::mpsc;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -46,8 +47,14 @@ impl ExtentInner for SqliteInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
+        spare_responses: &mut mpsc::UnboundedReceiver<
+            crucible_protocol::ReadResponse,
+        >,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
-        self.0.lock().unwrap().read(job_id, requests, iov_max)
+        self.0
+            .lock()
+            .unwrap()
+            .read(job_id, requests, iov_max, spare_responses)
     }
 
     fn write(
@@ -282,6 +289,9 @@ impl SqliteMoreInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
+        spare_responses: &mut mpsc::UnboundedReceiver<
+            crucible_protocol::ReadResponse,
+        >,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
         let mut responses = Vec::with_capacity(requests.len());
         // This code batches up operations for contiguous regions of
@@ -320,7 +330,11 @@ impl SqliteMoreInner {
             let block_size = self.extent_size.block_size_in_bytes() as u64;
             for req in requests[req_run_start..][..n_contiguous_requests].iter()
             {
-                let resp = ReadResponse::from_request(req, block_size as usize);
+                let resp = if let Ok(prev) = spare_responses.try_recv() {
+                    prev.reset(req, block_size as usize)
+                } else {
+                    ReadResponse::from_request(req, block_size as usize)
+                };
                 check_input(self.extent_size, req.offset, &resp.data)?;
                 responses.push(resp);
             }
@@ -1652,7 +1666,13 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
             };
-            let resp = inner.read(JobId(21), &[read], IOV_MAX_TEST)?;
+            let (_, mut recycle_rx) = mpsc::unbounded_channel();
+            let resp = inner.read(
+                JobId(21),
+                &[read],
+                IOV_MAX_TEST,
+                &mut recycle_rx,
+            )?;
 
             // We should not get back our data, because block 0 was written.
             assert_ne!(
@@ -1686,7 +1706,13 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(1),
             };
-            let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
+            let (_, mut recycle_rx) = mpsc::unbounded_channel();
+            let resp = inner.read(
+                JobId(31),
+                &[read],
+                IOV_MAX_TEST,
+                &mut recycle_rx,
+            )?;
 
             // We should get back our data! Block 1 was never written.
             assert_eq!(
@@ -1752,7 +1778,13 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
             };
-            let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
+            let (_, mut recycle_rx) = mpsc::unbounded_channel();
+            let resp = inner.read(
+                JobId(31),
+                &[read],
+                IOV_MAX_TEST,
+                &mut recycle_rx,
+            )?;
 
             // We should get back our data! Block 1 was never written.
             assert_eq!(

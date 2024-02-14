@@ -1594,6 +1594,7 @@ where
 
 async fn reply_task<WT>(
     mut resp_channel_rx: mpsc::Receiver<Message>,
+    recycle_tx: mpsc::UnboundedSender<ReadResponse>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
 ) -> Result<()>
 where
@@ -1602,8 +1603,19 @@ where
         + std::marker::Send
         + 'static,
 {
-    while let Some(m) = resp_channel_rx.recv().await {
-        fw.send(m).await?;
+    while let Some(msg) = resp_channel_rx.recv().await {
+        fw.send(&msg).await?;
+
+        // Recycle crucible_protocol::ReadResponse objects by sending them back
+        // to the Downstairs task for reuse.
+        if let Message::ReadResponse {
+            responses: Ok(rs), ..
+        } = msg
+        {
+            for r in rs {
+                let _ = recycle_tx.send(r);
+            }
+        }
     }
     Ok(())
 }
@@ -1637,7 +1649,11 @@ where
 
     let (resp_channel_tx, resp_channel_rx) =
         mpsc::channel(MAX_ACTIVE_COUNT + 50);
-    let mut framed_write_task = tokio::spawn(reply_task(resp_channel_rx, fw));
+    let mut framed_write_task = tokio::spawn(reply_task(
+        resp_channel_rx,
+        ads.lock().await.region.recycle_tx.clone(),
+        fw,
+    ));
 
     /*
      * Create tasks for:
