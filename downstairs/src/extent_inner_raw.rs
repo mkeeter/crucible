@@ -189,9 +189,7 @@ impl ExtentInner for RawInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
-        spare_responses: &mut mpsc::UnboundedReceiver<
-            crucible_protocol::ReadResponse,
-        >,
+        spare_responses: &mut mpsc::Receiver<crucible_protocol::ReadResponse>,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
         // This code batches up operations for contiguous regions of
         // ReadRequests, so we can perform larger read syscalls queries. This

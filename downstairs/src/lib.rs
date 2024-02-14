@@ -1594,7 +1594,7 @@ where
 
 async fn reply_task<WT>(
     mut resp_channel_rx: mpsc::Receiver<Message>,
-    recycle_tx: mpsc::UnboundedSender<ReadResponse>,
+    recycle_tx: mpsc::Sender<ReadResponse>,
     mut fw: FramedWrite<WT, CrucibleEncoder>,
 ) -> Result<()>
 where
@@ -1613,7 +1613,7 @@ where
         } = msg
         {
             for r in rs {
-                let _ = recycle_tx.send(r);
+                let _ = recycle_tx.try_send(r);
             }
         }
     }

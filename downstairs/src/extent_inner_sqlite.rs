@@ -47,7 +47,7 @@ impl ExtentInner for SqliteInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
-        spare_responses: &mut mpsc::UnboundedReceiver<
+        spare_responses: &mut mpsc::Receiver<
             crucible_protocol::ReadResponse,
         >,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
@@ -289,7 +289,7 @@ impl SqliteMoreInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
-        spare_responses: &mut mpsc::UnboundedReceiver<
+        spare_responses: &mut mpsc::Receiver<
             crucible_protocol::ReadResponse,
         >,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {

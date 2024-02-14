@@ -46,9 +46,7 @@ pub(crate) trait ExtentInner: Send + Sync + Debug {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         iov_max: usize,
-        spare_responses: &mut mpsc::UnboundedReceiver<
-            crucible_protocol::ReadResponse,
-        >,
+        spare_responses: &mut mpsc::Receiver<crucible_protocol::ReadResponse>,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError>;
 
     fn write(
@@ -521,9 +519,7 @@ impl Extent {
         &mut self,
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
-        spare_responses: &mut mpsc::UnboundedReceiver<
-            crucible_protocol::ReadResponse,
-        >,
+        spare_responses: &mut mpsc::Receiver<crucible_protocol::ReadResponse>,
     ) -> Result<Vec<crucible_protocol::ReadResponse>, CrucibleError> {
         cdt::extent__read__start!(|| {
             (job_id.0, self.number, requests.len() as u64)

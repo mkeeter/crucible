@@ -110,16 +110,16 @@ pub struct Region {
     /// When performing a read, we attempt to pull a spare `ReadResponse` from
     /// this queue, and allocate if we fail.
     ///
-    /// Using a `mpsc::UnboundedReceiver` is an easy way to create a pool of
+    /// Using a `mpsc::Receiver` is an easy way to create a pool of
     /// spare buffers that can be shared between multiple tasks (without
     /// locking the whole `Arc<Mutex<Downstairs>>`).
-    recycle_rx: mpsc::UnboundedReceiver<ReadResponse>,
+    recycle_rx: mpsc::Receiver<ReadResponse>,
 
     /// The other end of the recycling queue
     ///
     /// This sender is passed to the `reply_task`, which then passes back
     /// `ReadResponses` after they've been serialized out on the `FramedWrite`.
-    pub recycle_tx: mpsc::UnboundedSender<ReadResponse>,
+    pub recycle_tx: mpsc::Sender<ReadResponse>,
 
     /// Select the backend to use when creating and opening extents
     ///
@@ -250,7 +250,13 @@ impl Region {
         write_json(&cp, &def, false)?;
         info!(log, "Created new region file {:?}", cp);
 
-        let (recycle_tx, recycle_rx) = mpsc::unbounded_channel();
+        // We'll allow for up to 16384 ReadResponse buffers to be recycled.
+        // This value is chosen to strike a balance between maximum RAM usage
+        // (64 MiB, with 4K blocks) and minimum capacity (8 MiB with 512-byte
+        // blocks)
+        // This is 64 MiB with 4K blocks, which isn't excessive, or 8 MiB with
+        // 512-byte blocks, which isn't so small as to be useless.
+        let (recycle_tx, recycle_rx) = mpsc::channel(16384);
         let mut region = Region {
             dir: dir.as_ref().to_path_buf(),
             def,
@@ -346,7 +352,7 @@ impl Region {
         /*
          * Open every extent that presently exists.
          */
-        let (recycle_tx, recycle_rx) = mpsc::unbounded_channel();
+        let (recycle_tx, recycle_rx) = mpsc::channel(16384);
         let mut region = Region {
             dir: dir.as_ref().to_path_buf(),
             def,
