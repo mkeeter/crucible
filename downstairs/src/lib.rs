@@ -405,6 +405,14 @@ pub fn show_work(ds: &mut Downstairs) {
 // DTrace probes for the downstairs
 #[usdt::provider(provider = "crucible_downstairs")]
 pub mod cdt {
+    fn ds__new__work(_: u64) {}
+    fn ds__work__done(_: u64) {}
+    fn ds__message__rx(_: u64) {}
+    fn ds__io__rx(_: u64) {}
+    fn ds__io__rx__done(_: u64) {}
+    fn ds__io__tx(_: u64) {}
+    fn ds__io__tx__done(_: u64) {}
+    fn ds__work__added(_: u64) {}
     fn submit__read__start(_: u64) {}
     fn submit__writeunwritten__start(_: u64) {}
     fn submit__write__start(_: u64) {}
@@ -585,7 +593,6 @@ async fn do_work_task(
             info!(ads.lock().await.log, "[lossy] sleeping 1 second");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-
         Downstairs::do_work_for(ads, upstairs_connection, &resp_tx).await?;
     }
 
@@ -1091,7 +1098,14 @@ where
         + 'static,
 {
     while let Some(m) = resp_channel_rx.recv().await {
+        let ds_id = m.job_id();
+        if let Some(ds_id) = ds_id {
+            cdt::ds__io__tx!(|| ds_id.0);
+        }
         fw.send(m).await?;
+        if let Some(ds_id) = ds_id {
+            cdt::ds__io__tx__done!(|| ds_id.0);
+        }
     }
     Ok(())
 }
@@ -1183,13 +1197,16 @@ where
     };
 
     let (message_channel_tx, mut message_channel_rx) =
-        mpsc::channel(MAX_ACTIVE_COUNT + 50);
+        mpsc::channel::<Message>(MAX_ACTIVE_COUNT + 50);
     let mut pf_task = {
         let adc = ads.clone();
         let tx = job_channel_tx.clone();
         let resp_channel_tx = resp_channel_tx.clone();
         tokio::spawn(async move {
             while let Some(m) = message_channel_rx.recv().await {
+                if let Some(ds_id) = m.job_id() {
+                    cdt::ds__message__rx!(|| ds_id.0);
+                }
                 match Downstairs::proc_frame(
                     &adc,
                     upstairs_connection,
@@ -1324,6 +1341,10 @@ where
                         return Ok(());
                     }
                     Some(Ok(msg)) => {
+                        let ds_id = msg.job_id();
+                        if let Some(ds_id) = ds_id {
+                            cdt::ds__io__rx!(|| ds_id.0);
+                        }
                         if matches!(msg, Message::Ruok) {
                             // Respond instantly to pings, don't wait.
                             if let Err(e) = resp_channel_tx.send(Message::Imok).await {
@@ -1331,6 +1352,9 @@ where
                             }
                         } else if let Err(e) = message_channel_tx.send(msg).await {
                             bail!("Failed sending message to proc_frame: {}", e);
+                        }
+                        if let Some(ds_id) = ds_id {
+                            cdt::ds__io__rx__done!(|| ds_id.0);
                         }
                     }
                     Some(Err(e)) => {
@@ -1513,6 +1537,7 @@ impl Downstairs {
 
         let work = self.work_mut(upstairs_connection)?;
         work.add_work(ds_id, dsw);
+        cdt::ds__work__added!(|| ds_id.0);
 
         Ok(())
     }
@@ -2634,6 +2659,7 @@ impl Downstairs {
          * in order.
          */
         while let Some(new_id) = new_work.pop_front() {
+            cdt::ds__new__work!(|| new_id.0);
             if is_lossy && random() && random() {
                 // Skip a job that needs to be done, moving it to the back of
                 // the list.  This exercises job dependency tracking in the face
@@ -2662,6 +2688,7 @@ impl Downstairs {
                 .await
                 .do_work(upstairs_connection, job_id)
                 .await?;
+            cdt::ds__work__done!(|| job_id.0);
 
             // If a different downstairs was promoted, then `do_work` returns
             // `None` and we ignore the job.
