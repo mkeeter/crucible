@@ -324,7 +324,7 @@ mod cdt {
     use crate::Arg;
     fn up__status(_: String, arg: Arg) {}
     fn up__io__sending__message(_: u64, _: u8) {}
-    fn up__io__message_sent(_: u64, _: u8) {}
+    fn up__io__message__sent(_: u64, _: u8) {}
     fn up__guest__id(_: u64) {}
     fn up__in__progress(_: u64, _: u8) {}
     fn up__io__message__rx(_: u64, _: u8) {}
