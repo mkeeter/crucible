@@ -1536,6 +1536,7 @@ impl Upstairs {
                             Err(_) => false,
                         };
 
+                    let ds_id = m.job_id();
                     let dr = DeferredRead {
                         message: m,
                         client_id,
@@ -1544,10 +1545,19 @@ impl Upstairs {
                         log: self.log.new(o!("job" => "decrypt")),
                     };
                     if should_defer {
+                        if let Some(ds_id) = ds_id {
+                            cdt::up__deferring!(|| (ds_id.0, client_id.get()));
+                        }
                         let tx = self.deferred_msgs.push_oneshot();
                         rayon::spawn(move || {
                             let out = dr.run();
                             let _ = tx.send(out);
+                            if let Some(ds_id) = ds_id {
+                                cdt::up__defer__done!(|| (
+                                    ds_id.0,
+                                    client_id.get()
+                                ));
+                            }
                         });
                     } else {
                         // Do decryption right here!
@@ -1583,6 +1593,11 @@ impl Upstairs {
 
     async fn on_client_message(&mut self, dm: DeferredMessage) {
         let (client_id, m, hashes) = (dm.client_id, dm.message, dm.hashes);
+
+        let ds_id = m.job_id();
+        if let Some(ds_id) = ds_id {
+            cdt::up__client__message__received!(|| (ds_id.0, client_id.get()));
+        }
 
         // It's possible for a deferred message to arrive **after** we have
         // disconnected from this particular Downstairs.  In that case, we want
@@ -1620,6 +1635,9 @@ impl Upstairs {
                     hashes,
                     &self.state,
                 );
+                if let Some(ds_id) = ds_id {
+                    cdt::up__io__completion!(|| (ds_id.0, client_id.get()));
+                }
                 if let Err(e) = r {
                     warn!(
                         self.downstairs.clients[client_id].log,

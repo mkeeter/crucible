@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    BlockIO, BlockOp, BlockReq, BlockReqReply, BlockReqWaiter, BlockRes,
+    cdt, BlockIO, BlockOp, BlockReq, BlockReqReply, BlockReqWaiter, BlockRes,
     Buffer, JobId, ReplaceResult, UpstairsAction,
 };
 use crucible_common::{build_logger, crucible_bail, Block, CrucibleError};
@@ -196,7 +196,9 @@ impl GuestWork {
         res: Option<BlockRes>,
     ) -> (GuestWorkId, JobId) {
         let gw_id = self.next_gw_id();
+        cdt::up__guest__id!(|| gw_id.0);
         let ds_id = f(gw_id);
+        cdt::up__bind__guest__id!(|| (gw_id.0, ds_id.0));
 
         self.insert(gw_id, ds_id, guest_buffer, res);
         (gw_id, ds_id)
@@ -260,6 +262,7 @@ impl GuestWork {
              * provided to us, and notify any waiters.
              */
             gtos_job.transfer_and_notify(data, result);
+            cdt::up__guest__done!(|| (gw_id.0, ds_id.0));
 
             self.completed.push(gw_id);
         } else {

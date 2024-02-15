@@ -323,6 +323,19 @@ impl Debug for ReplaceResult {
 mod cdt {
     use crate::Arg;
     fn up__status(_: String, arg: Arg) {}
+    fn up__io__sending__message(_: u64, _: u8) {}
+    fn up__io__message_sent(_: u64, _: u8) {}
+    fn up__guest__id(_: u64) {}
+    fn up__in__progress(_: u64, _: u8) {}
+    fn up__io__message__rx(_: u64, _: u8) {}
+    fn up__client__message__sent(_: u64, _: u8) {}
+    fn up__bind__guest__id(_: u64, _: u64) {}
+    fn up__ds__select(_: u64, _: u8) {}
+    fn up__io__completion(_: u64, _: u8) {}
+    fn up__client__message__received(_: u64, _: u8) {}
+    fn up__deferring(_: u64, _: u8) {}
+    fn up__defer__done(_: u64, _: u8) {}
+    fn up__guest__done(_: u64, _: u64) {}
     fn ds__ping__sent(_: u64, _: u8) {}
     fn up__apply(_: u64) {}
     fn up__action_downstairs(_: u64) {}

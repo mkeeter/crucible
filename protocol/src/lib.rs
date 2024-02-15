@@ -672,6 +672,52 @@ impl Message {
             Message::WriteUnwrittenAck { result, .. } => result.as_ref().err(),
         }
     }
+    pub fn job_id(&self) -> Option<JobId> {
+        match self {
+            Message::HereIAm { .. }
+            | Message::YesItsMe { .. }
+            | Message::VersionMismatch { .. }
+            | Message::ReadOnlyMismatch { .. }
+            | Message::EncryptedMismatch { .. }
+            | Message::PromoteToActive { .. }
+            | Message::YouAreNowActive { .. }
+            | Message::YouAreNoLongerActive { .. }
+            | Message::UuidMismatch { .. }
+            | Message::Ruok { .. }
+            | Message::Imok { .. }
+            | Message::ExtentClose { .. }
+            | Message::ExtentReopen { .. }
+            | Message::ExtentFlush { .. }
+            | Message::ExtentRepair { .. }
+            | Message::RepairAckId { .. }
+            | Message::RegionInfoPlease { .. }
+            | Message::RegionInfo { .. }
+            | Message::ExtentVersionsPlease { .. }
+            | Message::ExtentVersions { .. }
+            | Message::LastFlush { .. }
+            | Message::LastFlushAck { .. }
+            | Message::Unknown(..)
+            | Message::ExtentError { .. }
+            | Message::ErrorReport { .. } => None,
+
+            Message::Write { job_id, .. }
+            | Message::ExtentLiveClose { job_id, .. }
+            | Message::ExtentLiveFlushClose { job_id, .. }
+            | Message::ExtentLiveRepair { job_id, .. }
+            | Message::ExtentLiveReopen { job_id, .. }
+            | Message::ExtentLiveNoOp { job_id, .. }
+            | Message::Flush { job_id, .. }
+            | Message::ReadRequest { job_id, .. }
+            | Message::WriteUnwritten { job_id, .. }
+            | Message::ExtentLiveCloseAck { job_id, .. }
+            | Message::ExtentLiveRepairAckId { job_id, .. }
+            | Message::ExtentLiveAckId { job_id, .. }
+            | Message::WriteAck { job_id, .. }
+            | Message::FlushAck { job_id, .. }
+            | Message::ReadResponse { job_id, .. }
+            | Message::WriteUnwrittenAck { job_id, .. } => Some(*job_id),
+        }
+    }
 }
 
 #[derive(Debug)]

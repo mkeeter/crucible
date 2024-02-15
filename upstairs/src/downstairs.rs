@@ -590,7 +590,8 @@ impl Downstairs {
                     })
                 }
             };
-            self.clients[client_id].send(message).await
+            self.clients[client_id].send(message).await;
+            cdt::up__client__message__sent!(|| (new_id.0, client_id.get()));
         }
         flow_control
     }
@@ -608,6 +609,7 @@ impl Downstairs {
         ds_id: JobId,
         client_id: ClientId,
     ) -> Option<IOop> {
+        cdt::up__in__progress!(|| (ds_id.0, client_id.get()));
         let Some(job) = self.ds_active.get_mut(&ds_id) else {
             // This job, that we thought was good, is not.  As we don't
             // keep the lock when gathering job IDs to work on, it is
