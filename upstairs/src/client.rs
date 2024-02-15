@@ -75,6 +75,17 @@ impl ClientRequest {
         }
         Ok(())
     }
+
+    fn job_id(&self) -> Option<JobId> {
+        match self {
+            ClientRequest::Message(m) => m.job_id(),
+            ClientRequest::RawMessage(
+                RawMessage::Write { job_id, .. }
+                | RawMessage::WriteUnwritten { job_id, .. },
+                ..,
+            ) => Some(*job_id),
+        }
+    }
 }
 
 /// Handle to a running I/O task
@@ -317,6 +328,11 @@ impl DownstairsClient {
                 Some(c) => c.into(),
                 None => break ClientAction::ChannelClosed,
             };
+            if let ClientAction::Response(m) = &out {
+                if let Some(ds_id) = m.job_id() {
+                    cdt::up__ds__select!(|| (ds_id.0, self.client_id.get()));
+                }
+            }
             // Ignore client responses if we have told the client to exit (we
             // still propagate other ClientAction variants, e.g. TaskStopped).
             if self.client_task.client_stop_tx.is_some()
@@ -2609,6 +2625,7 @@ impl ClientIoTask {
         // Spawn a separate task to receive data over the network, so that we
         // can always make progress and keep the socket buffer from filling up.
         self.recv_task.handle = Some(tokio::spawn(rx_loop(
+            self.client_id,
             self.response_tx.clone(),
             fr,
             self.log.clone(),
@@ -2632,8 +2649,17 @@ impl ClientIoTask {
                         break ClientRunResult::QueueClosed;
                     };
 
+                    let ds_id = m.job_id();
+                    if let Some(ds_id) = ds_id {
+                        cdt::up__io__sending__message!(
+                            || (ds_id.0, self.client_id.get()));
+                    }
                     if let Err(e) = self.write(&mut fw, m).await {
                         break e;
+                    }
+                    if let Some(ds_id) = ds_id {
+                        cdt::up__io__message_sent!(
+                            || (ds_id.0, self.client_id.get()));
                     }
                 }
 
@@ -2725,6 +2751,7 @@ impl ClientIoTask {
 }
 
 async fn rx_loop<R>(
+    client_id: ClientId,
     response_tx: mpsc::Sender<ClientResponse>,
     mut fr: FramedRead<R, crucible_protocol::CrucibleDecoder>,
     log: Logger,
@@ -2738,6 +2765,9 @@ where
             f = fr.next() => {
                 match f {
                     Some(Ok(m)) => {
+                        if let Some(ds_id) = m.job_id() {
+                            cdt::up__io__message__rx!(|| (ds_id.0, client_id.get()));
+                        }
                         // reset the timeout, since we've received a message
                         timeout = deadline_secs(TIMEOUT_SECS);
                         if let Err(e) =
