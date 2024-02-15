@@ -2658,7 +2658,7 @@ impl ClientIoTask {
                         break e;
                     }
                     if let Some(ds_id) = ds_id {
-                        cdt::up__io__message_sent!(
+                        cdt::up__io__message__sent!(
                             || (ds_id.0, self.client_id.get()));
                     }
                 }
