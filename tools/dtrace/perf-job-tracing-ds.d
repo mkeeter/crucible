@@ -36,7 +36,7 @@ crucible_downstairs*:::ds-work-done
 crucible_downstairs*:::work-done
 /ds_io_rx[arg0]/
 {
-    work_done[arg0, arg0] = timestamp;
+    work_done[arg0] = timestamp;
 }
 
 crucible_downstairs*:::ds-io-tx
@@ -45,7 +45,7 @@ crucible_downstairs*:::ds-io-tx
     ds_io_tx[arg0] = timestamp;
 }
 
-crucible_downstairs*:::up-guest-done
+crucible_downstairs*:::ds-io-tx-done
 /ds_io_rx[arg0]/
 {
     ds_io_tx_done[arg0] = timestamp;
