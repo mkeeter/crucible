@@ -606,7 +606,21 @@ impl Upstairs {
 
         // Send jobs downstairs as they become available.  This must be called
         // after `continue_live_repair`, which may enqueue jobs.
-        for i in ClientId::iter() {
+        //
+        // We send jobs to the client with the most in-progress jobs **first**,
+        // to avoid building up delay.  Otherwise, in a read-heavy workload,
+        // client 0 will always reply first, and then we'll send the next read,
+        // without giving clients 1 and 2 time to finish (because we only need
+        // one read to succeed).  Over time, this will cause jobs to accumulate
+        // in clients 1 and 2.
+        let mut client_ids =
+            [ClientId::new(0), ClientId::new(1), ClientId::new(2)];
+        client_ids.sort_by_key(|i| {
+            std::cmp::Reverse(
+                self.downstairs.clients[*i].io_state_count.in_progress,
+            )
+        });
+        for i in client_ids {
             if self.downstairs.clients[i].should_do_more_work() {
                 self.downstairs.io_send(i).await;
             }
