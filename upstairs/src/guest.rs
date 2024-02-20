@@ -373,7 +373,7 @@ impl Guest {
         // queue be full will just look like another source of backpressure (and
         // will in fact be invisible to the caller, since they can't distinguish
         // time spent waiting for the queue versus time spent in Upstairs code).
-        let (req_tx, req_rx) = mpsc::channel(500);
+        let (req_tx, req_rx) = mpsc::channel(64);
 
         let backpressure_us = Arc::new(AtomicU64::new(0));
         let limits = GuestLimits {

@@ -16,7 +16,7 @@ use std::time::Duration;
 use crucible_common::{
     build_logger, crucible_bail, impacted_blocks::extent_from_offset,
     integrity_hash, mkdir_for_file, Block, CrucibleError, RegionDefinition,
-    MAX_ACTIVE_COUNT, MAX_BLOCK_SIZE,
+    MAX_BLOCK_SIZE,
 };
 use crucible_protocol::{
     BlockContext, CrucibleDecoder, CrucibleEncoder, JobId, Message,
@@ -1132,12 +1132,11 @@ where
     // Create the log for this task to use.
     let log = ads.lock().await.log.new(o!("task" => "main".to_string()));
 
-    // Give our work queue a little more space than we expect the upstairs
-    // to ever send us.
-    let (job_channel_tx, job_channel_rx) = mpsc::channel(MAX_ACTIVE_COUNT + 50);
-
-    let (resp_channel_tx, resp_channel_rx) =
-        mpsc::channel(MAX_ACTIVE_COUNT + 50);
+    // Give our work queue room for 32 messages.  This is deliberately small,
+    // because if it fills up, we **want** backpressure to propagate all the way
+    // to the upstairs.
+    let (job_channel_tx, job_channel_rx) = mpsc::channel(32);
+    let (resp_channel_tx, resp_channel_rx) = mpsc::channel(32);
     let mut framed_write_task = tokio::spawn(reply_task(resp_channel_rx, fw));
 
     /*
@@ -1173,9 +1172,9 @@ where
      *   ┌────▼──┴─┐ message   ┌┴──────┐  job     ┌┴────────┐
      *   │resp_loop├──────────►│pf_task├─────────►│ dw_task │
      *   └─────────┘ channel   └──┬────┘ channel  └▲────────┘
+     *                            │    (doorbell)  │
      *                            │                │
-     *                         add│work         new│work
-     *   per-connection           │                │
+     *   per-connection        add│work         new│work
      *  ========================= │ ============== │ ===============
      *   shared state          ┌──▼────────────────┴────────────┐
      *                         │           Downstairs           │
@@ -1196,7 +1195,7 @@ where
     };
 
     let (message_channel_tx, mut message_channel_rx) =
-        mpsc::channel::<Message>(MAX_ACTIVE_COUNT + 50);
+        mpsc::channel::<Message>(32);
     let mut pf_task = {
         let adc = ads.clone();
         let tx = job_channel_tx.clone();
