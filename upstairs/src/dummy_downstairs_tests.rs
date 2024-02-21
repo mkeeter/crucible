@@ -13,7 +13,7 @@ pub(crate) mod protocol_test {
     use crate::BlockIO;
     use crate::Buffer;
     use crate::CrucibleError;
-    use crate::IO_OUTSTANDING_MAX;
+    use crate::IO_OUTSTANDING_MAX_JOBS;
     use crate::MAX_ACTIVE_COUNT;
     use crucible_client_types::CrucibleOpts;
     use crucible_common::Block;
@@ -937,11 +937,11 @@ pub(crate) mod protocol_test {
         let (_jh2, mut ds2_messages) = harness.ds2.spawn_message_receiver();
         let (_jh3, mut ds3_messages) = harness.ds3.spawn_message_receiver();
 
-        // Send 200 more than IO_OUTSTANDING_MAX jobs. Flow control will kick in
+        // Send 200 more than IO_OUTSTANDING_MAX_JOBS jobs. Flow control will kick in
         // at MAX_ACTIVE_COUNT messages, so we need to be sending read responses
-        // while reads are being sent. After IO_OUTSTANDING_MAX jobs, the
+        // while reads are being sent. After IO_OUTSTANDING_MAX_JOBS jobs, the
         // Upstairs will set ds1 to faulted, and send it no more work.
-        const NUM_JOBS: usize = IO_OUTSTANDING_MAX + 200;
+        const NUM_JOBS: usize = IO_OUTSTANDING_MAX_JOBS + 200;
         let mut job_ids = Vec::with_capacity(NUM_JOBS);
 
         for i in 0..NUM_JOBS {
@@ -1976,11 +1976,11 @@ pub(crate) mod protocol_test {
         let (_jh2, mut ds2_messages) = harness.ds2.spawn_message_receiver();
         let (_jh3, mut ds3_messages) = harness.ds3.spawn_message_receiver();
 
-        // Send 200 more than IO_OUTSTANDING_MAX jobs. Flow control will kick in
+        // Send 200 more than IO_OUTSTANDING_MAX_JOBS jobs. Flow control will kick in
         // at MAX_ACTIVE_COUNT messages, so we need to be sending read responses
-        // while reads are being sent. After IO_OUTSTANDING_MAX jobs, the
+        // while reads are being sent. After IO_OUTSTANDING_MAX_JOBS jobs, the
         // Upstairs will set ds1 to faulted, and send it no more work.
-        const NUM_JOBS: usize = IO_OUTSTANDING_MAX + 200;
+        const NUM_JOBS: usize = IO_OUTSTANDING_MAX_JOBS + 200;
         let mut job_ids = Vec::with_capacity(NUM_JOBS);
 
         for i in 0..NUM_JOBS {
@@ -2680,11 +2680,11 @@ pub(crate) mod protocol_test {
         let (_jh2, mut ds2_messages) = harness.ds2.spawn_message_receiver();
         let (_jh3, mut ds3_messages) = harness.ds3.spawn_message_receiver();
 
-        // Send 200 more than IO_OUTSTANDING_MAX jobs. Flow control will kick in
+        // Send 200 more than IO_OUTSTANDING_MAX_JOBS jobs. Flow control will kick in
         // at MAX_ACTIVE_COUNT messages, so we need to be sending read responses
-        // while reads are being sent. After IO_OUTSTANDING_MAX jobs, the
+        // while reads are being sent. After IO_OUTSTANDING_MAX_JOBS jobs, the
         // Upstairs will set ds1 to faulted, and send it no more work.
-        const NUM_JOBS: usize = IO_OUTSTANDING_MAX + 200;
+        const NUM_JOBS: usize = IO_OUTSTANDING_MAX_JOBS + 200;
         let mut job_ids = Vec::with_capacity(NUM_JOBS);
 
         for i in 0..NUM_JOBS {

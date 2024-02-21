@@ -92,7 +92,7 @@ impl BackpressureConfig {
     pub fn get_delay(&self, bp: &BackpressureCounters) -> Duration {
         let bytes = bp.write_bytes_outstanding.load(Ordering::Relaxed);
         let jobs = bp.io_jobs.load(Ordering::Relaxed);
-        let ratio = jobs as f64 / crate::IO_OUTSTANDING_MAX as f64;
+        let ratio = jobs as f64 / crate::IO_OUTSTANDING_MAX_JOBS as f64;
 
         // Check to see if the number of outstanding write bytes (between
         // the upstairs and downstairs) is particularly high.  If so,
