@@ -491,6 +491,11 @@ impl Guest {
     pub fn disable_queue_backpressure(&mut self) {
         self.backpressure_config.queue_max_delay = Duration::ZERO;
     }
+    /// Disables queue-based backpressure, to speed up certain unit tests
+    #[cfg(test)]
+    pub fn disable_byte_backpressure(&mut self) {
+        self.backpressure_config.bytes_max_delay = Duration::ZERO;
+    }
 }
 
 #[async_trait]

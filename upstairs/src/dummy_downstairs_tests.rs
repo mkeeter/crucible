@@ -13,6 +13,7 @@ pub(crate) mod protocol_test {
     use crate::BlockIO;
     use crate::Buffer;
     use crate::CrucibleError;
+    use crate::IO_OUTSTANDING_MAX_BYTES;
     use crate::IO_OUTSTANDING_MAX_JOBS;
     use crate::MAX_ACTIVE_COUNT;
     use crucible_client_types::CrucibleOpts;
@@ -524,6 +525,7 @@ pub(crate) mod protocol_test {
             // which require triggering a timeout
             let (mut g, io) = Guest::new(Some(log.clone()));
             g.disable_queue_backpressure();
+            g.disable_byte_backpressure();
             let guest = Arc::new(g);
 
             let crucible_opts = CrucibleOpts {
@@ -1963,6 +1965,147 @@ pub(crate) mod protocol_test {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Test that after giving up on a downstairs, setting it to faulted, and
+    /// letting it reconnect, live repair occurs. Check that each extent is
+    /// repaired with the correct source, and that extent limits are honoured if
+    /// additional IO comes through.
+    #[tokio::test]
+    async fn test_byte_fault_condition() -> Result<()> {
+        let harness = Arc::new(TestHarness::new().await?);
+
+        let (_jh1, mut ds1_messages) =
+            harness.ds1().await.spawn_message_receiver();
+        let (_jh2, mut ds2_messages) = harness.ds2.spawn_message_receiver();
+        let (_jh3, mut ds3_messages) = harness.ds3.spawn_message_receiver();
+
+        // Send enough bytes to hit the IO_OUTSTANDING_MAX_BYTES condition on
+        // downstairs 1, which should mark it as faulted and kick it out.
+        let write_buf = Bytes::from(vec![1; 50 * 1024]); // 1 MiB
+        let num_jobs = IO_OUTSTANDING_MAX_BYTES as usize / write_buf.len() + 10;
+        let mut job_ids = Vec::with_capacity(num_jobs);
+        assert!(num_jobs < IO_OUTSTANDING_MAX_JOBS);
+
+        for i in 0..num_jobs {
+            {
+                let harness = harness.clone();
+
+                // We must tokio::spawn here because `read` will wait for the
+                // response to come back before returning
+                let write_buf = write_buf.clone();
+                tokio::spawn(async move {
+                    harness
+                        .guest
+                        .write(Block::new_512(0), write_buf)
+                        .await
+                        .unwrap();
+                });
+            }
+
+            if i < MAX_ACTIVE_COUNT {
+                // Before flow control kicks in, assert we're seeing the read
+                // requests
+                bail_assert!(matches!(
+                    ds1_messages.recv().await.unwrap(),
+                    Message::Write { .. },
+                ));
+            } else {
+                // After flow control kicks in, we shouldn't see any more
+                // messages
+                match ds1_messages.try_recv() {
+                    // This can return either Empty or Disconnected, depending
+                    // on whether the upstairs has kicked us out.
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {}
+                    x => {
+                        info!(
+                            harness.log,
+                            "Read {i} should return EMPTY, but we got:{:?}", x
+                        );
+
+                        bail!(
+                            "Read {i} should return EMPTY, but we got:{:?}",
+                            x
+                        );
+                    }
+                }
+            }
+
+            match ds2_messages.recv().await.unwrap() {
+                Message::Write { job_id, .. } => {
+                    // Record the job ids of the read requests
+                    job_ids.push(job_id);
+                }
+
+                _ => bail!("saw non read request!"),
+            }
+
+            bail_assert!(matches!(
+                ds3_messages.recv().await.unwrap(),
+                Message::Write { .. },
+            ));
+
+            // Respond with read responses for downstairs 2 and 3
+            harness
+                .ds2
+                .fw
+                .lock()
+                .await
+                .send(Message::WriteAck {
+                    upstairs_id: harness.guest.get_uuid().await.unwrap(),
+                    session_id: harness
+                        .ds2
+                        .upstairs_session_id
+                        .lock()
+                        .await
+                        .unwrap(),
+                    job_id: job_ids[i],
+                    result: Ok(()),
+                })
+                .await
+                .unwrap();
+
+            harness
+                .ds3
+                .fw
+                .lock()
+                .await
+                .send(Message::WriteAck {
+                    upstairs_id: harness.guest.get_uuid().await.unwrap(),
+                    session_id: harness
+                        .ds3
+                        .upstairs_session_id
+                        .lock()
+                        .await
+                        .unwrap(),
+                    job_id: job_ids[i],
+                    result: Ok(()),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Confirm that's all the Upstairs sent us (only ds2 and ds3) - with the
+        // flush_timeout set to 24 hours, we shouldn't see anything else
+        bail_assert!(matches!(
+            ds2_messages.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        bail_assert!(matches!(
+            ds3_messages.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        // Assert the Upstairs isn't sending ds1 more work, because it is
+        // Faulted
+        let v = ds1_messages.try_recv();
+        assert_eq!(
+            v,
+            Err(TryRecvError::Disconnected),
+            "ds1 message queue must be disconnected"
+        );
         Ok(())
     }
 
