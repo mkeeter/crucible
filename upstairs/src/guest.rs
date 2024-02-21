@@ -354,8 +354,8 @@ impl Guest {
 
         let backpressure_counters = BackpressureCounters::new();
         let backpressure_config = BackpressureConfig {
-            bytes_start: 1024u64.pow(3), // Start at 1 GiB
-            bytes_scale: 9.3e-8,         // Delay of 10ms at 2 GiB in-flight
+            bytes_start: 0.1, // Start backpressure at 100 MiB
+            bytes_max_delay: Duration::from_millis(10),
             queue_start: 0.05,
             queue_max_delay: Duration::from_millis(5),
         };

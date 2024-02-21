@@ -70,19 +70,19 @@ impl Drop for BackpressureGuard {
 /// otherwise acked immediately, before actually being complete).  The delay is
 /// varied based on two metrics:
 ///
-/// - number of write bytes outstanding
+/// - number of write bytes outstanding, as a fraction of max
 /// - queue length as a fraction (where 1.0 is full)
 ///
 /// These two metrics are used for quadratic backpressure, picking the larger of
 /// the two delays.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct BackpressureConfig {
-    /// When should backpressure start (in bytes)?
-    pub bytes_start: u64,
-    /// Scale for byte-based quadratic backpressure
-    pub bytes_scale: f64,
+    /// Byte-based backpressure start, as a fraction of IO_OUTSTANDING_MAX_BYTES
+    pub bytes_start: f64,
+    /// Maximum byte-based delay
+    pub bytes_max_delay: Duration,
 
-    /// When should queue-based backpressure start?
+    /// Queue-based backpressure start, as a fraction of IO_OUTSTANDING_MAX_JOBS
     pub queue_start: f64,
     /// Maximum queue-based delay
     pub queue_max_delay: Duration,
@@ -91,29 +91,39 @@ pub(crate) struct BackpressureConfig {
 impl BackpressureConfig {
     pub fn get_delay(&self, bp: &BackpressureCounters) -> Duration {
         let bytes = bp.write_bytes_outstanding.load(Ordering::Relaxed);
+
+        // We calculate backpressure as the worst case of jobs-in-flight and
+        // bytes-in-flight.  Both delays are based on max outstanding values
+        // (i.e. how many jobs or bytes must be in-flight to declare a
+        // Downstairs failed).
+
         let jobs = bp.io_jobs.load(Ordering::Relaxed);
-        let ratio = jobs as f64 / crate::IO_OUTSTANDING_MAX_JOBS as f64;
-
-        // Check to see if the number of outstanding write bytes (between
-        // the upstairs and downstairs) is particularly high.  If so,
-        // apply some backpressure by delaying host operations, with a
-        // quadratically-increasing delay.
-        let d1 = (bytes.saturating_sub(self.bytes_start) as f64
-            * self.bytes_scale)
-            .powf(2.0) as u64;
-
-        // Compute an alternate delay based on queue length
-        let d2 = self
+        let job_ratio = jobs as f64 / crate::IO_OUTSTANDING_MAX_JOBS as f64;
+        let backpressure_due_to_jobs = self
             .queue_max_delay
             .mul_f64(
-                ((ratio - self.queue_start).max(0.0)
+                ((job_ratio - self.queue_start).max(0.0)
                     / (1.0 - self.queue_start))
                     .powf(2.0),
             )
             .as_micros() as u64;
 
+        // Check to see if the number of outstanding write bytes (between
+        // the upstairs and downstairs) is particularly high.  If so,
+        // apply some backpressure by delaying host operations, with a
+        // quadratically-increasing delay.
+        let bytes_ratio = bytes as f64 / crate::IO_OUTSTANDING_MAX_BYTES as f64;
+        let backpressure_due_to_bytes = self
+            .bytes_max_delay
+            .mul_f64(
+                ((bytes_ratio - self.bytes_start).max(0.0)
+                    / (1.0 - self.bytes_start))
+                    .powf(2.0),
+            )
+            .as_micros() as u64;
+
         // Write the current value to the cache in BackpressureCounters
-        let bp_us = d1.max(d2);
+        let bp_us = backpressure_due_to_jobs.max(backpressure_due_to_bytes);
         bp.backpressure_us.store(bp_us, Ordering::Relaxed);
 
         Duration::from_micros(bp_us)
