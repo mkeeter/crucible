@@ -117,6 +117,10 @@ impl BlockRes {
         //
         // (we only count write bytes because only writes return immediately)
         assert!(self.backpressure_guard.is_none());
+
+        // The logic in this statement should match `IOop::write_bytes()`;
+        // otherwise, backpressure and the bytes-in-flight fault won't be
+        // correctly correlated.
         let bytes = match op {
             BlockOp::Write { data, .. } => data.len() as u64,
             _ => 0,
