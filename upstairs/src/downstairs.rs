@@ -2295,6 +2295,8 @@ impl Downstairs {
                 self.clients[cid].enqueue(&mut io, last_repair_extent);
             if matches!(job_state, IOState::Skipped) {
                 skipped += 1;
+            } else {
+                assert_eq!(job_state, IOState::New);
             }
         }
 

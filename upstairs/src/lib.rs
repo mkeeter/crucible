@@ -1345,6 +1345,16 @@ impl IOop {
             false
         }
     }
+
+    /// Returns the number of bytes written in this job
+    fn write_bytes(&self) -> u64 {
+        match &self {
+            IOop::Write { data, .. } | IOop::WriteUnwritten { data, .. } => {
+                data.io_size_bytes as u64
+            }
+            _ => 0,
+        }
+    }
 }
 
 /*
