@@ -325,6 +325,7 @@ mod cdt {
     fn up__status(_: String, arg: Arg) {}
     fn up__io__sending__message(_: u64, _: u8) {}
     fn up__io__message__sent(_: u64, _: u8) {}
+    fn up__client__lag(_: u64, _: u64, _: u64) {}
     fn up__guest__id(_: u64) {}
     fn up__in__progress(_: u64, _: u8) {}
     fn up__io__message__rx(_: u64, _: u8) {}
@@ -901,6 +902,9 @@ struct DownstairsIO {
 
     /// Map of work status, tracked on a per-client basis
     state: ClientData<IOState>,
+
+    /// At what time did we hear a reply?
+    reply_time: ClientData<Option<std::time::Instant>>,
 
     /*
      * Has this been acked to the guest yet?
