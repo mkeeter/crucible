@@ -3187,6 +3187,27 @@ impl Downstairs {
             let dt2 = (job.reply_time[ClientId::new(2)].unwrap() - earliest)
                 .as_micros() as u64;
             cdt::up__client__lag!(|| (dt0, dt1, dt2));
+
+            // Delay the fastest clients (lol)
+            let latest = *job.reply_time.iter().flatten().max().unwrap();
+            for i in ClientId::iter() {
+                // Calculate how far ahead this client is compared to the
+                // slowest client, which we'll use to delay things.
+                let lead_time_us: u64 = (latest - job.reply_time[i].unwrap())
+                    .as_micros()
+                    .try_into()
+                    .unwrap();
+
+                // 0 delay below 10ms of lead time, then quadratically
+                // increasing until we hit  10 ms of delay at 20 ms of lead
+                // time.  This is all incredibly eyeballed.
+                let delay_time_us = if lead_time_us < 10_000 {
+                    0
+                } else {
+                    (lead_time_us - 10_000).min(20_000).pow(2) / 40000
+                };
+                self.clients[i].set_delay_us(delay_time_us);
+            }
         }
 
         /*

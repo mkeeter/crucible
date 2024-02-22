@@ -10,7 +10,14 @@ use crate::{
 use crucible_common::x509::TLSContext;
 use crucible_protocol::{ReconciliationId, CRUCIBLE_MESSAGE_VERSION};
 
-use std::{collections::BTreeSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use futures::StreamExt;
 use slog::{debug, error, info, o, warn, Logger};
@@ -18,7 +25,7 @@ use tokio::{
     io::AsyncWriteExt,
     net::{TcpSocket, TcpStream},
     sync::{mpsc, oneshot},
-    time::sleep_until,
+    time::{sleep_until, Duration},
 };
 use tokio_util::codec::{Encoder, FramedRead};
 use uuid::Uuid;
@@ -227,6 +234,9 @@ pub(crate) struct DownstairsClient {
 
     /// Session ID for a clients connection to a downstairs.
     connection_id: ConnectionId,
+
+    /// Backpressure handle, shared with the downstairs client
+    backpressure_delay_us: Arc<AtomicU64>,
 }
 
 impl DownstairsClient {
@@ -237,6 +247,7 @@ impl DownstairsClient {
         log: Logger,
         tls_context: Option<Arc<crucible_common::x509::TLSContext>>,
     ) -> Self {
+        let backpressure_delay_us = Arc::new(AtomicU64::new(0));
         Self {
             cfg,
             client_task: Self::new_io_task(
@@ -245,6 +256,7 @@ impl DownstairsClient {
                 false, // do not start the task until GoActive
                 client_id,
                 tls_context.clone(),
+                backpressure_delay_us.clone(),
                 &log,
             ),
             client_id,
@@ -264,6 +276,7 @@ impl DownstairsClient {
             repair_info: None,
             io_state_count: ClientIOStateCount::new(),
             connection_id: ConnectionId(0),
+            backpressure_delay_us,
         }
     }
 
@@ -281,6 +294,7 @@ impl DownstairsClient {
             read_only: false,
             lossy: false,
         });
+        let backpressure_delay_us = Arc::new(AtomicU64::new(0));
         Self {
             cfg,
             client_task: Self::new_dummy_task(false),
@@ -301,6 +315,7 @@ impl DownstairsClient {
             repair_info: None,
             io_state_count: ClientIOStateCount::new(),
             connection_id: ConnectionId(0),
+            backpressure_delay_us,
         }
     }
 
@@ -668,6 +683,7 @@ impl DownstairsClient {
             connect,
             self.client_id,
             self.tls_context.clone(),
+            self.backpressure_delay_us.clone(),
             &self.log,
         );
     }
@@ -678,6 +694,7 @@ impl DownstairsClient {
         connect: bool,
         client_id: ClientId,
         tls_context: Option<Arc<TLSContext>>,
+        backpressure_delay_us: Arc<AtomicU64>,
         log: &Logger,
     ) -> ClientTaskHandle {
         #[cfg(test)]
@@ -688,6 +705,7 @@ impl DownstairsClient {
                 connect,
                 client_id,
                 tls_context,
+                backpressure_delay_us,
                 log,
             )
         } else {
@@ -701,6 +719,7 @@ impl DownstairsClient {
             connect,
             client_id,
             tls_context,
+            backpressure_delay_us,
             log,
         )
     }
@@ -711,6 +730,7 @@ impl DownstairsClient {
         connect: bool,
         client_id: ClientId,
         tls_context: Option<Arc<TLSContext>>,
+        backpressure_delay_us: Arc<AtomicU64>,
         log: &Logger,
     ) -> ClientTaskHandle {
         // These channels must support at least MAX_ACTIVE_COUNT messages;
@@ -746,6 +766,7 @@ impl DownstairsClient {
                     log: log.clone(),
                 },
                 delay,
+                backpressure_delay_us,
                 log,
             };
             c.run().await
@@ -2238,6 +2259,10 @@ impl DownstairsClient {
             None
         }
     }
+
+    pub(crate) fn set_delay_us(&self, delay: u64) {
+        self.backpressure_delay_us.store(delay, Ordering::Relaxed);
+    }
 }
 
 /// How to handle "promote to active" requests
@@ -2437,6 +2462,9 @@ struct ClientIoTask {
 
     /// Handle for the rx task
     recv_task: ClientRxTask,
+
+    /// Shared handle to control per-client backpressure delay
+    backpressure_delay_us: Arc<AtomicU64>,
 
     log: Logger,
 }
@@ -2720,6 +2748,13 @@ impl ClientIoTask {
             + std::marker::Send
             + 'static,
     {
+        // Delay communication with this client based on backpressure, to keep
+        // the three clients relatively in sync with each other.
+        let d = self.backpressure_delay_us.load(Ordering::Relaxed);
+        if d > 0 {
+            tokio::time::sleep(Duration::from_micros(d)).await;
+        }
+
         // There's some duplication between this function and `cmd_loop` above,
         // but it's not obvious whether there's a cleaner way to organize stuff.
         tokio::select! {
