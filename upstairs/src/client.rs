@@ -2260,8 +2260,11 @@ impl DownstairsClient {
         }
     }
 
+    /// Sets the new per-client delay, with a low-pass filter
     pub(crate) fn set_delay_us(&self, delay: u64) {
-        self.backpressure_delay_us.store(delay, Ordering::Relaxed);
+        let prev = self.backpressure_delay_us.load(Ordering::Relaxed);
+        let next = prev * 9 / 10 + delay / 10;
+        self.backpressure_delay_us.store(next, Ordering::Relaxed);
     }
 }
 
