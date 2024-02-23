@@ -3218,13 +3218,13 @@ impl Downstairs {
                     .try_into()
                     .unwrap();
 
-                // 0 delay below 10ms of lead time, then quadratically
-                // increasing until we hit  10 ms of delay at 20 ms of lead
+                // 0 delay below 10ms of lead time, then linearly increasing
+                //   until we hit  10 ms of delay at 20 ms of lead
                 // time.  This is all incredibly eyeballed.
                 let delay_time_us = if lead_time_us < 10_000 {
                     0
                 } else {
-                    (lead_time_us - 10_000).min(20_000).pow(2) / 40000
+                    (lead_time_us - 10_000).min(20_000) / 2
                 };
                 times[i] = delay_time_us;
                 self.clients[i].set_delay_us(delay_time_us);
