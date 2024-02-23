@@ -3207,23 +3207,27 @@ impl Downstairs {
                 .as_micros() as u64;
             cdt::up__job__time!(|| (dt0, dt1, dt2));
 
-            // Delay the fastest clients (lol)
-            let latest = *job.reply_time.iter().flatten().max().unwrap();
+            // Delay the fastest client (lol)
+            let earliest_id = ClientId::iter()
+                .min_by_key(|i| job.reply_time[*i].unwrap())
+                .unwrap();
+            let latest_time = *job.reply_time.iter().flatten().max().unwrap();
             let mut times = ClientData::new(0);
             for i in ClientId::iter() {
-                // Calculate how far ahead this client is compared to the
-                // slowest client, which we'll use to delay things.
-                let lead_time_us: u64 = (latest - job.reply_time[i].unwrap())
+                let delay_time_us = if i == earliest_id {
+                    // Calculate how far ahead this client is compared to the
+                    // slowest client, which we'll use to delay things.
+                    let lead_time_us: u64 = (latest_time
+                        - job.reply_time[i].unwrap())
                     .as_micros()
                     .try_into()
                     .unwrap();
 
-                // 0 delay below 10ms of lead time, then linearly increasing
-                // at a totally eyeballed rate, maxing out at 10 ms of lag.
-                let delay_time_us = if lead_time_us < 10_000 {
-                    0
+                    // 0 delay below 10ms of lead time, then linearly increasing
+                    // at a totally eyeballed rate, maxing out at 10 ms of lag.
+                    ((lead_time_us.saturating_sub(10_000)) / 100).min(10_000)
                 } else {
-                    ((lead_time_us - 10_000) / 100).min(10_000)
+                    0
                 };
                 times[i] = delay_time_us;
                 self.clients[i].set_delay_us(delay_time_us);
