@@ -1328,6 +1328,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: noop_ioop,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -1452,6 +1453,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: repair_ioop,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -1593,6 +1595,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: reopen_ioop,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -1667,6 +1670,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: aread,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -1738,6 +1742,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: awrite,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -1769,6 +1774,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: close_ioop,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -2095,6 +2101,7 @@ impl Downstairs {
             guest_id: gw_id,
             work: flush,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -2220,6 +2227,7 @@ impl Downstairs {
             guest_id,
             work: aread,
             state: ClientData::new(IOState::New),
+            send_time: std::time::Instant::now(),
             reply_time: ClientData::new(None),
             acked: false,
             replay: false,
@@ -3188,8 +3196,20 @@ impl Downstairs {
                 .as_micros() as u64;
             cdt::up__client__lag!(|| (dt0, dt1, dt2));
 
+            let dt0 = (job.reply_time[ClientId::new(0)].unwrap()
+                - job.send_time)
+                .as_micros() as u64;
+            let dt1 = (job.reply_time[ClientId::new(1)].unwrap()
+                - job.send_time)
+                .as_micros() as u64;
+            let dt2 = (job.reply_time[ClientId::new(2)].unwrap()
+                - job.send_time)
+                .as_micros() as u64;
+            cdt::up__job__time!(|| (dt0, dt1, dt2));
+
             // Delay the fastest clients (lol)
             let latest = *job.reply_time.iter().flatten().max().unwrap();
+            let mut times = ClientData::new(0);
             for i in ClientId::iter() {
                 // Calculate how far ahead this client is compared to the
                 // slowest client, which we'll use to delay things.
@@ -3206,8 +3226,14 @@ impl Downstairs {
                 } else {
                     (lead_time_us - 10_000).min(20_000).pow(2) / 40000
                 };
+                times[i] = delay_time_us;
                 self.clients[i].set_delay_us(delay_time_us);
             }
+            cdt::up__client__backpressure!(|| (
+                times[ClientId::new(0)],
+                times[ClientId::new(1)],
+                times[ClientId::new(2)]
+            ));
         }
 
         /*

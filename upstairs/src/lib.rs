@@ -326,6 +326,8 @@ mod cdt {
     fn up__io__sending__message(_: u64, _: u8) {}
     fn up__io__message__sent(_: u64, _: u8) {}
     fn up__client__lag(_: u64, _: u64, _: u64) {}
+    fn up__job__time(_: u64, _: u64, _: u64) {}
+    fn up__client__backpressure(_: u64, _: u64, _: u64) {}
     fn up__guest__id(_: u64) {}
     fn up__in__progress(_: u64, _: u8) {}
     fn up__io__message__rx(_: u64, _: u8) {}
@@ -902,6 +904,9 @@ struct DownstairsIO {
 
     /// Map of work status, tracked on a per-client basis
     state: ClientData<IOState>,
+
+    /// At what time (roughly) did we create this job?
+    send_time: std::time::Instant,
 
     /// At what time did we hear a reply?
     reply_time: ClientData<Option<std::time::Instant>>,
