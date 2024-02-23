@@ -2658,7 +2658,6 @@ impl ClientIoTask {
             self.client_id,
             self.response_tx.clone(),
             fr,
-            self.backpressure_delay_us.clone(),
             self.log.clone(),
         )));
 
@@ -2749,6 +2748,13 @@ impl ClientIoTask {
             + std::marker::Send
             + 'static,
     {
+        // Delay communication with this client based on backpressure, to keep
+        // the three clients relatively in sync with each other.
+        let d = self.backpressure_delay_us.load(Ordering::Relaxed);
+        if d > 0 {
+            tokio::time::sleep(Duration::from_micros(d)).await;
+        }
+
         // There's some duplication between this function and `cmd_loop` above,
         // but it's not obvious whether there's a cleaner way to organize stuff.
         tokio::select! {
@@ -2785,7 +2791,6 @@ async fn rx_loop<R>(
     client_id: ClientId,
     response_tx: mpsc::Sender<ClientResponse>,
     mut fr: FramedRead<R, crucible_protocol::CrucibleDecoder>,
-    backpressure_delay_us: Arc<AtomicU64>,
     log: Logger,
 ) -> ClientRunResult
 where
@@ -2802,15 +2807,6 @@ where
                         }
                         // reset the timeout, since we've received a message
                         timeout = deadline_secs(TIMEOUT_SECS);
-
-                        // Delay communication with this client based on
-                        // backpressure, to keep the three clients relatively in
-                        // sync with each other.
-                        let d = backpressure_delay_us.load(Ordering::Relaxed);
-                        if d > 0 {
-                            tokio::time::sleep(Duration::from_micros(d)).await;
-                        }
-
                         if let Err(e) =
                             response_tx.send(ClientResponse::Message(m)).await
                         {
