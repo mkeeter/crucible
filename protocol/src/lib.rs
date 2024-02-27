@@ -7,6 +7,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use num_enum::IntoPrimitive;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumDiscriminants;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Decoder, Encoder};
 use uuid::Uuid;
 
@@ -535,8 +537,6 @@ pub enum Message {
     /*
      * IO related
      */
-    // Message::Write must contain the same fields in the same order as
-    // RawMessage::Write which is used for zero-copy serialization.
     Write {
         upstairs_id: Uuid,
         session_id: Uuid,
@@ -586,8 +586,6 @@ pub enum Message {
         responses: Result<Vec<ReadResponse>, CrucibleError>,
     },
 
-    // Message::WriteUnwritten must contain the same fields in the same order as
-    // RawMessage::WriteUnwritten, which is used for zero-copy serialization.
     WriteUnwritten {
         upstairs_id: Uuid,
         session_id: Uuid,
@@ -939,6 +937,150 @@ impl Decoder for CrucibleDecoder {
         }
 
         Ok(Some(message?))
+    }
+}
+
+/// Writer to synchronously send a `Message` to an `AsyncWrite` sink
+///
+/// This allows us to call `bincode::serialize` directly into a socket, without
+/// an intermediate serialization step.
+pub struct AsyncMessageWriter {
+    tx: mpsc::Sender<AsyncMessageRequest>,
+}
+
+type AsyncMessageReply = oneshot::Sender<Result<(), CrucibleError>>;
+struct AsyncMessageRequest(Message, AsyncMessageReply);
+
+pub struct AsyncMessageWorker<W> {
+    rx: mpsc::Receiver<AsyncMessageRequest>,
+    writer: W,
+    buf: Vec<u8>,
+    handle: tokio::runtime::Handle,
+}
+
+impl<W> AsyncMessageWorker<W>
+where
+    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    fn new(writer: W, rx: mpsc::Receiver<AsyncMessageRequest>) -> Self {
+        Self {
+            rx,
+            writer,
+            buf: vec![],
+            handle: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl AsyncMessageWriter {
+    /// Builds a new `AsyncMessageWriter`
+    ///
+    /// # Panics
+    /// This must be called within the context of a Tokio runtime, otherwise the
+    /// function will panic.
+    pub fn new<W>(writer: W) -> Self
+    where
+        W: tokio::io::AsyncWrite
+            + std::marker::Unpin
+            + std::marker::Send
+            + 'static,
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut worker = AsyncMessageWorker::new(writer, rx);
+        let _worker = tokio::task::spawn(async move { worker.run().await });
+        Self { tx }
+    }
+
+    /// Sends a single encoded message
+    ///
+    /// Under the hood, this serializes directly into the `AsyncWriter`,
+    /// avoiding large `memcpy` calls.  Because `bincode` is synchronous, this
+    /// is implemented using `tokio::runtime::Handle::block_on`.
+    pub async fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
+        println!("SENDING {m:?}");
+        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.tx.send(AsyncMessageRequest(m, tx)).await {
+            return Err(CrucibleError::IoError(format!(
+                "IO worker died: {e:?}"
+            )));
+        }
+        println!("SENT MESSAGE, AWAITING RESULT");
+        match rx.await {
+            Ok(v) => {
+                println!("GOT RESULT OK");
+                v
+            }
+            Err(e) => {
+                Err(CrucibleError::IoError(format!("IO worker died: {e:?}")))
+            }
+        }
+    }
+}
+
+impl<W> AsyncMessageWorker<W>
+where
+    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    async fn run(&mut self) {
+        while let Some(s) = self.rx.recv().await {
+            println!("WORKER IS SENDING {:?}", s.0);
+            let r = self.send(s.0).await;
+            let _ = s.1.send(r);
+        }
+    }
+
+    async fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
+        use std::io::Write;
+        let len = CrucibleEncoder::serialized_size(&m)?;
+        if len > MAX_FRM_LEN {
+            // Bail out before creating a frame that the decoder will refuse to
+            // deserialize
+            return Err(CrucibleError::IoError(format!(
+                "frame is {} bytes, more than maximum {}",
+                len, MAX_FRM_LEN
+            )));
+        }
+
+        let mut wrapper = AsyncMessageWrapper(self);
+        wrapper.write_all(&len.to_le_bytes())?;
+        bincode::serialize_into(wrapper, &m).map_err(|e| {
+            CrucibleError::IoError(format!("serialization failed: {e:?}"))
+        })?;
+        if !self.buf.is_empty() {
+            self.writer.write_all(&self.buf).await?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+struct AsyncMessageWrapper<'a, W>(&'a mut AsyncMessageWorker<W>);
+impl<W> std::io::Write for AsyncMessageWrapper<'_, W>
+where
+    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
+{
+    // Required methods
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Write large buffers directly, without copying them
+        if buf.len() > 4096 {
+            self.flush()?;
+            self.0.handle.block_on(self.0.writer.write_all(buf))?;
+        } else {
+            self.0.buf.extend(buf);
+            if self.0.buf.len() > 4096 {
+                self.flush()?;
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.0.buf.is_empty() {
+            self.0
+                .handle
+                .block_on(self.0.writer.write_all(&self.0.buf))?;
+            self.0.buf.clear();
+        }
+        Ok(())
     }
 }
 

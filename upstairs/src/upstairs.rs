@@ -1470,7 +1470,7 @@ impl Upstairs {
                 self.downstairs.submit_write(
                     gw_id,
                     write.impacted_blocks,
-                    write.data,
+                    write.writes,
                     write.is_write_unwritten,
                 )
             },

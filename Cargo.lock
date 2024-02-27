@@ -1093,10 +1093,12 @@ dependencies = [
  "bytes",
  "crucible-common",
  "crucible-workspace-hack",
+ "futures",
  "num_enum",
  "schemars",
  "serde",
  "strum_macros 0.25.3",
+ "tokio",
  "tokio-util",
  "uuid",
 ]
