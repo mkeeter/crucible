@@ -955,7 +955,6 @@ pub struct AsyncMessageWorker<W> {
     rx: mpsc::Receiver<AsyncMessageRequest>,
     writer: W,
     buf: Vec<u8>,
-    handle: tokio::runtime::Handle,
 }
 
 impl<W> AsyncMessageWorker<W>
@@ -967,7 +966,6 @@ where
             rx,
             writer,
             buf: vec![],
-            handle: tokio::runtime::Handle::current(),
         }
     }
 }
@@ -997,19 +995,14 @@ impl AsyncMessageWriter {
     /// avoiding large `memcpy` calls.  Because `bincode` is synchronous, this
     /// is implemented using `tokio::runtime::Handle::block_on`.
     pub async fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
-        println!("SENDING {m:?}");
         let (tx, rx) = oneshot::channel();
         if let Err(e) = self.tx.send(AsyncMessageRequest(m, tx)).await {
             return Err(CrucibleError::IoError(format!(
                 "IO worker died: {e:?}"
             )));
         }
-        println!("SENT MESSAGE, AWAITING RESULT");
         match rx.await {
-            Ok(v) => {
-                println!("GOT RESULT OK");
-                v
-            }
+            Ok(v) => v,
             Err(e) => {
                 Err(CrucibleError::IoError(format!("IO worker died: {e:?}")))
             }
@@ -1023,7 +1016,6 @@ where
 {
     async fn run(&mut self) {
         while let Some(s) = self.rx.recv().await {
-            println!("WORKER IS SENDING {:?}", s.0);
             let r = self.send(s.0).await;
             let _ = s.1.send(r);
         }
@@ -1042,7 +1034,7 @@ where
         }
 
         let mut wrapper = AsyncMessageWrapper(self);
-        wrapper.write_all(&len.to_le_bytes())?;
+        wrapper.write_all(&(len as u32).to_le_bytes())?;
         bincode::serialize_into(wrapper, &m).map_err(|e| {
             CrucibleError::IoError(format!("serialization failed: {e:?}"))
         })?;
@@ -1064,7 +1056,7 @@ where
         // Write large buffers directly, without copying them
         if buf.len() > 4096 {
             self.flush()?;
-            self.0.handle.block_on(self.0.writer.write_all(buf))?;
+            futures::executor::block_on(self.0.writer.write_all(buf))?;
         } else {
             self.0.buf.extend(buf);
             if self.0.buf.len() > 4096 {
@@ -1075,9 +1067,7 @@ where
     }
     fn flush(&mut self) -> std::io::Result<()> {
         if !self.0.buf.is_empty() {
-            self.0
-                .handle
-                .block_on(self.0.writer.write_all(&self.0.buf))?;
+            futures::executor::block_on(self.0.writer.write_all(&self.0.buf))?;
             self.0.buf.clear();
         }
         Ok(())
