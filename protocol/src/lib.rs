@@ -951,25 +951,6 @@ pub struct AsyncMessageWriter {
 type AsyncMessageReply = oneshot::Sender<Result<(), CrucibleError>>;
 struct AsyncMessageRequest(Message, AsyncMessageReply);
 
-pub struct AsyncMessageWorker<W> {
-    rx: mpsc::Receiver<AsyncMessageRequest>,
-    writer: W,
-    buf: Vec<u8>,
-}
-
-impl<W> AsyncMessageWorker<W>
-where
-    W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
-{
-    fn new(writer: W, rx: mpsc::Receiver<AsyncMessageRequest>) -> Self {
-        Self {
-            rx,
-            writer,
-            buf: vec![],
-        }
-    }
-}
-
 impl AsyncMessageWriter {
     /// Builds a new `AsyncMessageWriter`
     ///
@@ -984,9 +965,9 @@ impl AsyncMessageWriter {
             + 'static,
     {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut worker = AsyncMessageWorker::new(writer, rx);
         let h = tokio::runtime::Handle::current();
-        let _worker = std::thread::spawn(move || worker.run(h));
+        let mut worker = AsyncMessageWorker::new(writer, rx, h);
+        let _worker = std::thread::spawn(move || worker.run());
         Self { tx }
     }
 
@@ -1011,27 +992,47 @@ impl AsyncMessageWriter {
     }
 }
 
+pub struct AsyncMessageWorker<W> {
+    rx: mpsc::Receiver<AsyncMessageRequest>,
+    writer: W,
+    buf: Vec<u8>,
+    handle: tokio::runtime::Handle,
+}
+
 impl<W> AsyncMessageWorker<W>
 where
     W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
 {
-    fn run(&mut self, h: tokio::runtime::Handle) {
-        loop {
-            let s = h.block_on(self.rx.recv());
-            if let Some(s) = s {
-                let r = self.send(s.0, &h);
-                let _ = s.1.send(r);
-            } else {
-                break;
-            }
+    fn new(
+        writer: W,
+        rx: mpsc::Receiver<AsyncMessageRequest>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            rx,
+            writer,
+            buf: vec![],
+            handle,
         }
     }
 
-    fn send(
-        &mut self,
-        m: Message,
-        h: &tokio::runtime::Handle,
-    ) -> Result<(), CrucibleError> {
+    fn run(&mut self) {
+        while let Some(s) = self.handle.block_on(self.rx.recv()) {
+            let r = self.send(s.0);
+            let _ = s.1.send(r);
+        }
+    }
+
+    fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
+        self.serialize(m)?;
+        if !self.buf.is_empty() {
+            self.handle.block_on(self.writer.write_all(&self.buf))?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    fn serialize(&mut self, m: Message) -> Result<(), CrucibleError> {
         use std::io::Write;
         let len = CrucibleEncoder::serialized_size(&m)?;
         if len > MAX_FRM_LEN {
@@ -1042,25 +1043,15 @@ where
                 len, MAX_FRM_LEN
             )));
         }
+        self.write_all(&(len as u32).to_le_bytes())?;
 
-        let mut wrapper = AsyncMessageWrapper(self, h);
-        wrapper.write_all(&(len as u32).to_le_bytes())?;
-        bincode::serialize_into(wrapper, &m).map_err(|e| {
+        bincode::serialize_into(self, &m).map_err(|e| {
             CrucibleError::IoError(format!("serialization failed: {e:?}"))
-        })?;
-        if !self.buf.is_empty() {
-            h.block_on(self.writer.write_all(&self.buf))?;
-            self.buf.clear();
-        }
-        Ok(())
+        })
     }
 }
 
-struct AsyncMessageWrapper<'a, W>(
-    &'a mut AsyncMessageWorker<W>,
-    &'a tokio::runtime::Handle,
-);
-impl<W> std::io::Write for AsyncMessageWrapper<'_, W>
+impl<W> std::io::Write for AsyncMessageWorker<W>
 where
     W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
 {
@@ -1069,19 +1060,19 @@ where
         // Write large buffers directly, without copying them
         if buf.len() > 4096 {
             self.flush()?;
-            self.1.block_on(self.0.writer.write_all(buf))?;
+            self.handle.block_on(self.writer.write_all(buf))?;
         } else {
-            self.0.buf.extend(buf);
-            if self.0.buf.len() > 4096 {
+            self.buf.extend(buf);
+            if self.buf.len() > 4096 {
                 self.flush()?;
             }
         }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.0.buf.is_empty() {
-            self.1.block_on(self.0.writer.write_all(&self.0.buf))?;
-            self.0.buf.clear();
+        if !self.buf.is_empty() {
+            self.handle.block_on(self.writer.write_all(&self.buf))?;
+            self.buf.clear();
         }
         Ok(())
     }
