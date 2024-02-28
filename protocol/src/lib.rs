@@ -940,10 +940,7 @@ impl Decoder for CrucibleDecoder {
     }
 }
 
-/// Writer to synchronously send a `Message` to an `AsyncWrite` sink
-///
-/// This allows us to call `bincode::serialize` directly into a socket, without
-/// an intermediate serialization step.
+/// Writer to send efficiently messages into an `AsyncWrite` sink
 pub struct AsyncMessageWriter {
     tx: mpsc::Sender<AsyncMessageRequest>,
 }
@@ -972,10 +969,6 @@ impl AsyncMessageWriter {
     }
 
     /// Sends a single encoded message
-    ///
-    /// Under the hood, this serializes directly into the `AsyncWriter`,
-    /// avoiding large `memcpy` calls.  Because `bincode` is synchronous, this
-    /// is implemented using `tokio::runtime::Handle::block_on`.
     pub async fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
         let (tx, rx) = oneshot::channel();
         if let Err(e) = self.tx.send(AsyncMessageRequest(m, tx)).await {
@@ -992,6 +985,11 @@ impl AsyncMessageWriter {
     }
 }
 
+/// Worker which handles the async-sync boundary between Tokio and `bincode`
+///
+/// This worker should run in an independent thread; importantly, it should
+/// **not** run in an async context.  It will enter an async context as needed
+/// using the `tokio::runtime::Handle`.
 struct AsyncMessageWorker<W> {
     rx: mpsc::Receiver<AsyncMessageRequest>,
     writer: W,
@@ -1026,15 +1024,6 @@ where
     }
 
     fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
-        self.serialize(m)?;
-        if !self.buf.is_empty() {
-            self.handle.block_on(self.writer.write_all(&self.buf))?;
-            self.buf.clear();
-        }
-        Ok(())
-    }
-
-    fn serialize(&mut self, m: Message) -> Result<(), CrucibleError> {
         use std::io::Write;
         let len = CrucibleEncoder::serialized_size(&m)?;
         if len > MAX_FRM_LEN {
@@ -1046,10 +1035,14 @@ where
             )));
         }
         self.write_all(&(len as u32).to_le_bytes())?;
-
-        bincode::serialize_into(self, &m).map_err(|e| {
+        bincode::serialize_into(&mut *self, &m).map_err(|e| {
             CrucibleError::IoError(format!("serialization failed: {e:?}"))
-        })
+        })?;
+        if !self.buf.is_empty() {
+            self.handle.block_on(self.writer.write_all(&self.buf))?;
+            self.buf.clear();
+        }
+        Ok(())
     }
 }
 
