@@ -1017,9 +1017,11 @@ where
     }
 
     fn run(&mut self) {
-        while let Some(s) = self.handle.block_on(self.rx.recv()) {
-            let r = self.send(s.0);
-            let _ = s.1.send(r);
+        while let Some(AsyncMessageRequest(msg, reply)) =
+            self.handle.block_on(self.rx.recv())
+        {
+            let r = self.send(msg);
+            let _ = reply.send(r);
         }
     }
 
