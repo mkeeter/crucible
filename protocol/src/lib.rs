@@ -985,7 +985,8 @@ impl AsyncMessageWriter {
     {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut worker = AsyncMessageWorker::new(writer, rx);
-        let _worker = tokio::task::spawn(async move { worker.run().await });
+        let h = tokio::runtime::Handle::current();
+        let _worker = std::thread::spawn(move || worker.run(h));
         Self { tx }
     }
 
@@ -1014,14 +1015,23 @@ impl<W> AsyncMessageWorker<W>
 where
     W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
 {
-    async fn run(&mut self) {
-        while let Some(s) = self.rx.recv().await {
-            let r = self.send(s.0).await;
-            let _ = s.1.send(r);
+    fn run(&mut self, h: tokio::runtime::Handle) {
+        loop {
+            let s = h.block_on(self.rx.recv());
+            if let Some(s) = s {
+                let r = self.send(s.0, &h);
+                let _ = s.1.send(r);
+            } else {
+                break;
+            }
         }
     }
 
-    async fn send(&mut self, m: Message) -> Result<(), CrucibleError> {
+    fn send(
+        &mut self,
+        m: Message,
+        h: &tokio::runtime::Handle,
+    ) -> Result<(), CrucibleError> {
         use std::io::Write;
         let len = CrucibleEncoder::serialized_size(&m)?;
         if len > MAX_FRM_LEN {
@@ -1033,20 +1043,23 @@ where
             )));
         }
 
-        let mut wrapper = AsyncMessageWrapper(self);
+        let mut wrapper = AsyncMessageWrapper(self, h);
         wrapper.write_all(&(len as u32).to_le_bytes())?;
         bincode::serialize_into(wrapper, &m).map_err(|e| {
             CrucibleError::IoError(format!("serialization failed: {e:?}"))
         })?;
         if !self.buf.is_empty() {
-            self.writer.write_all(&self.buf).await?;
+            h.block_on(self.writer.write_all(&self.buf))?;
             self.buf.clear();
         }
         Ok(())
     }
 }
 
-struct AsyncMessageWrapper<'a, W>(&'a mut AsyncMessageWorker<W>);
+struct AsyncMessageWrapper<'a, W>(
+    &'a mut AsyncMessageWorker<W>,
+    &'a tokio::runtime::Handle,
+);
 impl<W> std::io::Write for AsyncMessageWrapper<'_, W>
 where
     W: tokio::io::AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
@@ -1056,7 +1069,7 @@ where
         // Write large buffers directly, without copying them
         if buf.len() > 4096 {
             self.flush()?;
-            futures::executor::block_on(self.0.writer.write_all(buf))?;
+            self.1.block_on(self.0.writer.write_all(buf))?;
         } else {
             self.0.buf.extend(buf);
             if self.0.buf.len() > 4096 {
@@ -1067,7 +1080,7 @@ where
     }
     fn flush(&mut self) -> std::io::Result<()> {
         if !self.0.buf.is_empty() {
-            futures::executor::block_on(self.0.writer.write_all(&self.0.buf))?;
+            self.1.block_on(self.0.writer.write_all(&self.0.buf))?;
             self.0.buf.clear();
         }
         Ok(())
