@@ -19,7 +19,7 @@ use crucible_common::{
     MAX_ACTIVE_COUNT, MAX_BLOCK_SIZE,
 };
 use crucible_protocol::{
-    BlockContext, CrucibleDecoder, CrucibleEncoder, JobId, Message,
+    AsyncMessageWriter, BlockContext, CrucibleDecoder, JobId, Message,
     ReadRequest, ReadResponse, ReconciliationId, SnapshotDetails,
     CRUCIBLE_MESSAGE_VERSION,
 };
@@ -27,13 +27,13 @@ use repair_client::Client;
 
 use anyhow::{bail, Result};
 use bytes::BytesMut;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use rand::prelude::*;
 use slog::{debug, error, info, o, warn, Logger};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::FramedRead;
 use uuid::Uuid;
 
 pub mod admin;
@@ -602,7 +602,7 @@ async fn proc_stream(
             let (read, write) = sock.into_split();
 
             let fr = FramedRead::new(read, CrucibleDecoder::new());
-            let fw = FramedWrite::new(write, CrucibleEncoder::new());
+            let fw = AsyncMessageWriter::new(write);
 
             proc(ads, fr, fw).await
         }
@@ -610,7 +610,7 @@ async fn proc_stream(
             let (read, write) = tokio::io::split(stream);
 
             let fr = FramedRead::new(read, CrucibleDecoder::new());
-            let fw = FramedWrite::new(write, CrucibleEncoder::new());
+            let fw = AsyncMessageWriter::new(write);
 
             proc(ads, fr, fw).await
         }
@@ -631,17 +631,13 @@ pub struct UpstairsConnection {
  * the next function if everything was successful and we can start
  * taking IOs from the upstairs.
  */
-async fn proc<RT, WT>(
+async fn proc<RT>(
     ads: &Arc<Mutex<Downstairs>>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
-    mut fw: FramedWrite<WT, CrucibleEncoder>,
+    mut fw: AsyncMessageWriter,
 ) -> Result<()>
 where
     RT: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send,
-    WT: tokio::io::AsyncWrite
-        + std::marker::Unpin
-        + std::marker::Send
-        + 'static,
 {
     // In this function, repair address should exist, and shouldn't change. Grab
     // it here.
@@ -1080,16 +1076,10 @@ where
         .await
 }
 
-async fn reply_task<WT>(
+async fn reply_task(
     mut resp_channel_rx: mpsc::Receiver<Message>,
-    mut fw: FramedWrite<WT, CrucibleEncoder>,
-) -> Result<()>
-where
-    WT: tokio::io::AsyncWrite
-        + std::marker::Unpin
-        + std::marker::Send
-        + 'static,
-{
+    mut fw: AsyncMessageWriter,
+) -> Result<()> {
     while let Some(m) = resp_channel_rx.recv().await {
         fw.send(m).await?;
     }
@@ -1101,19 +1091,15 @@ where
  * We assume here that correct negotiation has taken place and this
  * downstairs is ready to receive IO.
  */
-async fn resp_loop<RT, WT>(
+async fn resp_loop<RT>(
     ads: &Arc<Mutex<Downstairs>>,
     mut fr: FramedRead<RT, CrucibleDecoder>,
-    fw: FramedWrite<WT, CrucibleEncoder>,
+    fw: AsyncMessageWriter,
     mut another_upstairs_active_rx: oneshot::Receiver<UpstairsConnection>,
     upstairs_connection: UpstairsConnection,
 ) -> Result<()>
 where
     RT: tokio::io::AsyncRead + std::marker::Unpin + std::marker::Send,
-    WT: tokio::io::AsyncWrite
-        + std::marker::Unpin
-        + std::marker::Send
-        + 'static,
 {
     let mut lossy_interval = deadline_secs(5);
     // Create the log for this task to use.
@@ -1131,7 +1117,7 @@ where
      * Create tasks for:
      *  Doing the work then sending the ACK
      *  Pulling work off the socket and putting on the work queue.
-     *  Sending messages back on the FramedWrite
+     *  Sending messages back on the AsyncMessageWriter
      *
      * These tasks and this function must be able to handle the
      * Upstairs connection going away at any time, as well as a forced
@@ -1145,9 +1131,9 @@ where
      *
      * Tasks are organized as follows, with tasks in `snake_case`
      *
-     *   ┌──────────┐              ┌───────────┐
-     *   │FramedRead│              │FramedWrite│
-     *   └────┬─────┘              └─────▲─────┘
+     *   ┌──────────┐              ┌──────────────────┐
+     *   │FramedRead│              │AsyncMessageWriter│
+     *   └────┬─────┘              └─────▲────────────┘
      *        │                          │
      *        │         ┌────────────────┴────────────────────┐
      *        │         │         framed_write_task           │
@@ -6226,7 +6212,7 @@ mod test {
         let tcp = start_ds_and_connect(5555, 5556).await.unwrap();
         let (read, write) = tcp.into_split();
         let mut fr = FramedRead::new(read, CrucibleDecoder::new());
-        let mut fw = FramedWrite::new(write, CrucibleEncoder::new());
+        let mut fw = AsyncMessageWriter::new(write);
 
         // Our downstairs version is CRUCIBLE_MESSAGE_VERSION
         let m = Message::HereIAm {
@@ -6264,7 +6250,7 @@ mod test {
         let tcp = start_ds_and_connect(5557, 5558).await.unwrap();
         let (read, write) = tcp.into_split();
         let mut fr = FramedRead::new(read, CrucibleDecoder::new());
-        let mut fw = FramedWrite::new(write, CrucibleEncoder::new());
+        let mut fw = AsyncMessageWriter::new(write);
 
         // Our downstairs version is CRUCIBLE_MESSAGE_VERSION
         let m = Message::HereIAm {
@@ -6298,7 +6284,7 @@ mod test {
         let tcp = start_ds_and_connect(5579, 5560).await.unwrap();
         let (read, write) = tcp.into_split();
         let mut fr = FramedRead::new(read, CrucibleDecoder::new());
-        let mut fw = FramedWrite::new(write, CrucibleEncoder::new());
+        let mut fw = AsyncMessageWriter::new(write);
 
         // Our downstairs version is CRUCIBLE_MESSAGE_VERSION
         let m = Message::HereIAm {
@@ -6332,7 +6318,7 @@ mod test {
         let tcp = start_ds_and_connect(5561, 5562).await.unwrap();
         let (read, write) = tcp.into_split();
         let mut fr = FramedRead::new(read, CrucibleDecoder::new());
-        let mut fw = FramedWrite::new(write, CrucibleEncoder::new());
+        let mut fw = AsyncMessageWriter::new(write);
 
         // Our downstairs version is CRUCIBLE_MESSAGE_VERSION
         let m = Message::HereIAm {
@@ -6373,7 +6359,7 @@ mod test {
         let tcp = start_ds_and_connect(5563, 5564).await.unwrap();
         let (read, write) = tcp.into_split();
         let mut fr = FramedRead::new(read, CrucibleDecoder::new());
-        let mut fw = FramedWrite::new(write, CrucibleEncoder::new());
+        let mut fw = AsyncMessageWriter::new(write);
 
         // Our downstairs version is CRUCIBLE_MESSAGE_VERSION
         let m = Message::HereIAm {

@@ -992,7 +992,7 @@ impl AsyncMessageWriter {
     }
 }
 
-pub struct AsyncMessageWorker<W> {
+struct AsyncMessageWorker<W> {
     rx: mpsc::Receiver<AsyncMessageRequest>,
     writer: W,
     buf: Vec<u8>,
