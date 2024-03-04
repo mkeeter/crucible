@@ -34,12 +34,44 @@ pub(crate) trait ExtentInner: Send + Sync + Debug {
     fn flush_number(&self) -> Result<u64, CrucibleError>;
     fn dirty(&self) -> Result<bool, CrucibleError>;
 
-    fn flush(
+    /// Performs any metadata updates needed before a flush
+    fn pre_flush(
         &mut self,
         new_flush: u64,
         new_gen: u64,
         job_id: JobOrReconciliationId,
     ) -> Result<(), CrucibleError>;
+
+    /// Syncs all relevant data to persistant storage
+    fn flush_inner(
+        &mut self,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError>;
+
+    /// Performs any metadata updates after syncing data to persistent storage
+    fn post_flush(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError>;
+
+    /// Performs a full flush (pre/inner/post)
+    ///
+    /// This is only exposed for the sake of unit testing; normal code should
+    /// use the fine-grained functions and be forced to consider performance.
+    #[cfg(test)]
+    fn flush(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError> {
+        self.pre_flush(new_flush, new_gen, job_id)?;
+        self.flush_inner(job_id)?;
+        self.post_flush(new_flush, new_gen, job_id)?;
+        Ok(())
+    }
 
     fn read(
         &mut self,
@@ -556,6 +588,7 @@ impl Extent {
         Ok(())
     }
 
+    /// Flushes this extent if it is dirty
     #[instrument]
     pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
         &mut self,
@@ -582,7 +615,10 @@ impl Extent {
             crucible_bail!(ModifyingReadOnlyRegion);
         }
 
-        self.inner.flush(new_flush, new_gen, job_id)
+        self.inner.pre_flush(new_flush, new_gen, job_id)?;
+        self.inner.flush_inner(job_id)?;
+        self.inner.post_flush(new_flush, new_gen, job_id)?;
+        Ok(())
     }
 
     #[allow(clippy::unused_async)] // this will be async again in the future
