@@ -1149,7 +1149,6 @@ impl Region {
             return Err(CrucibleError::from(e));
         }
 
-        cdt::os__flush__done!(|| job_id.0);
 
         // After the bits have been committed to durable storage, execute any
         // post flush routine that needs to happen
@@ -1157,6 +1156,8 @@ impl Region {
             let extent = self.get_opened_extent_mut(eid);
             extent.post_flush(flush_number, gen_number, job_id)?;
         }
+
+        cdt::os__flush__done!(|| job_id.0);
         Ok(())
     }
 
