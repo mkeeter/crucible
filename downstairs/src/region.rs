@@ -1149,6 +1149,8 @@ impl Region {
             return Err(CrucibleError::from(e));
         }
 
+        cdt::os__flush__done!(|| job_id.0);
+
         // After the bits have been committed to durable storage, execute any
         // post flush routine that needs to happen
         for eid in flushed_extents {
