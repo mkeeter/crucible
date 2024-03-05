@@ -1142,7 +1142,19 @@ impl Region {
         const FIOFFS_MAGIC: u8 = b'f';
         const FIOFFS_TYPE_MODE: u8 = 66;
         nix::ioctl_none!(zfs_fioffs, FIOFFS_MAGIC, FIOFFS_TYPE_MODE);
-        let rc = unsafe { zfs_fioffs(file.as_raw_fd()) };
+
+        // Do the flush in a worker thread if possible, to avoid blocking the
+        // main tokio thread pool.
+        let f = || unsafe { zfs_fioffs(file.as_raw_fd()) };
+        let rc = if matches!(
+            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            tokio::task::block_in_place(f)
+        } else {
+            f()
+        };
+
         if let Err(e) = rc {
             let e: std::io::Error = e.into();
             return Err(CrucibleError::from(e));
