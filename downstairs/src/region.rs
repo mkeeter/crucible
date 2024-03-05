@@ -896,7 +896,7 @@ impl Region {
      */
     #[instrument]
     pub(crate) async fn region_flush_extent<
-        I: Into<JobOrReconciliationId> + Debug,
+        I: Into<JobOrReconciliationId> + Copy + Clone + Debug,
     >(
         &mut self,
         eid: usize,
@@ -959,60 +959,7 @@ impl Region {
             }
         };
 
-        // This is a bit sneaky: we want to perform each flush in a separate
-        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
-        // multiple times.  In addition, we can't use the tokio thread pool to
-        // spawn a task, because that requires a 'static lifetime, which we
-        // can't get from a borrowed Extent.
-        //
-        // We'll combine two tricks to work around the issue:
-        // - Do the work in the rayon thread pool instead of using tokio tasks
-        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
-        //   multiple at the same time.
-        let mut results = vec![Ok(()); dirty_extents.len()];
-        let log = self.log.clone();
-        let mut f = || {
-            let mut slice_start = 0;
-            let mut slice = self.extents.as_mut_slice();
-            let h = tokio::runtime::Handle::current();
-            rayon::scope(|s| {
-                for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
-                    let next = eid - slice_start;
-                    slice = &mut slice[next..];
-                    let (extent, rest) = slice.split_first_mut().unwrap();
-                    let ExtentState::Opened(extent) = extent else {
-                        panic!("can't flush closed extent");
-                    };
-                    slice = rest;
-                    slice_start += next + 1;
-                    let log = log.clone();
-                    s.spawn(|_| {
-                        h.block_on(async move {
-                            *r = extent
-                                .flush(flush_number, gen_number, job_id, &log)
-                                .await
-                        });
-                    });
-                }
-            })
-        };
-        if matches!(
-            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        ) {
-            tokio::task::block_in_place(f)
-        } else {
-            f()
-        }
-
-        cdt::os__flush__done!(|| job_id.0);
-
-        for result in results {
-            // If any extent flush failed, then return that as an error. Because
-            // the results were all collected above, each extent flush has
-            // completed at this point.
-            result?;
-        }
+        self.flush_extents(&dirty_extents, flush_number, gen_number, job_id)?;
 
         // Now everything has succeeded, we can remove these extents from the
         // flush candidates
@@ -1086,6 +1033,121 @@ impl Region {
             }
         } else if snapshot_details.is_some() {
             error!(self.log, "Snapshot request received on unsupported binary");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "omicron-build"))]
+    fn flush_extents(
+        &mut self,
+        dirty_extents: &BTreeSet<usize>,
+        flush_number: u64,
+        gen_number: u64,
+        job_id: JobId,
+    ) -> Result<()> {
+        // This is a bit sneaky: we want to perform each flush in a separate
+        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
+        // multiple times.  In addition, we can't use the tokio thread pool to
+        // spawn a task, because that requires a 'static lifetime, which we
+        // can't get from a borrowed Extent.
+        //
+        // We'll combine two tricks to work around the issue:
+        // - Do the work in the rayon thread pool instead of using tokio tasks
+        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
+        //   multiple at the same time.
+        let mut results = vec![Ok(()); dirty_extents.len()];
+        let log = self.log.clone();
+        let mut f = || {
+            let mut slice_start = 0;
+            let mut slice = self.extents.as_mut_slice();
+            let h = tokio::runtime::Handle::current();
+            rayon::scope(|s| {
+                for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
+                    let next = eid - slice_start;
+                    slice = &mut slice[next..];
+                    let (extent, rest) = slice.split_first_mut().unwrap();
+                    let ExtentState::Opened(extent) = extent else {
+                        panic!("can't flush closed extent");
+                    };
+                    slice = rest;
+                    slice_start += next + 1;
+                    let log = log.clone();
+                    s.spawn(|_| {
+                        h.block_on(async move {
+                            *r = extent
+                                .flush(flush_number, gen_number, job_id, &log)
+                                .await
+                        });
+                    });
+                }
+            })
+        };
+        if matches!(
+            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            tokio::task::block_in_place(f)
+        } else {
+            f()
+        }
+
+        cdt::os__flush__done!(|| job_id.0);
+
+        for result in results {
+            // If any extent flush failed, then return that as an error. Because
+            // the results were all collected above, each extent flush has
+            // completed at this point.
+            result?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "omicron-build")]
+    fn flush_extents(
+        &mut self,
+        dirty_extents: &BTreeSet<usize>,
+        flush_number: u64,
+        gen_number: u64,
+        job_id: JobId,
+    ) -> Result<(), CrucibleError> {
+        // Prepare to flush extents by writing metadata to files (if needed)
+        //
+        // Some extents may not _actually_ be dirty, so we'll skip them here
+        let mut flushed_extents = vec![];
+        let log = self.log.clone();
+        for eid in dirty_extents {
+            let extent = self.get_opened_extent_mut(*eid);
+            if extent.pre_flush(flush_number, gen_number, job_id, &log)? {
+                flushed_extents.push(*eid);
+            } else {
+                warn!(
+                    self.log,
+                    "extent {eid} was in dirty_extents but not actually dirty"
+                );
+            }
+        }
+
+        // If using `omicron-build`, then we're running on illumos and the
+        // region is backed by a ZFS dataset. Issue a _FIOFFS call, which
+        // will result in a `zfs_sync` to the entire region dataset.
+        use std::os::fd::AsRawFd;
+        // Open the region's mountpoint
+        let file = File::open(&self.dir)?;
+        // "file system flush", defined in illumos' sys/filio.h
+        const FIOFFS_MAGIC: u8 = b'f';
+        const FIOFFS_TYPE_MODE: u8 = 66;
+        nix::ioctl_none!(zfs_fioffs, FIOFFS_MAGIC, FIOFFS_TYPE_MODE);
+        let rc = unsafe { zfs_fioffs(file.as_raw_fd()) };
+        if let Err(e) = rc {
+            let e: std::io::Error = e.into();
+            return Err(CrucibleError::from(e));
+        }
+
+        // After the bits have been committed to durable storage, execute any
+        // post flush routine that needs to happen
+        for eid in flushed_extents {
+            let extent = self.get_opened_extent_mut(eid);
+            extent.post_flush(flush_number, gen_number, job_id)?;
         }
         Ok(())
     }

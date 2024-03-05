@@ -588,15 +588,17 @@ impl Extent {
         Ok(())
     }
 
-    /// Flushes this extent if it is dirty
-    #[instrument]
-    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
+    /// Prepares for a flush
+    ///
+    /// Returns `false` if we should skip the flush (because this extent is not
+    /// dirty), or `true` if we should proceed.
+    pub(crate) fn pre_flush<I: Into<JobOrReconciliationId> + Debug>(
         &mut self,
         new_flush: u64,
         new_gen: u64,
         id: I, // only used for logging
         log: &Logger,
-    ) -> Result<(), CrucibleError> {
+    ) -> Result<bool, CrucibleError> {
         let job_id: JobOrReconciliationId = id.into();
 
         if !self.inner.dirty()? {
@@ -604,7 +606,7 @@ impl Extent {
              * If we have made no writes to this extent since the last flush,
              * we do not need to update the extent on disk
              */
-            return Ok(());
+            return Ok(false);
         }
 
         // Read only extents should never have the dirty bit set. If they do,
@@ -616,8 +618,39 @@ impl Extent {
         }
 
         self.inner.pre_flush(new_flush, new_gen, job_id)?;
-        self.inner.flush_inner(job_id)?;
-        self.inner.post_flush(new_flush, new_gen, job_id)?;
+        Ok(true)
+    }
+
+    /// Prepares for a flush
+    ///
+    /// Returns `false` if we should skip the flush (because this extent is not
+    /// dirty), or `true` if we should proceed.
+    pub(crate) fn post_flush<I: Into<JobOrReconciliationId> + Debug>(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        id: I, // only used for logging
+    ) -> Result<(), CrucibleError> {
+        let job_id: JobOrReconciliationId = id.into();
+        self.inner.post_flush(new_flush, new_gen, job_id)
+    }
+
+    /// Flushes this extent if it is dirty
+    #[instrument]
+    pub(crate) async fn flush<
+        I: Into<JobOrReconciliationId> + Debug + Copy + Clone,
+    >(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        id: I, // only used for logging
+        log: &Logger,
+    ) -> Result<(), CrucibleError> {
+        if !self.pre_flush(new_flush, new_gen, id, log)? {
+            return Ok(());
+        }
+        self.inner.flush_inner(id.into())?;
+        self.post_flush(new_flush, new_gen, id)?;
         Ok(())
     }
 
