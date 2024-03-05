@@ -960,6 +960,7 @@ impl Region {
         };
 
         self.flush_extents(&dirty_extents, flush_number, gen_number, job_id)?;
+        cdt::os__flush__done!(|| job_id.0);
 
         // Now everything has succeeded, we can remove these extents from the
         // flush candidates
@@ -1091,8 +1092,6 @@ impl Region {
             f()
         }
 
-        cdt::os__flush__done!(|| job_id.0);
-
         for result in results {
             // If any extent flush failed, then return that as an error. Because
             // the results were all collected above, each extent flush has
@@ -1149,7 +1148,6 @@ impl Region {
             return Err(CrucibleError::from(e));
         }
 
-
         // After the bits have been committed to durable storage, execute any
         // post flush routine that needs to happen
         for eid in flushed_extents {
@@ -1157,7 +1155,6 @@ impl Region {
             extent.post_flush(flush_number, gen_number, job_id)?;
         }
 
-        cdt::os__flush__done!(|| job_id.0);
         Ok(())
     }
 
