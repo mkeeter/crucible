@@ -1102,6 +1102,11 @@ impl Region {
         Ok(())
     }
 
+    /// Flush extents using the FIOFFS ioctl
+    ///
+    /// If using `omicron-build`, then we're running on illumos and the
+    /// region is backed by a ZFS dataset. Issue a _FIOFFS call, which
+    /// will result in a `zfs_sync` to the entire region dataset.
     #[cfg(feature = "omicron-build")]
     fn flush_extents(
         &mut self,
@@ -1110,6 +1115,9 @@ impl Region {
         gen_number: u64,
         job_id: JobId,
     ) -> Result<(), CrucibleError> {
+        #[cfg(not(target_os = "illumos"))]
+        compile_error!("FIOFFS-based flush is only supported on illumos");
+
         // Prepare to flush extents by writing metadata to files (if needed)
         //
         // Some extents may not _actually_ be dirty, so we'll skip them here
@@ -1127,9 +1135,7 @@ impl Region {
             }
         }
 
-        // If using `omicron-build`, then we're running on illumos and the
-        // region is backed by a ZFS dataset. Issue a _FIOFFS call, which
-        // will result in a `zfs_sync` to the entire region dataset.
+        // Send the ioctl!
         use std::os::fd::AsRawFd;
         // Open the region's mountpoint
         let file = File::open(&self.dir)?;
