@@ -959,7 +959,8 @@ impl Region {
             }
         };
 
-        self.flush_extents(&dirty_extents, flush_number, gen_number, job_id)?;
+        self.flush_extents(&dirty_extents, flush_number, gen_number, job_id)
+            .await?;
         cdt::os__flush__done!(|| job_id.0);
 
         // Now everything has succeeded, we can remove these extents from the
@@ -1039,7 +1040,8 @@ impl Region {
     }
 
     #[cfg(not(feature = "omicron-build"))]
-    fn flush_extents(
+    #[allow(clippy::unused_async)]
+    async fn flush_extents(
         &mut self,
         dirty_extents: &BTreeSet<usize>,
         flush_number: u64,
@@ -1107,7 +1109,7 @@ impl Region {
     /// region is backed by a ZFS dataset. Issue a _FIOFFS call, which
     /// will result in a `zfs_sync` to the entire region dataset.
     #[cfg(feature = "omicron-build")]
-    fn flush_extents(
+    async fn flush_extents(
         &mut self,
         dirty_extents: &BTreeSet<usize>,
         flush_number: u64,
@@ -1137,7 +1139,7 @@ impl Region {
         // Send the ioctl!
         use std::os::fd::AsRawFd;
         // Open the region's mountpoint
-        let file = File::open(&self.dir)?;
+        let dir = self.dir.clone();
         // "file system flush", defined in illumos' sys/filio.h
         const FIOFFS_MAGIC: u8 = b'f';
         const FIOFFS_TYPE_MODE: u8 = 66;
@@ -1145,20 +1147,22 @@ impl Region {
 
         // Do the flush in a worker thread if possible, to avoid blocking the
         // main tokio thread pool.
-        let f = || unsafe { zfs_fioffs(file.as_raw_fd()) };
-        let rc = if matches!(
-            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        ) {
-            tokio::task::block_in_place(f)
-        } else {
-            f()
-        };
-
-        if let Err(e) = rc {
-            let e: std::io::Error = e.into();
-            return Err(CrucibleError::from(e));
-        }
+        let handle = tokio::task::spawn_blocking(
+            move || -> Result<(), CrucibleError> {
+                let file = File::open(&dir)?;
+                let rc = unsafe {
+                     zfs_fioffs(file.as_raw_fd())
+                };
+                if let Err(e) = rc {
+                    let e: std::io::Error = e.into();
+                    Err(CrucibleError::from(e))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        // Wait for the async work to finish
+        handle.await.expect("could not join spawned task")?;
 
         // After the bits have been committed to durable storage, execute any
         // post flush routine that needs to happen
