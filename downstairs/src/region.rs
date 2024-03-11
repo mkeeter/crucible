@@ -1150,9 +1150,7 @@ impl Region {
         let handle = tokio::task::spawn_blocking(
             move || -> Result<(), CrucibleError> {
                 let file = File::open(&dir)?;
-                let rc = unsafe {
-                     zfs_fioffs(file.as_raw_fd())
-                };
+                let rc = unsafe { zfs_fioffs(file.as_raw_fd()) };
                 if let Err(e) = rc {
                     let e: std::io::Error = e.into();
                     Err(CrucibleError::from(e))
