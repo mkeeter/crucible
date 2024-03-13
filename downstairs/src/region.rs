@@ -1106,8 +1106,23 @@ impl Region {
     /// Flush extents using the FIOFFS ioctl
     ///
     /// If using `omicron-build`, then we're running on illumos and the
-    /// region is backed by a ZFS dataset. Issue a _FIOFFS call, which
+    /// region is backed by a ZFS dataset. Issue a `_FIOFFS` call, which
     /// will result in a `zfs_sync` to the entire region dataset.
+    ///
+    /// The codepath is roughly as follows
+    /// - The IOCTL is received by `zfs_ioctl` through `zfs_dvnodeops_template`
+    /// - `zfs_ioctl` calls `zfs_sync(vp->v_vfsp, 0, cred)`
+    /// - `zfs_sync` calls `zil_commit(zfsvfs->z_log, 0)` if `zfsvfs->z_log` is
+    ///   present; it should always be present, because it's only set to `NULL`
+    ///   during `zfsvfs_teardown`.
+    ///
+    /// Quoth the `zil_commit` docstring:
+    ///
+    /// > If "foid" is zero, this means all "synchronous" and "asynchronous"
+    /// > txs, for all objects in the dataset, will be committed to stable
+    /// > storage prior to zil_commit() returning.
+    ///
+    /// The extents all live within the same dataset, so this is what we want!
     #[cfg(feature = "omicron-build")]
     async fn flush_extents(
         &mut self,
