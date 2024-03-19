@@ -815,10 +815,6 @@ impl Region {
         if single_extent {
             batched_writes.insert(first_eid as usize, write);
         } else {
-            // Empty writes are trivially true
-            let Some(bs) = write.block_size() else {
-                return Ok(());
-            };
             // Group writes by eid and accumulate them into batched_writes
             for (eid, group) in write
                 .blocks
@@ -829,13 +825,9 @@ impl Region {
             {
                 let mut group = group.peekable();
                 let start = group.peek().unwrap().0;
-                let n = group.count();
-                let blocks = write.blocks[start..][..n].to_vec();
-                let data = write.data.slice((start * bs)..((start + n) * bs));
-                batched_writes.insert(
-                    eid as usize,
-                    crucible_protocol::Write { blocks, data },
-                );
+                let end = group.last().unwrap().0 + 1;
+                let sub_write = write.slice(start..end);
+                batched_writes.insert(eid as usize, sub_write);
             }
         }
 
@@ -1196,6 +1188,59 @@ pub async fn save_stream_to_file(
     if let Err(e) = file.sync_all() {
         crucible_bail!(IoError, "repair {:?}: fsync failure: {:?}", file, e);
     }
+    Ok(())
+}
+
+pub fn write_to_file(
+    write: &crucible_protocol::Write,
+    blocks_to_skip: &HashSet<u64>,
+    block_size: usize,
+    fd: std::os::fd::BorrowedFd,
+) -> Result<(), CrucibleError> {
+    let mut start = 0;
+    let mut skip_next = blocks_to_skip.contains(&write.blocks[0].offset.value);
+    for (i, b) in write.blocks.iter().enumerate() {
+        let skip_me = skip_next;
+        skip_next = write
+            .blocks
+            .get(i + 1)
+            .map(|b| blocks_to_skip.contains(&b.offset.value))
+            .unwrap_or(false);
+        if skip_me {
+            start = i + 1;
+            continue;
+        }
+
+        // If this is the end of a contiguous run, or the next block is
+        // skipped, or we're at the end of the write data, then write the
+        // run to disk and update our new starting position.
+        if skip_next
+            || i == write.blocks.len() - 1
+            || write.blocks[i + 1].offset.value != b.offset.value + 1
+        {
+            // Calculate our write
+            let num_blocks = i - start + 1;
+            let expected_bytes = num_blocks * block_size;
+            let offset = write.blocks[start].offset.value as usize;
+
+            // Perform the write with a single syscall
+            let n_written = nix::sys::uio::pwrite(
+                fd,
+                &write.data[start * block_size..][..expected_bytes],
+                (offset * block_size) as i64,
+            )
+            .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+
+            if n_written != expected_bytes {
+                return Err(CrucibleError::IoError(format!(
+                    "pwrite incomplete \
+                     (expected {expected_bytes}, got {n_written} bytes)",
+                )));
+            }
+            start = i + 1;
+        }
+    }
+
     Ok(())
 }
 
@@ -3034,7 +3079,7 @@ pub(crate) mod test {
             let offset: Block =
                 Block::new_512((i as u64) % ddef.extent_size().value);
 
-            let data = &buffer[(i * 512)..((i + 1) * 512)];
+            let data = &buffer[(i * 512)..][..512];
             let hash = integrity_hash(&[data]);
 
             blocks.push(crucible_protocol::WriteBlockMetadata {
@@ -3057,9 +3102,7 @@ pub(crate) mod test {
         // should still have the data from the first write.  Update our buffer
         // for the first block to have that original data.
         let mut buffer = BytesMut::from(&buffer[..]);
-        for a_buf in buffer.iter_mut().take(512) {
-            *a_buf = 9;
-        }
+        buffer[..512].fill(9);
 
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
@@ -3073,7 +3116,7 @@ pub(crate) mod test {
             read_from_files.extend(&data[..extent_data_size]);
         }
 
-        assert_eq!(buffer, read_from_files);
+        assert_eq!(&buffer[..], read_from_files);
 
         // read all using region_read
         let mut requests: Vec<crucible_protocol::ReadRequest> =

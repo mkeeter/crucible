@@ -564,7 +564,13 @@ impl SqliteMoreInner {
         });
 
         // Do the actual file writing
-        self.write_inner(write, &writes_to_skip)?;
+        let block_size = self.extent_size.block_size_in_bytes() as usize;
+        crate::region::write_to_file(
+            write,
+            &writes_to_skip,
+            block_size,
+            self.file.as_fd(),
+        )?;
 
         cdt::extent__write__file__done!(|| {
             (job_id.0, self.extent_number, write.blocks.len() as u64)
@@ -679,58 +685,6 @@ impl SqliteMoreInner {
         }
 
         Ok(results)
-    }
-
-    fn write_inner(
-        &self,
-        write: &crucible_protocol::Write,
-        writes_to_skip: &HashSet<u64>,
-    ) -> Result<(), CrucibleError> {
-        let mut start = 0;
-        let mut skip_next = false;
-        let block_size = self.extent_size.block_size_in_bytes() as usize;
-        for (i, b) in write.blocks.iter().enumerate() {
-            let skip_me = skip_next;
-            skip_next = write
-                .blocks
-                .get(i + 1)
-                .map(|b| writes_to_skip.contains(&b.offset.value))
-                .unwrap_or(false);
-            if skip_me {
-                continue;
-            }
-
-            // If this is the end of a contiguous run, or the next block is
-            // skipped, or we're at the end of the write data, then write the
-            // run to disk and update our new starting position.
-            if skip_next
-                || i == write.blocks.len() - 1
-                || write.blocks[i + 1].offset.value != b.offset.value + 1
-            {
-                // Calculate our write
-                let num_blocks = i - start + 1;
-                let expected_bytes = num_blocks * block_size;
-                let offset = write.blocks[start].offset.value as usize;
-
-                // Perform the write with a single syscall
-                let n_written = nix::sys::uio::pwrite(
-                    self.file.as_fd(),
-                    &write.data[start * block_size..][..expected_bytes],
-                    (offset * block_size) as i64,
-                )
-                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
-
-                if n_written != expected_bytes {
-                    return Err(CrucibleError::IoError(format!(
-                        "pwrite incomplete \
-                     (expected {expected_bytes}, got {n_written} bytes)",
-                    )));
-                }
-                start = i + 1;
-            }
-        }
-
-        Ok(())
     }
 
     // We should never create a new SQLite-backed extent in production code,
