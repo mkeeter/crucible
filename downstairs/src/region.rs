@@ -823,11 +823,17 @@ impl Region {
                 .group_by(|(_i, b)| b.eid)
                 .into_iter()
             {
+                // This is a set of **not necessarily contiguous** writes that
+                // go to the same extent, so we'll build a single Write object
+                // from them.  This borrows the bulk data but clones the
+                // per-block metadata, alas.
                 let mut group = group.peekable();
-                let first = group.peek().unwrap().0;
-                let last = group.last().unwrap().0;
-                let sub_write = write.slice(first..(last + 1));
-                batched_writes.insert(eid as usize, sub_write);
+                let first_index = group.peek().unwrap().0;
+                let last_index = group.last().unwrap().0;
+                batched_writes.insert(
+                    eid as usize,
+                    write.slice(first_index..(last_index + 1)),
+                );
             }
         }
 
