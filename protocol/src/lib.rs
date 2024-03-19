@@ -120,7 +120,7 @@ impl std::fmt::Display for ClientId {
 /// `data` should be a borrowed section of the received `Message::Write`, to
 /// reduce memory copies.
 #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Write {
     /// Per-block metadata
     pub blocks: Vec<WriteBlockMetadata>,
