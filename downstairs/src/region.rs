@@ -16,9 +16,12 @@ use crucible_protocol::SnapshotDetails;
 use repair_client::Client;
 
 use super::*;
-use crate::extent::{
-    copy_dir, extent_dir, extent_file_name, move_replacement_extent,
-    replace_dir, sync_path, Extent, ExtentMeta, ExtentState, ExtentType,
+use crate::{
+    extent::{
+        copy_dir, extent_dir, extent_file_name, move_replacement_extent,
+        replace_dir, sync_path, Extent, ExtentMeta, ExtentState, ExtentType,
+    },
+    io_task::{IoRequest, IoTask},
 };
 
 /**
@@ -89,6 +92,9 @@ pub struct Region {
     pub dir: PathBuf,
     def: RegionDefinition,
     pub extents: Vec<ExtentState>,
+
+    /// Handles to IO workers
+    workers: Vec<mpsc::Sender<IoRequest>>,
 
     /// Extents which are dirty and need to be flushed. Should be true if the
     /// dirty flag in the extent's metadata is set. When an extent is opened, if
@@ -235,6 +241,7 @@ impl Region {
             dir: dir.as_ref().to_path_buf(),
             def,
             extents: Vec::new(),
+            workers: IoTask::spawn_workers(&log),
             dirty_extents: HashSet::new(),
             read_only: false,
             log,
@@ -328,6 +335,7 @@ impl Region {
             dir: dir.as_ref().to_path_buf(),
             def,
             extents: Vec::new(),
+            workers: IoTask::spawn_workers(log),
             dirty_extents: HashSet::new(),
             read_only,
             log: log.clone(),
@@ -379,8 +387,18 @@ impl Region {
         let mut these_extents = Vec::with_capacity(eid_range.len());
 
         for eid in eid_range {
+            let worker =
+                self.workers[eid as usize % self.workers.len()].clone();
             let extent = if create {
-                Extent::create(&self.dir, &self.def, eid, self.backend)?
+                Extent::create(
+                    &self.dir,
+                    &self.def,
+                    eid,
+                    self.backend,
+                    worker,
+                    &self.log,
+                )
+                .await?
             } else {
                 let extent = Extent::open(
                     &self.dir,
@@ -388,8 +406,10 @@ impl Region {
                     eid,
                     self.read_only,
                     self.backend,
+                    worker,
                     &self.log,
-                )?;
+                )
+                .await?;
 
                 if extent.dirty().await {
                     self.dirty_extents.insert(eid as usize);
@@ -462,14 +482,17 @@ impl Region {
         assert!(matches!(mg, ExtentState::Closed));
         assert!(!self.read_only);
 
+        let worker = self.workers[eid % self.workers.len()].clone();
         let new_extent = Extent::open(
             &self.dir,
             &self.def,
             eid as u32,
             self.read_only,
             Backend::default(),
+            worker,
             &self.log,
-        )?;
+        )
+        .await?;
 
         if new_extent.dirty().await {
             self.dirty_extents.insert(eid);
@@ -935,50 +958,30 @@ impl Region {
             }
         };
 
-        // This is a bit sneaky: we want to perform each flush in a separate
-        // task for *parallelism*, but can't call `self.get_opened_extent_mut`
-        // multiple times.  In addition, we can't use the tokio thread pool to
-        // spawn a task, because that requires a 'static lifetime, which we
-        // can't get from a borrowed Extent.
-        //
-        // We'll combine two tricks to work around the issue:
-        // - Do the work in the rayon thread pool instead of using tokio tasks
-        // - Carefully walk self.extents.as_mut_slice() to mutably borrow
-        //   multiple at the same time.
-        let mut results = vec![Ok(()); dirty_extents.len()];
+        // Submit flushes to each extent worker
         let log = self.log.clone();
-        let mut f = || {
-            let mut slice_start = 0;
-            let mut slice = self.extents.as_mut_slice();
-            let h = tokio::runtime::Handle::current();
-            rayon::scope(|s| {
-                for (eid, r) in dirty_extents.iter().zip(results.iter_mut()) {
-                    let next = eid - slice_start;
-                    slice = &mut slice[next..];
-                    let (extent, rest) = slice.split_first_mut().unwrap();
-                    let ExtentState::Opened(extent) = extent else {
-                        panic!("can't flush closed extent");
-                    };
-                    slice = rest;
-                    slice_start += next + 1;
-                    let log = log.clone();
-                    s.spawn(|_| {
-                        h.block_on(async move {
-                            *r = extent
-                                .flush(flush_number, gen_number, job_id, &log)
-                                .await
-                        });
-                    });
-                }
-            })
-        };
-        if matches!(
-            tokio::runtime::Handle::try_current().map(|r| r.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        ) {
-            tokio::task::block_in_place(f)
-        } else {
-            f()
+        let mut fut = vec![];
+        for &eid in dirty_extents.iter() {
+            let extent = self.get_opened_extent_mut(eid);
+            fut.push(
+                extent
+                    .submit_flush(flush_number, gen_number, job_id, &log)
+                    .await,
+            );
+        }
+        // Await each extent worker's oneshot channel
+        let mut results = vec![];
+        for f in fut {
+            let r = match f {
+                Ok(c) => match c.await {
+                    Ok(c) => c,
+                    Err(e) => Err(CrucibleError::IoError(format!(
+                        "flush oneshot failed: {e:?}"
+                    ))),
+                },
+                Err(e) => Err(e),
+            };
+            results.push(r);
         }
 
         cdt::os__flush__done!(|| job_id.0);

@@ -40,6 +40,7 @@ pub mod admin;
 mod dump;
 mod dynamometer;
 mod extent;
+mod io_task;
 pub mod region;
 pub mod repair;
 mod stats;
