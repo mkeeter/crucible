@@ -824,9 +824,9 @@ impl Region {
                 .into_iter()
             {
                 let mut group = group.peekable();
-                let start = group.peek().unwrap().0;
-                let end = group.last().unwrap().0 + 1;
-                let sub_write = write.slice(start..end);
+                let first = group.peek().unwrap().0;
+                let last = group.last().unwrap().0;
+                let sub_write = write.slice(first..(last + 1));
                 batched_writes.insert(eid as usize, sub_write);
             }
         }
@@ -3221,9 +3221,7 @@ pub(crate) mod test {
         // should still have the data from the first write.  Update our buffer
         // for the first block to have that original data.
         let mut buffer = BytesMut::from(&buffer[..]);
-        for a_buf in buffer.iter_mut().take(1024).skip(512) {
-            *a_buf = 9;
-        }
+        buffer[512..][..512].fill(9);
 
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
@@ -3345,9 +3343,7 @@ pub(crate) mod test {
         // should still have the data from the first write.  Update our
         // expected buffer for the final block to have that original data.
         let mut buffer = BytesMut::from(&buffer[..]);
-        for a_buf in buffer.iter_mut().take(2048).skip(1536) {
-            *a_buf = 9;
-        }
+        buffer[1536..][..512].fill(9);
 
         // read all using region_read
         let mut requests: Vec<crucible_protocol::ReadRequest> =
@@ -3455,11 +3451,7 @@ pub(crate) mod test {
         // for these blocks to have that original data.
         let mut buffer = BytesMut::from(&buffer[..]);
         for b in blocks_to_write {
-            let b_start = b * 512;
-            let b_end = b_start + 512;
-            for a_buf in buffer.iter_mut().take(b_end).skip(b_start) {
-                *a_buf = 9;
-            }
+            buffer[b * 512..][..512].fill(9);
         }
 
         // read all using region_read
