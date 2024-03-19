@@ -3812,13 +3812,14 @@ pub(crate) mod test {
 
                         let blocks = range
                             .clone()
-                            .map(|idx| {
+                            .enumerate()
+                            .map(|(i, block)| {
                                 // Generate data for this block
-                                let data = &buffer[idx as usize * 512..][..512];
+                                let data = &buffer[i * 512..][..512];
                                 let hash = integrity_hash(&[data]);
                                 crucible_protocol::WriteBlockMetadata {
                                     eid: 0,
-                                    offset: Block::new_512(idx),
+                                    offset: Block::new_512(block),
                                     block_context: BlockContext {
                                         hash,
                                         encryption_context: None,
