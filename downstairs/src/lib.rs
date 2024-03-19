@@ -61,11 +61,11 @@ pub use stats::{DsCountStat, DsStatOuter};
 enum IOop {
     Write {
         dependencies: Vec<JobId>, // Jobs that must finish before this
-        writes: Vec<crucible_protocol::Write>,
+        write: crucible_protocol::Write,
     },
     WriteUnwritten {
         dependencies: Vec<JobId>, // Jobs that must finish before this
-        writes: Vec<crucible_protocol::Write>,
+        write: crucible_protocol::Write,
     },
     Read {
         dependencies: Vec<JobId>, // Jobs that must finish before this
@@ -245,7 +245,8 @@ pub async fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
 
     let mut offset = Block::new_with_ddef(0, &region.def());
     loop {
-        let mut buffer = vec![0; CHUNK_SIZE];
+        let mut buffer = BytesMut::with_capacity(CHUNK_SIZE);
+        buffer.resize(CHUNK_SIZE, 0u8);
 
         /*
          * Read data into the buffer until it is full, or we hit EOF.
@@ -292,20 +293,15 @@ pub async fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
          */
         let nblocks = Block::from_bytes(total, &rm);
         let mut pos = Block::from_bytes(0, &rm);
-        let mut writes = vec![];
+        let mut blocks = vec![];
         for (eid, offset) in
             extent_from_offset(&rm, offset, nblocks).blocks(&rm)
         {
             let len = Block::new_with_ddef(1, &region.def());
             let data = &buffer[pos.bytes()..(pos.bytes() + len.bytes())];
-            let mut buffer = BytesMut::with_capacity(data.len());
-            buffer.resize(data.len(), 0);
-            buffer.copy_from_slice(data);
-
-            writes.push(crucible_protocol::Write {
+            blocks.push(crucible_protocol::WriteBlockMetadata {
                 eid,
                 offset,
-                data: buffer.freeze(),
                 block_context: BlockContext {
                     hash: integrity_hash(&[data]),
                     encryption_context: None,
@@ -315,8 +311,13 @@ pub async fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
             pos.advance(len);
         }
 
+        let write = crucible_protocol::Write {
+            data: buffer.freeze(),
+            blocks,
+        };
+
         // We have no job ID, so it makes no sense for accounting.
-        region.region_write(&writes, JobId(0), false).await?;
+        region.region_write(write, JobId(0), false).await?;
 
         assert_eq!(nblocks, pos);
         assert_eq!(total, pos.bytes());
@@ -1645,7 +1646,7 @@ impl Downstairs {
         };
 
         assert_eq!(job.ds_id, job_id);
-        match &job.work {
+        match job.work {
             IOop::Read {
                 dependencies,
                 requests,
@@ -1661,7 +1662,7 @@ impl Downstairs {
                     error!(self.log, "Upstairs inactive error");
                     Err(CrucibleError::UpstairsInactive)
                 } else {
-                    self.region.region_read(requests, job_id).await
+                    self.region.region_read(&requests, job_id).await
                 };
                 debug!(
                     self.log,
@@ -1685,7 +1686,7 @@ impl Downstairs {
                     data,
                 }))
             }
-            IOop::WriteUnwritten { writes, .. } => {
+            IOop::WriteUnwritten { write, .. } => {
                 /*
                  * Any error from an IO should be intercepted here and passed
                  * back to the upstairs.
@@ -1699,7 +1700,7 @@ impl Downstairs {
                 } else {
                     // The region_write will handle what happens to each block
                     // based on if they have data or not.
-                    self.region.region_write(writes, job_id, true).await
+                    self.region.region_write(write, job_id, true).await
                 };
 
                 Ok(Some(Message::WriteUnwrittenAck {
@@ -1711,7 +1712,7 @@ impl Downstairs {
             }
             IOop::Write {
                 dependencies,
-                writes,
+                write,
             } => {
                 let result = if self.write_errors && random() && random() {
                     warn!(self.log, "returning error on write!");
@@ -1720,7 +1721,7 @@ impl Downstairs {
                     error!(self.log, "Upstairs inactive error");
                     Err(CrucibleError::UpstairsInactive)
                 } else {
-                    self.region.region_write(writes, job_id, false).await
+                    self.region.region_write(write, job_id, false).await
                 };
                 debug!(
                     self.log,
@@ -1753,11 +1754,11 @@ impl Downstairs {
                 } else {
                     self.region
                         .region_flush(
-                            *flush_number,
-                            *gen_number,
-                            snapshot_details,
+                            flush_number,
+                            gen_number,
+                            &snapshot_details,
                             job_id,
-                            *extent_limit,
+                            extent_limit,
                         )
                         .await
                 };
@@ -1783,7 +1784,7 @@ impl Downstairs {
                     error!(self.log, "Upstairs inactive error");
                     Err(CrucibleError::UpstairsInactive)
                 } else {
-                    self.region.close_extent(*extent).await
+                    self.region.close_extent(extent).await
                 };
                 debug!(
                     self.log,
@@ -1817,15 +1818,15 @@ impl Downstairs {
                     match self
                         .region
                         .region_flush_extent(
-                            *extent,
-                            *gen_number,
-                            *flush_number,
+                            extent,
+                            gen_number,
+                            flush_number,
                             job_id,
                         )
                         .await
                     {
                         Err(f_res) => Err(f_res),
-                        Ok(_) => self.region.close_extent(*extent).await,
+                        Ok(_) => self.region.close_extent(extent).await,
                     }
                 };
 
@@ -1863,7 +1864,7 @@ impl Downstairs {
                     Err(CrucibleError::UpstairsInactive)
                 } else {
                     self.region
-                        .repair_extent(*extent, *source_repair_address, false)
+                        .repair_extent(extent, source_repair_address, false)
                         .await
                 };
                 debug!(
@@ -1890,7 +1891,7 @@ impl Downstairs {
                     error!(self.log, "Upstairs inactive error");
                     Err(CrucibleError::UpstairsInactive)
                 } else {
-                    self.region.reopen_extent(*extent).await
+                    self.region.reopen_extent(extent).await
                 };
                 debug!(
                     self.log,
@@ -2401,11 +2402,13 @@ impl Downstairs {
         let r = match m {
             Message::Write { header, data } => {
                 cdt::submit__write__start!(|| header.job_id.0);
-                let writes = header.get_writes(data);
 
                 let new_write = IOop::Write {
                     dependencies: header.dependencies,
-                    writes,
+                    write: crucible_protocol::Write {
+                        data,
+                        blocks: header.blocks,
+                    },
                 };
 
                 let mut d = ad.lock().await;
@@ -2437,11 +2440,13 @@ impl Downstairs {
             }
             Message::WriteUnwritten { header, data } => {
                 cdt::submit__writeunwritten__start!(|| header.job_id.0);
-                let writes = header.get_writes(data);
 
                 let new_write = IOop::WriteUnwritten {
                     dependencies: header.dependencies,
-                    writes,
+                    write: crucible_protocol::Write {
+                        data,
+                        blocks: header.blocks,
+                    },
                 };
 
                 let mut d = ad.lock().await;
@@ -3429,6 +3434,7 @@ mod test {
         );
     }
 
+    #[cfg(test)]
     fn add_work_rf(
         work: &mut Work,
         upstairs_connection: UpstairsConnection,
@@ -3442,7 +3448,10 @@ mod test {
                 ds_id,
                 work: IOop::WriteUnwritten {
                     dependencies: deps,
-                    writes: Vec::with_capacity(1),
+                    write: crucible_protocol::Write {
+                        blocks: Vec::with_capacity(1),
+                        data: Default::default(),
+                    },
                 },
                 state: WorkState::New,
             },
@@ -3890,27 +3899,29 @@ mod test {
     // A test function that will return a generic crucible write command
     // for use when building the IOop::Write structure.  The data (of 9's)
     // matches the hash.
-    fn create_generic_test_write(eid: u64) -> Vec<crucible_protocol::Write> {
+    fn create_generic_test_write(eid: u64) -> crucible_protocol::Write {
         let data = BytesMut::from(&[9u8; 512][..]);
         let offset = Block::new_512(1);
 
-        vec![crucible_protocol::Write {
-            eid,
-            offset,
+        crucible_protocol::Write {
             data: data.freeze(),
-            block_context: BlockContext {
-                encryption_context: Some(
-                    crucible_protocol::EncryptionContext {
-                        nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-                        tag: [
-                            4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
-                            18, 19,
-                        ],
-                    },
-                ),
-                hash: 14137680576404864188, // Hash for all 9s
-            },
-        }]
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid,
+                offset,
+                block_context: BlockContext {
+                    encryption_context: Some(
+                        crucible_protocol::EncryptionContext {
+                            nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                            tag: [
+                                4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                                17, 18, 19,
+                            ],
+                        },
+                    ),
+                    hash: 14137680576404864188, // Hash for all 9s
+                },
+            }],
+        }
     }
 
     #[tokio::test]
@@ -3941,10 +3952,10 @@ mod test {
         let eid = 3;
 
         // Create and add the first write
-        let writes = create_generic_test_write(eid);
+        let write = create_generic_test_write(eid);
         let rio = IOop::Write {
             dependencies: Vec::new(),
-            writes,
+            write,
         };
         ds.add_work(upstairs_connection, JobId(1000), rio)?;
 
@@ -3959,11 +3970,11 @@ mod test {
         ds.add_work(upstairs_connection, JobId(1001), rio)?;
 
         // Add work for 2nd write 1002
-        let writes = create_generic_test_write(eid);
+        let write = create_generic_test_write(eid);
 
         let rio = IOop::Write {
             dependencies: vec![JobId(1000), JobId(1001)],
-            writes,
+            write,
         };
         ds.add_work(upstairs_connection, JobId(1002), rio)?;
 
@@ -4061,10 +4072,10 @@ mod test {
         let eid = 0;
 
         // Create the write
-        let writes = create_generic_test_write(eid);
+        let write = create_generic_test_write(eid);
         let rio = IOop::Write {
             dependencies: Vec::new(),
-            writes,
+            write,
         };
         ds.add_work(upstairs_connection, JobId(1000), rio)?;
 
@@ -4171,10 +4182,10 @@ mod test {
         let eid = 1;
 
         // Create the write
-        let writes = create_generic_test_write(eid);
+        let write = create_generic_test_write(eid);
         let rio = IOop::Write {
             dependencies: Vec::new(),
-            writes,
+            write,
         };
         ds.add_work(upstairs_connection, JobId(1000), rio)?;
 
@@ -4282,18 +4293,18 @@ mod test {
         let eid_two = 2;
 
         // Create the write for extent 1
-        let writes = create_generic_test_write(eid_one);
+        let write = create_generic_test_write(eid_one);
         let rio = IOop::Write {
             dependencies: Vec::new(),
-            writes,
+            write,
         };
         ds.add_work(upstairs_connection, JobId(1000), rio)?;
 
         // Create the write for extent 2
-        let writes = create_generic_test_write(eid_two);
+        let write = create_generic_test_write(eid_two);
         let rio = IOop::Write {
             dependencies: Vec::new(),
-            writes,
+            write,
         };
         ds.add_work(upstairs_connection, JobId(1001), rio)?;
 

@@ -3,7 +3,7 @@ use crate::{
     cdt, crucible_bail,
     extent::{check_input, extent_path, DownstairsBlockContext, ExtentInner},
     integrity_hash,
-    region::{BatchedPwritev, JobOrReconciliationId},
+    region::JobOrReconciliationId,
     Block, BlockContext, CrucibleError, JobId, RegionDefinition,
 };
 use crucible_protocol::{
@@ -55,16 +55,13 @@ impl ExtentInner for SqliteInner {
     fn write(
         &mut self,
         job_id: JobId,
-        writes: &[crucible_protocol::Write],
+        writes: &crucible_protocol::Write,
         only_write_unwritten: bool,
-        iov_max: usize,
     ) -> Result<(), CrucibleError> {
-        self.0.lock().unwrap().write(
-            job_id,
-            writes,
-            only_write_unwritten,
-            iov_max,
-        )
+        self.0
+            .lock()
+            .unwrap()
+            .write(job_id, writes, only_write_unwritten)
     }
 
     #[cfg(test)]
@@ -393,12 +390,11 @@ impl SqliteMoreInner {
     fn write(
         &mut self,
         job_id: JobId,
-        writes: &[crucible_protocol::Write],
+        write: &crucible_protocol::Write,
         only_write_unwritten: bool,
-        iov_max: usize,
     ) -> Result<(), CrucibleError> {
-        for write in writes {
-            check_input(self.extent_size, write.offset, &write.data)?;
+        for (block, data) in write.iter() {
+            check_input(self.extent_size, block.offset, data)?;
         }
 
         /*
@@ -449,18 +445,18 @@ impl SqliteMoreInner {
         let mut writes_to_skip = HashSet::new();
         if only_write_unwritten {
             cdt::extent__write__get__hashes__start!(|| {
-                (job_id.0, self.extent_number, writes.len() as u64)
+                (job_id.0, self.extent_number, write.blocks.len() as u64)
             });
             let mut write_run_start = 0;
-            while write_run_start < writes.len() {
-                let first_write = &writes[write_run_start];
+            while write_run_start < write.blocks.len() {
+                let first_write = &write.blocks[write_run_start];
 
                 // Starting from the first write in the potential run, we scan
                 // forward until we find a write with a block that isn't
                 // contiguous with the request before it. Since we're counting
                 // pairs, and the number of pairs is one less than the number of
                 // writes, we need to add 1 to get our actual run length.
-                let n_contiguous_writes = writes[write_run_start..]
+                let n_contiguous_writes = write.blocks[write_run_start..]
                     .windows(2)
                     .take_while(|wr_pair| {
                         wr_pair[0].offset.value + 1 == wr_pair[1].offset.value
@@ -486,10 +482,10 @@ impl SqliteMoreInner {
                 write_run_start += n_contiguous_writes;
             }
             cdt::extent__write__get__hashes__done!(|| {
-                (job_id.0, self.extent_number, writes.len() as u64)
+                (job_id.0, self.extent_number, write.blocks.len() as u64)
             });
 
-            if writes_to_skip.len() == writes.len() {
+            if writes_to_skip.len() == write.blocks.len() {
                 // Nothing to do
                 return Ok(());
             }
@@ -508,23 +504,23 @@ impl SqliteMoreInner {
         // TODO right now we're including the integrity_hash() time in the sqlite time. It's small in
         // comparison right now, but worth being aware of when looking at dtrace numbers
         cdt::extent__write__sqlite__insert__start!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
-        let mut hashes_to_write = Vec::with_capacity(writes.len());
-        for write in writes {
-            if writes_to_skip.contains(&write.offset.value) {
+        let mut hashes_to_write = Vec::with_capacity(write.blocks.len());
+        for (block, data) in write.iter() {
+            if writes_to_skip.contains(&block.offset.value) {
                 hashes_to_write.push(None);
                 continue;
             }
 
             // TODO it would be nice if we could profile what % of time we're
             // spending on hashes locally vs sqlite
-            let on_disk_hash = integrity_hash(&[&write.data[..]]);
+            let on_disk_hash = integrity_hash(&[data]);
 
             self.set_block_context(&DownstairsBlockContext {
-                block_context: write.block_context,
-                block: write.offset.value,
+                block_context: block.block_context,
+                block: block.offset.value,
                 on_disk_hash,
             })?;
 
@@ -537,13 +533,13 @@ impl SqliteMoreInner {
             // lets us easily test specific edge-cases of the database state.
             // Could make another function that wraps tx_set_block_context
             // and handles this as well.
-            self.dirty_blocks.insert(write.offset.value as usize, None);
+            self.dirty_blocks.insert(block.offset.value as usize, None);
             hashes_to_write.push(Some(on_disk_hash));
         }
         tx.commit()?;
 
         cdt::extent__write__sqlite__insert__done!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
         // PERFORMANCE TODO:
@@ -564,43 +560,21 @@ impl SqliteMoreInner {
         // introduces complexity. The time spent implementing that would
         // probably better be spent switching to aio or something like that.
         cdt::extent__write__file__start!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
-        // Now, batch writes into iovecs and use pwritev to write them all out.
-        let mut batched_pwritev = BatchedPwritev::new(
-            self.file.as_fd(),
-            writes.len(),
-            self.extent_size.block_size_in_bytes() as u64,
-            iov_max,
-        );
-
-        for write in writes {
-            let block = write.offset.value;
-
-            // TODO, can this be `only_write_unwritten &&
-            // write_to_skip.contains()`?
-            if writes_to_skip.contains(&block) {
-                debug_assert!(only_write_unwritten);
-                batched_pwritev.perform_writes()?;
-                continue;
-            }
-
-            batched_pwritev.add_write(write)?;
-        }
-
-        // Write any remaining data
-        batched_pwritev.perform_writes()?;
+        // Do the actual file writing
+        self.write_inner(write, &writes_to_skip)?;
 
         cdt::extent__write__file__done!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
         // At this point, we know that the written data for the target blocks
         // must match the integrity hashes calculated above (and stored to
         // SQLite).  We can therefore store pre-computed hash values for these
         // dirty blocks, allowing us to skip rehashing during a flush operation.
-        for (write, hash) in writes.iter().zip(&hashes_to_write) {
+        for (write, hash) in write.blocks.iter().zip(&hashes_to_write) {
             if let Some(h) = hash {
                 // This overwrites the `None` value written above!
                 let prev = self
@@ -705,6 +679,58 @@ impl SqliteMoreInner {
         }
 
         Ok(results)
+    }
+
+    fn write_inner(
+        &self,
+        write: &crucible_protocol::Write,
+        writes_to_skip: &HashSet<u64>,
+    ) -> Result<(), CrucibleError> {
+        let mut start = 0;
+        let mut skip_next = false;
+        let block_size = self.extent_size.block_size_in_bytes() as usize;
+        for (i, b) in write.blocks.iter().enumerate() {
+            let skip_me = skip_next;
+            skip_next = write
+                .blocks
+                .get(i + 1)
+                .map(|b| writes_to_skip.contains(&b.offset.value))
+                .unwrap_or(false);
+            if skip_me {
+                continue;
+            }
+
+            // If this is the end of a contiguous run, or the next block is
+            // skipped, or we're at the end of the write data, then write the
+            // run to disk and update our new starting position.
+            if skip_next
+                || i == write.blocks.len() - 1
+                || write.blocks[i + 1].offset.value != b.offset.value + 1
+            {
+                // Calculate our write
+                let num_blocks = i - start + 1;
+                let expected_bytes = num_blocks * block_size;
+                let offset = write.blocks[start].offset.value as usize;
+
+                // Perform the write with a single syscall
+                let n_written = nix::sys::uio::pwrite(
+                    self.file.as_fd(),
+                    &write.data[start * block_size..][..expected_bytes],
+                    (offset * block_size) as i64,
+                )
+                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+
+                if n_written != expected_bytes {
+                    return Err(CrucibleError::IoError(format!(
+                        "pwrite incomplete \
+                     (expected {expected_bytes}, got {n_written} bytes)",
+                    )));
+                }
+                start = i + 1;
+            }
+        }
+
+        Ok(())
     }
 
     // We should never create a new SQLite-backed extent in production code,
@@ -1230,8 +1256,6 @@ mod test {
     use rand::Rng;
     use tempfile::tempdir;
 
-    const IOV_MAX_TEST: usize = 1000;
-
     fn new_region_definition() -> RegionDefinition {
         let opt = crate::region::test::new_region_options();
         RegionDefinition::from_options(&opt).unwrap()
@@ -1629,15 +1653,17 @@ mod test {
         let data = Bytes::from(vec![0x55; 512]);
         let hash = integrity_hash(&[&data[..]]);
         let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
             data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid: 0,
+                offset: Block::new_512(0),
+                block_context: BlockContext {
+                    encryption_context: None,
+                    hash,
+                },
+            }],
         };
-        inner.write(JobId(10), &[write], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &write, false)?;
 
         // We haven't flushed, but this should leave our context in place.
         inner.fully_rehash_and_clean_all_stale_contexts(false)?;
@@ -1652,12 +1678,14 @@ mod test {
                 hash,
             };
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(0),
                 data: data.clone(),
-                block_context,
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(0),
+                    block_context,
+                }],
             };
-            inner.write(JobId(20), &[write], true, IOV_MAX_TEST)?;
+            inner.write(JobId(20), &write, true)?;
 
             let read = ReadRequest {
                 eid: 0,
@@ -1686,12 +1714,14 @@ mod test {
                 hash,
             };
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(1),
                 data: data.clone(),
-                block_context,
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(1),
+                    block_context,
+                }],
             };
-            inner.write(JobId(30), &[write], true, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, true)?;
 
             let read = ReadRequest {
                 eid: 0,
@@ -1752,12 +1782,14 @@ mod test {
                 hash,
             };
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(0),
                 data: data.clone(),
-                block_context,
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(0),
+                    block_context,
+                }],
             };
-            inner.write(JobId(30), &[write], true, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, true)?;
 
             let read = ReadRequest {
                 eid: 0,

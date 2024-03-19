@@ -122,11 +122,38 @@ impl std::fmt::Display for ClientId {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Write {
-    pub eid: u64,
-    pub offset: Block,
+    /// Per-block metadata
+    pub blocks: Vec<WriteBlockMetadata>,
+    /// Raw data
     pub data: bytes::Bytes,
+}
 
-    pub block_context: BlockContext,
+impl Write {
+    /// Returns the block size by looking at our first write's metadata
+    pub fn block_size(&self) -> Option<usize> {
+        self.blocks
+            .first()
+            .map(|b| b.offset.block_size_in_bytes() as usize)
+    }
+
+    /// Returns an iterator over `(metadata, chunk)` tuples
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&WriteBlockMetadata, &[u8])> + '_ {
+        let bs = self.block_size().unwrap_or(0);
+        self.blocks.iter().zip(self.data.chunks_exact(bs))
+    }
+
+    /// Returns a slice from within this write
+    ///
+    /// This requires allocation to clone `self.blocks`, so should be avoided if
+    /// possible.
+    pub fn slice(&self, r: std::ops::Range<usize>) -> Write {
+        let blocks = self.blocks[r.clone()].to_vec();
+        let bs = self.block_size().unwrap_or(0);
+        let data = self.data.slice((bs * r.start)..(bs * r.end));
+        Write { blocks, data }
+    }
 }
 
 /// Write data, containing data from all blocks
@@ -671,29 +698,6 @@ pub struct WriteHeader {
     pub job_id: JobId,
     pub dependencies: Vec<JobId>,
     pub blocks: Vec<WriteBlockMetadata>,
-}
-
-impl WriteHeader {
-    /// Destructures into a list of block-size writes which borrow our data
-    ///
-    /// # Panics
-    /// `buf.len()` must be an even multiple of `self.blocks.len()`, which is
-    /// assumed to be the block size.
-    pub fn get_writes(&self, mut buf: bytes::Bytes) -> Vec<Write> {
-        assert_eq!(buf.len() % self.blocks.len(), 0);
-        let block_size = buf.len() / self.blocks.len();
-        let mut out = Vec::with_capacity(self.blocks.len());
-        for b in &self.blocks {
-            let data = buf.split_to(block_size);
-            out.push(Write {
-                eid: b.eid,
-                offset: b.offset,
-                block_context: b.block_context,
-                data,
-            })
-        }
-        out
-    }
 }
 
 #[derive(Debug, PartialEq, Copy, Clone, Serialize, Deserialize)]

@@ -6,7 +6,7 @@ use crate::{
         EXTENT_META_RAW,
     },
     integrity_hash, mkdir_for_file,
-    region::{BatchedPwritev, JobOrReconciliationId},
+    region::JobOrReconciliationId,
     Block, BlockContext, CrucibleError, JobId, RegionDefinition,
 };
 
@@ -152,9 +152,8 @@ impl ExtentInner for RawInner {
     fn write(
         &mut self,
         job_id: JobId,
-        writes: &[crucible_protocol::Write],
+        write: &crucible_protocol::Write,
         only_write_unwritten: bool,
-        iov_max: usize,
     ) -> Result<(), CrucibleError> {
         // If the same block is written multiple times in a single write, then
         // (1) that's weird, and (2) we need to handle it specially.  To handle
@@ -162,21 +161,33 @@ impl ExtentInner for RawInner {
         // writes.
         let mut seen = HashSet::new();
         let mut start = 0;
-        for i in 0..=writes.len() {
+        for i in 0..=write.blocks.len() {
             // If this value is a duplicate or we have reached the end of
             // the list, then write everything up to this point and adjust
             // our starting point and `seen` array
-            if i == writes.len() || !seen.insert(writes[i].offset.value) {
-                self.write_without_overlaps(
-                    job_id,
-                    &writes[start..i],
-                    only_write_unwritten,
-                    iov_max,
-                )?;
+            if i == write.blocks.len()
+                || !seen.insert(write.blocks[i].offset.value)
+            {
+                // Special case: there are no overlaps, so write the entire
+                // thing without doing any copying or splitting.
+                if i == write.blocks.len() && start == 0 {
+                    self.write_without_overlaps(
+                        job_id,
+                        write,
+                        only_write_unwritten,
+                    )?;
+                } else {
+                    let write = write.slice(start..i);
+                    self.write_without_overlaps(
+                        job_id,
+                        &write,
+                        only_write_unwritten,
+                    )?;
+                }
                 // Keep going, resetting the hashmap and start position
-                if i != writes.len() {
+                if i != write.blocks.len() {
                     seen.clear();
-                    seen.insert(writes[i].offset.value);
+                    seen.insert(write.blocks[i].offset.value);
                     start = i;
                 }
             }
@@ -840,26 +851,52 @@ impl RawInner {
 
     fn write_inner(
         &self,
-        writes: &[crucible_protocol::Write],
+        write: &crucible_protocol::Write,
         writes_to_skip: &HashSet<u64>,
-        iov_max: usize,
     ) -> Result<(), CrucibleError> {
-        // Now, batch writes into iovecs and use pwritev to write them all out.
-        let mut batched_pwritev = BatchedPwritev::new(
-            self.file.as_fd(),
-            writes.len(),
-            self.extent_size.block_size_in_bytes().into(),
-            iov_max,
-        );
+        let mut start = 0;
+        let mut skip_next = false;
+        let block_size = self.extent_size.block_size_in_bytes() as usize;
+        for (i, b) in write.blocks.iter().enumerate() {
+            let skip_me = skip_next;
+            skip_next = write
+                .blocks
+                .get(i + 1)
+                .map(|b| writes_to_skip.contains(&b.offset.value))
+                .unwrap_or(false);
+            if skip_me {
+                continue;
+            }
 
-        for write in writes {
-            if !writes_to_skip.contains(&write.offset.value) {
-                batched_pwritev.add_write(write)?;
+            // If this is the end of a contiguous run, or the next block is
+            // skipped, or we're at the end of the write data, then write the
+            // run to disk and update our new starting position.
+            if skip_next
+                || i == write.blocks.len() - 1
+                || write.blocks[i + 1].offset.value != b.offset.value + 1
+            {
+                // Calculate our write
+                let num_blocks = i - start + 1;
+                let expected_bytes = num_blocks * block_size;
+                let offset = write.blocks[start].offset.value as usize;
+
+                // Perform the write with a single syscall
+                let n_written = nix::sys::uio::pwrite(
+                    self.file.as_fd(),
+                    &write.data[start * block_size..][..expected_bytes],
+                    (offset * block_size) as i64,
+                )
+                .map_err(|e| CrucibleError::IoError(e.to_string()))?;
+
+                if n_written != expected_bytes {
+                    return Err(CrucibleError::IoError(format!(
+                        "pwrite incomplete \
+                     (expected {expected_bytes}, got {n_written} bytes)",
+                    )));
+                }
+                start = i + 1;
             }
         }
-
-        // Write any remaining data
-        batched_pwritev.perform_writes()?;
 
         Ok(())
     }
@@ -1010,9 +1047,8 @@ impl RawInner {
     fn write_without_overlaps(
         &mut self,
         job_id: JobId,
-        writes: &[crucible_protocol::Write],
+        write: &crucible_protocol::Write,
         only_write_unwritten: bool,
-        iov_max: usize,
     ) -> Result<(), CrucibleError> {
         /*
          * In order to be crash consistent, perform the following steps in
@@ -1061,18 +1097,18 @@ impl RawInner {
         let mut writes_to_skip = HashSet::new();
         if only_write_unwritten {
             cdt::extent__write__get__hashes__start!(|| {
-                (job_id.0, self.extent_number, writes.len() as u64)
+                (job_id.0, self.extent_number, write.blocks.len() as u64)
             });
             let mut write_run_start = 0;
-            while write_run_start < writes.len() {
-                let first_write = &writes[write_run_start];
+            while write_run_start < write.blocks.len() {
+                let first_write = &write.blocks[write_run_start];
 
                 // Starting from the first write in the potential run, we scan
                 // forward until we find a write with a block that isn't
                 // contiguous with the request before it. Since we're counting
                 // pairs, and the number of pairs is one less than the number of
                 // writes, we need to add 1 to get our actual run length.
-                let n_contiguous_writes = writes[write_run_start..]
+                let n_contiguous_writes = write.blocks[write_run_start..]
                     .windows(2)
                     .take_while(|wr_pair| {
                         wr_pair[0].offset.value + 1 == wr_pair[1].offset.value
@@ -1096,10 +1132,10 @@ impl RawInner {
                 write_run_start += n_contiguous_writes;
             }
             cdt::extent__write__get__hashes__done!(|| {
-                (job_id.0, self.extent_number, writes.len() as u64)
+                (job_id.0, self.extent_number, write.blocks.len() as u64)
             });
 
-            if writes_to_skip.len() == writes.len() {
+            if writes_to_skip.len() == write.blocks.len() {
                 // Nothing to do
                 return Ok(());
             }
@@ -1112,21 +1148,23 @@ impl RawInner {
         // TODO right now we're including the integrity_hash() time in the
         // measured time.  Is it small enough to be ignored?
         cdt::extent__write__raw__context__insert__start!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
         // Compute block contexts, then write them to disk
-        let block_ctx: Vec<_> = writes
+        let block_ctx: Vec<_> = write
             .iter()
-            .filter(|write| !writes_to_skip.contains(&write.offset.value))
-            .map(|write| {
+            .filter(|(block, _data)| {
+                !writes_to_skip.contains(&block.offset.value)
+            })
+            .map(|(block, data)| {
                 // TODO it would be nice if we could profile what % of time we're
                 // spending on hashes locally vs writing to disk
-                let on_disk_hash = integrity_hash(&[&write.data[..]]);
+                let on_disk_hash = integrity_hash(&[data]);
 
                 DownstairsBlockContext {
-                    block_context: write.block_context,
-                    block: write.offset.value,
+                    block_context: block.block_context,
+                    block: block.offset.value,
                     on_disk_hash,
                 }
             })
@@ -1135,7 +1173,7 @@ impl RawInner {
         self.set_block_contexts(&block_ctx)?;
 
         cdt::extent__write__raw__context__insert__done!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
         // PERFORMANCE TODO:
@@ -1156,13 +1194,13 @@ impl RawInner {
         // complexity. The time spent implementing that would probably better be
         // spent switching to aio or something like that.
         cdt::extent__write__file__start!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
-        let r = self.write_inner(writes, &writes_to_skip, iov_max);
+        let r = self.write_inner(write, &writes_to_skip);
 
         if r.is_err() {
-            for write in writes.iter() {
+            for write in write.blocks.iter() {
                 let block = write.offset.value;
                 if !writes_to_skip.contains(&block) {
                     // Try to recompute the context slot from the file.  If this
@@ -1173,7 +1211,7 @@ impl RawInner {
             }
         } else {
             // Now that writes have gone through, update active context slots
-            for write in writes.iter() {
+            for write in write.blocks.iter() {
                 let block = write.offset.value;
                 if !writes_to_skip.contains(&block) {
                     // We always write to the inactive slot, so just swap it
@@ -1184,7 +1222,7 @@ impl RawInner {
         }
 
         cdt::extent__write__file__done!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
+            (job_id.0, self.extent_number, write.blocks.len() as u64)
         });
 
         Ok(())
@@ -1476,8 +1514,6 @@ mod test {
     use rand::Rng;
     use tempfile::tempdir;
 
-    const IOV_MAX_TEST: usize = 1000;
-
     fn new_region_definition() -> RegionDefinition {
         let opt = crate::region::test::new_region_options();
         RegionDefinition::from_options(&opt).unwrap()
@@ -1695,15 +1731,17 @@ mod test {
         let data = Bytes::from(vec![0x55; 512]);
         let hash = integrity_hash(&[&data[..]]);
         let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
             data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid: 0,
+                offset: Block::new_512(0),
+                block_context: BlockContext {
+                    encryption_context: None,
+                    hash,
+                },
+            }],
         };
-        inner.write(JobId(10), &[write], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &write, false)?;
 
         // The context should be in place, though we haven't flushed yet
 
@@ -1717,12 +1755,14 @@ mod test {
                 hash,
             };
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(0),
                 data: data.clone(),
-                block_context,
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(0),
+                    block_context,
+                }],
             };
-            inner.write(JobId(20), &[write], true, IOV_MAX_TEST)?;
+            inner.write(JobId(20), &write, true)?;
 
             let read = ReadRequest {
                 eid: 0,
@@ -1751,12 +1791,14 @@ mod test {
                 hash,
             };
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(1),
                 data: data.clone(),
-                block_context,
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(1),
+                    block_context,
+                }],
             };
-            inner.write(JobId(30), &[write], true, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, true)?;
 
             let read = ReadRequest {
                 eid: 0,
@@ -1790,43 +1832,52 @@ mod test {
         let data = Bytes::from(vec![0x55; 512]);
         let hash = integrity_hash(&[&data[..]]);
         let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
-            data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
+            data: data.clone(),
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid: 0,
+                offset: Block::new_512(0),
+                block_context: BlockContext {
+                    encryption_context: None,
+                    hash,
+                },
+            }],
         };
 
         // Write block 1, so that we can notice when a sync happens.  The write
         // should go to slot B.
         let write1 = crucible_protocol::Write {
-            offset: Block::new_512(1),
-            ..write.clone()
+            data,
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid: 0,
+                offset: Block::new_512(1),
+                block_context: BlockContext {
+                    encryption_context: None,
+                    hash,
+                },
+            }],
         };
-        inner.write(JobId(10), &[write1], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &write1, false)?;
         assert_eq!(inner.context_slot_dirty[0], 0b00);
         assert_eq!(inner.active_context[0], ContextSlot::A);
         assert_eq!(inner.context_slot_dirty[1], 0b10);
         assert_eq!(inner.active_context[1], ContextSlot::B);
 
         // The context should be written to block 0, slot B
-        inner.write(JobId(10), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &write, false)?;
         assert_eq!(inner.context_slot_dirty[0], 0b10);
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[1], 0b10); // unchanged
         assert_eq!(inner.active_context[1], ContextSlot::B); // unchanged
 
         // The context should be written to block 0, slot A
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(11), &write, false)?;
         assert_eq!(inner.context_slot_dirty[0], 0b11);
         assert_eq!(inner.active_context[0], ContextSlot::A);
         assert_eq!(inner.context_slot_dirty[1], 0b10); // unchanged
         assert_eq!(inner.active_context[1], ContextSlot::B); // unchanged
 
         // The context should be written to slot B, forcing a sync
-        inner.write(JobId(12), &[write], false, IOV_MAX_TEST)?;
+        inner.write(JobId(12), &write, false)?;
         assert_eq!(inner.context_slot_dirty[0], 0b10);
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[1], 0b00);
@@ -1846,16 +1897,18 @@ mod test {
         let data = Bytes::from(vec![0x55; 512]);
         let hash = integrity_hash(&[&data[..]]);
         let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
             data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid: 0,
+                offset: Block::new_512(0),
+                block_context: BlockContext {
+                    encryption_context: None,
+                    hash,
+                },
+            }],
         };
         // The context should be written to slot B
-        inner.write(JobId(10), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[0], 0b10);
 
@@ -1865,17 +1918,17 @@ mod test {
         assert_eq!(inner.context_slot_dirty[0], 0b00);
 
         // The context should be written to slot A
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(11), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::A);
         assert_eq!(inner.context_slot_dirty[0], 0b01);
 
         // The context should be written to slot B
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(12), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[0], 0b11);
 
         // The context should be written to slot A, forcing a sync
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(12), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::A);
         assert_eq!(inner.context_slot_dirty[0], 0b01);
 
@@ -1893,21 +1946,23 @@ mod test {
         let data = Bytes::from(vec![0x55; 512]);
         let hash = integrity_hash(&[&data[..]]);
         let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
             data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
+            blocks: vec![crucible_protocol::WriteBlockMetadata {
+                eid: 0,
+                offset: Block::new_512(0),
+                block_context: BlockContext {
+                    encryption_context: None,
+                    hash,
+                },
+            }],
         };
         // The context should be written to slot B
-        inner.write(JobId(10), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(10), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[0], 0b10);
 
         // The context should be written to slot A
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(11), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::A);
         assert_eq!(inner.context_slot_dirty[0], 0b11);
 
@@ -1917,17 +1972,17 @@ mod test {
         assert_eq!(inner.context_slot_dirty[0], 0b00);
 
         // The context should be written to slot B
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(12), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[0], 0b10);
 
         // The context should be written to slot A
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(12), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::A);
         assert_eq!(inner.context_slot_dirty[0], 0b11);
 
         // The context should be written to slot B, forcing a sync
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
+        inner.write(JobId(11), &write, false)?;
         assert_eq!(inner.active_context[0], ContextSlot::B);
         assert_eq!(inner.context_slot_dirty[0], 0b10);
 
@@ -1974,12 +2029,14 @@ mod test {
                 hash,
             };
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(0),
                 data: data.clone(),
-                block_context,
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(0),
+                    block_context,
+                }],
             };
-            inner.write(JobId(30), &[write], true, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, true)?;
 
             let read = ReadRequest {
                 eid: 0,
@@ -2014,15 +2071,17 @@ mod test {
         let hash = integrity_hash(&[&data[..]]);
         for i in 0..5 {
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
                 data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(i * 2),
+                    block_context: BlockContext {
+                        encryption_context: None,
+                        hash,
+                    },
+                }],
             };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, false)?;
         }
 
         for i in 0..10 {
@@ -2054,23 +2113,23 @@ mod test {
 
         // Now, do one big write, which will be forced to bounce between the
         // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
+        let mut blocks = vec![];
+        let data = Bytes::from(vec![0x33; 512 * 10]);
+        let hash = integrity_hash(&[&data[..512]]);
         for i in 0..10 {
-            let write = crucible_protocol::Write {
+            let block = crucible_protocol::WriteBlockMetadata {
                 eid: 0,
                 offset: Block::new_512(i),
-                data: data.clone(),
                 block_context: BlockContext {
                     encryption_context: None,
                     hash,
                 },
             };
-            writes.push(write);
+            blocks.push(block);
         }
         // This write has toggled every single context slot
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
+        let write = crucible_protocol::Write { blocks, data };
+        inner.write(JobId(30), &write, false)?;
         for i in 0..10 {
             assert_eq!(
                 inner.active_context[i],
@@ -2114,15 +2173,17 @@ mod test {
 
         for i in 0..3 {
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
                 data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(i * 2),
+                    block_context: BlockContext {
+                        encryption_context: None,
+                        hash,
+                    },
+                }],
             };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, false)?;
         }
         // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
         // --|---|---|---|---|---|---|---|---|---
@@ -2156,26 +2217,26 @@ mod test {
 
         // Now, do one big write, which will be forced to bounce between the
         // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
+        let mut blocks = vec![];
+        let data = Bytes::from(vec![0x33; 512 * 10]);
+        let hash = integrity_hash(&[&data[..512]]);
         for i in 0..10 {
-            let write = crucible_protocol::Write {
+            let block = crucible_protocol::WriteBlockMetadata {
                 eid: 0,
                 offset: Block::new_512(i),
-                data: data.clone(),
                 block_context: BlockContext {
                     encryption_context: None,
                     hash,
                 },
             };
-            writes.push(write);
+            blocks.push(block);
         }
+        let write = crucible_protocol::Write { data, blocks };
         // This write should toggled every single context slot:
         // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
         // --|---|---|---|---|---|---|---|---|---
         // A | B | A | B | A | B | B | B | B | B
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
+        inner.write(JobId(30), &write, false)?;
         for i in 0..10 {
             assert_eq!(
                 inner.active_context[i],
@@ -2221,15 +2282,17 @@ mod test {
 
         for i in 0..3 {
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
                 data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(i * 2),
+                    block_context: BlockContext {
+                        encryption_context: None,
+                        hash,
+                    },
+                }],
             };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, false)?;
         }
         // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
         // --|---|---|---|---|---|---|---|---|---
@@ -2263,23 +2326,23 @@ mod test {
 
         // Now, do two big writes, which will be forced to bounce between the
         // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
+        let mut blocks = vec![];
+        let data = Bytes::from(vec![0x33; 512 * 10]);
+        let hash = integrity_hash(&[&data[..512]]);
         for i in 0..10 {
-            let write = crucible_protocol::Write {
+            let block = crucible_protocol::WriteBlockMetadata {
                 eid: 0,
                 offset: Block::new_512(i),
-                data: data.clone(),
                 block_context: BlockContext {
                     encryption_context: None,
                     hash,
                 },
             };
-            writes.push(write);
+            blocks.push(block);
         }
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
+        let write = crucible_protocol::Write { blocks, data };
+        inner.write(JobId(30), &write, false)?;
+        inner.write(JobId(30), &write, false)?;
         // This write should toggled every single context slot:
         // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
         // --|---|---|---|---|---|---|---|---|---
@@ -2329,15 +2392,17 @@ mod test {
 
         for i in 0..2 {
             let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
                 data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
+                blocks: vec![crucible_protocol::WriteBlockMetadata {
+                    eid: 0,
+                    offset: Block::new_512(i * 2),
+                    block_context: BlockContext {
+                        encryption_context: None,
+                        hash,
+                    },
+                }],
             };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
+            inner.write(JobId(30), &write, false)?;
         }
         // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
         // --|---|---|---|---|---|---|---|---|---
@@ -2371,23 +2436,23 @@ mod test {
 
         // Now, do two big writes, which will be forced to bounce between the
         // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
+        let mut blocks = vec![];
+        let data = Bytes::from(vec![0x33; 512 * 10]);
+        let hash = integrity_hash(&[&data[..512]]);
         for i in 0..10 {
-            let write = crucible_protocol::Write {
+            let block = crucible_protocol::WriteBlockMetadata {
                 eid: 0,
                 offset: Block::new_512(i),
-                data: data.clone(),
                 block_context: BlockContext {
                     encryption_context: None,
                     hash,
                 },
             };
-            writes.push(write);
+            blocks.push(block);
         }
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
+        let write = crucible_protocol::Write { data, blocks };
+        inner.write(JobId(30), &write, false)?;
+        inner.write(JobId(30), &write, false)?;
         // This write should toggled every single context slot:
         // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
         // --|---|---|---|---|---|---|---|---|---
@@ -2460,16 +2525,16 @@ mod test {
                 .unwrap();
 
         // Write the same block four times in the same write command.
-
-        let writes: Vec<_> = (0..4)
+        let mut data = BytesMut::with_capacity(512 * 4);
+        let blocks: Vec<_> = (0..4)
             .map(|i| {
-                let data = Bytes::from(vec![i as u8; 512]);
-                let hash = integrity_hash(&[&data[..]]);
+                let chunk = vec![i as u8; 512];
+                let hash = integrity_hash(&[&chunk[..]]);
+                data.extend(chunk);
 
-                crucible_protocol::Write {
+                crucible_protocol::WriteBlockMetadata {
                     eid: 0,
                     offset: Block::new_512(0),
-                    data,
                     block_context: BlockContext {
                         encryption_context: None,
                         hash,
@@ -2477,9 +2542,13 @@ mod test {
                 }
             })
             .collect();
+        let write = crucible_protocol::Write {
+            blocks,
+            data: data.freeze(),
+        };
 
         assert_eq!(inner.context_slot_dirty[0], 0b00);
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
+        inner.write(JobId(30), &write, false)?;
 
         // The write should be split into four separate calls to
         // `write_without_overlaps`, triggering one bonus fsync.

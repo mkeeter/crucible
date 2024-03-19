@@ -1,11 +1,9 @@
 // Copyright 2023 Oxide Computer Company
-use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 
-use anyhow::{anyhow, bail, Context, Result};
-use nix::unistd::{sysconf, SysconfVar};
+use anyhow::{bail, Context, Result};
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -21,7 +19,6 @@ use super::*;
 pub struct Extent {
     pub number: u32,
     read_only: bool,
-    iov_max: usize,
 
     /// Inner contains information about the actual extent file that holds the
     /// data, the metadata about that extent, and the set of dirty blocks that
@@ -68,9 +65,8 @@ pub(crate) trait ExtentInner: Send + Sync + Debug {
     fn write(
         &mut self,
         job_id: JobId,
-        writes: &[crucible_protocol::Write],
+        writes: &crucible_protocol::Write,
         only_write_unwritten: bool,
-        iov_max: usize,
     ) -> Result<(), CrucibleError>;
 
     #[cfg(test)]
@@ -282,12 +278,6 @@ pub fn remove_copy_cleanup_dir<P: AsRef<Path>>(dir: P, eid: u32) -> Result<()> {
 }
 
 impl Extent {
-    fn get_iov_max() -> Result<usize> {
-        let i: i64 = sysconf(SysconfVar::IOV_MAX)?
-            .ok_or_else(|| anyhow!("IOV_MAX returned None!"))?;
-        Ok(i.try_into()?)
-    }
-
     /**
      * Open an existing extent file at the location requested.
      */
@@ -451,7 +441,6 @@ impl Extent {
         let extent = Extent {
             number,
             read_only,
-            iov_max: Extent::get_iov_max()?,
             inner,
         };
 
@@ -518,7 +507,6 @@ impl Extent {
         Ok(Extent {
             number,
             read_only: false,
-            iov_max: Extent::get_iov_max()?,
             inner,
         })
     }
@@ -553,7 +541,7 @@ impl Extent {
     pub async fn write(
         &mut self,
         job_id: JobId,
-        writes: &[crucible_protocol::Write],
+        writes: &crucible_protocol::Write,
         only_write_unwritten: bool,
     ) -> Result<(), CrucibleError> {
         if self.read_only {
@@ -561,14 +549,13 @@ impl Extent {
         }
 
         cdt::extent__write__start!(|| {
-            (job_id.0, self.number, writes.len() as u64)
+            (job_id.0, self.number, writes.blocks.len() as u64)
         });
 
-        self.inner
-            .write(job_id, writes, only_write_unwritten, self.iov_max)?;
+        self.inner.write(job_id, writes, only_write_unwritten)?;
 
         cdt::extent__write__done!(|| {
-            (job_id.0, self.number, writes.len() as u64)
+            (job_id.0, self.number, writes.blocks.len() as u64)
         });
 
         Ok(())

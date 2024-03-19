@@ -1,5 +1,6 @@
 // Copyright 2023 Oxide Computer Company
 use super::*;
+use bytes::Bytes;
 
 pub enum DynoFlushConfig {
     FlushPerIops(usize),
@@ -62,14 +63,19 @@ pub async fn dynamometer(
                 let nonce = nonce.clone();
                 let tag = tag.clone();
 
-                let writes: Vec<_> = (0..num_writes)
-                    .map(|i| crucible_protocol::Write {
+                let data = Bytes::from_iter(
+                    std::iter::repeat(&block_bytes)
+                        .take(num_writes)
+                        .flatten()
+                        .cloned(),
+                );
+                let blocks: Vec<_> = (0..num_writes)
+                    .map(|i| crucible_protocol::WriteBlockMetadata {
                         eid: eid as u64,
                         offset: Block::new_with_ddef(
                             i as u64 + block_offset,
                             &ddef,
                         ),
-                        data: block_bytes.clone(),
                         block_context: BlockContext {
                             hash,
                             encryption_context: Some(
@@ -81,9 +87,10 @@ pub async fn dynamometer(
                         },
                     })
                     .collect();
+                let write = crucible_protocol::Write { blocks, data };
 
                 let io_operation_time = Instant::now();
-                region.region_write(&writes, JobId(1000), false).await?;
+                region.region_write(write, JobId(1000), false).await?;
 
                 total_io_time += io_operation_time.elapsed();
                 io_operations_sent += num_writes;
