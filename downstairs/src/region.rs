@@ -1300,6 +1300,14 @@ pub(crate) mod test {
         region_options
     }
 
+    fn random_buffer(size: usize) -> Bytes {
+        let mut rng = rand::thread_rng();
+        let mut buffer = BytesMut::with_capacity(size);
+        buffer.resize(size, 0u8);
+        rng.fill_bytes(&mut buffer);
+        buffer.freeze()
+    }
+
     #[tokio::test]
     async fn region_create_drop_open() -> Result<()> {
         // Create a region, make three extents.
@@ -2412,12 +2420,7 @@ pub(crate) mod test {
             ddef.extent_size().value as usize * ddef.extent_count() as usize;
 
         // use region_write to fill region
-
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks: Vec<crucible_protocol::WriteBlockMetadata> =
             Vec::with_capacity(num_blocks);
@@ -2502,12 +2505,7 @@ pub(crate) mod test {
             ddef.extent_size().value as usize * ddef.extent_count() as usize;
 
         // use region_write to fill region
-
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -2960,12 +2958,7 @@ pub(crate) mod test {
             ddef.extent_size().value as usize * ddef.extent_count() as usize;
 
         // use region_write to fill region
-
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -3072,11 +3065,7 @@ pub(crate) mod test {
         region.region_write(writes, JobId(0), false).await?;
 
         // Now use region_write to fill entire region
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -3189,11 +3178,7 @@ pub(crate) mod test {
         region.region_write(write, JobId(0), false).await?;
 
         // Now use region_write to fill entire region
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -3311,12 +3296,8 @@ pub(crate) mod test {
         region.region_write(write, JobId(0), false).await?;
 
         // Now use region_write to fill four blocks
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
+        let buffer = random_buffer(total_size);
         println!("buffer size:{}", buffer.len());
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -3420,11 +3401,7 @@ pub(crate) mod test {
         }
 
         // Now use region_write to fill entire region
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
@@ -3804,9 +3781,7 @@ pub(crate) mod test {
                     .iter()
                     .map(|range| {
                         let buf_size = (range.end - range.start) as usize * 512;
-                        let mut buffer = BytesMut::with_capacity(buf_size);
-                        buffer.resize(buf_size, 0u8);
-                        thread_rng().fill_bytes(&mut buffer);
+                        let buffer = random_buffer(buf_size);
 
                         let blocks = range
                             .clone()
@@ -3827,7 +3802,7 @@ pub(crate) mod test {
                             .collect();
                         crucible_protocol::Write {
                             blocks,
-                            data: buffer.freeze(),
+                            data: buffer,
                         }
                     })
                     .collect()
@@ -3901,9 +3876,7 @@ pub(crate) mod test {
         let writes: Vec<crucible_protocol::Write> = (0..3)
             .map(|_| {
                 let buf_size = EXTENT_SIZE as usize * 512;
-                let mut buffer = BytesMut::with_capacity(buf_size);
-                buffer.resize(buf_size, 0u8);
-                thread_rng().fill_bytes(&mut buffer);
+                let buffer = random_buffer(buf_size);
                 let blocks = (0..EXTENT_SIZE)
                     .map(|idx| {
                         // Generate data for this block
@@ -3921,7 +3894,7 @@ pub(crate) mod test {
                     .collect();
                 crucible_protocol::Write {
                     blocks,
-                    data: buffer.freeze(),
+                    data: buffer,
                 }
             })
             .collect();
@@ -4056,11 +4029,7 @@ pub(crate) mod test {
             ddef.extent_size().value as usize * ddef.extent_count() as usize;
 
         // Write in random data
-        let mut rng = rand::thread_rng();
-        let mut buffer = BytesMut::with_capacity(total_size);
-        buffer.resize(total_size, 0u8);
-        rng.fill_bytes(&mut buffer);
-        let buffer = buffer.freeze();
+        let buffer = random_buffer(total_size);
 
         let mut blocks = Vec::with_capacity(num_blocks);
 
