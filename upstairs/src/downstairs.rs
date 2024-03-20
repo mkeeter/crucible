@@ -408,10 +408,9 @@ impl Downstairs {
         }
     }
 
-    pub(crate) async fn io_send(&mut self, client_id: ClientId) {
+    pub(crate) fn io_send(&mut self, client_id: ClientId) {
         // Send all jobs to the downstairs
-        let client = &mut self.clients[client_id];
-        let new_work = client.new_work();
+        let new_work = self.clients[client_id].new_work();
 
         /*
          * Now we have a list of all the job IDs that are new for our client id.
@@ -422,179 +421,152 @@ impl Downstairs {
          * map to see if they are new.
          */
         for new_id in new_work {
+            self.io_send_one(client_id, new_id);
+        }
+    }
+
+    /// Sends the given IO to the given client
+    ///
+    /// If the send fails, the job is added to the client's `new_work` map.
+    fn io_send_one(&mut self, client_id: ClientId, new_id: JobId) {
+        /*
+         * Walk the list of work to do, update its status as in progress
+         * and send the details to our downstairs.
+         */
+        if self.cfg.lossy && random() && random() {
             /*
-             * Walk the list of work to do, update its status as in progress
-             * and send the details to our downstairs.
+             * Requeue this work so it isn't completely lost.
              */
-            if self.cfg.lossy && random() && random() {
-                /*
-                 * Requeue this work so it isn't completely lost.
-                 */
-                self.clients[client_id].requeue_one(new_id);
-                continue;
+            self.clients[client_id].requeue_one(new_id);
+            return;
+        }
+
+        /*
+         * If in_progress returns None, it means that this job on this
+         * client should be skipped.
+         */
+        let Some(job) = self.in_progress(new_id, client_id) else {
+            return;
+        };
+
+        let message = match job {
+            IOop::Write {
+                dependencies,
+                blocks,
+                data,
+            } => {
+                cdt::ds__write__io__start!(|| (new_id.0, client_id.get()));
+                Message::Write {
+                    header: WriteHeader {
+                        upstairs_id: self.cfg.upstairs_id,
+                        session_id: self.cfg.session_id,
+                        job_id: new_id,
+                        dependencies,
+                        blocks,
+                    },
+                    data,
+                }
             }
-
-            /*
-             * If in_progress returns None, it means that this job on this
-             * client should be skipped.
-             */
-            let Some(job) = self.in_progress(new_id, client_id) else {
-                continue;
-            };
-
-            let message = match job {
-                IOop::Write {
-                    dependencies,
-                    blocks,
+            IOop::WriteUnwritten {
+                blocks,
+                dependencies,
+                data,
+            } => {
+                cdt::ds__write__unwritten__io__start!(|| (
+                    new_id.0,
+                    client_id.get()
+                ));
+                Message::WriteUnwritten {
+                    header: WriteHeader {
+                        upstairs_id: self.cfg.upstairs_id,
+                        session_id: self.cfg.session_id,
+                        job_id: new_id,
+                        dependencies,
+                        blocks,
+                    },
                     data,
-                } => {
-                    cdt::ds__write__io__start!(|| (new_id.0, client_id.get()));
-                    Message::Write {
-                        header: WriteHeader {
-                            upstairs_id: self.cfg.upstairs_id,
-                            session_id: self.cfg.session_id,
-                            job_id: new_id,
-                            dependencies,
-                            blocks,
-                        },
-                        data,
-                    }
                 }
-                IOop::WriteUnwritten {
-                    blocks,
-                    dependencies,
-                    data,
-                } => {
-                    cdt::ds__write__unwritten__io__start!(|| (
-                        new_id.0,
-                        client_id.get()
-                    ));
-                    Message::WriteUnwritten {
-                        header: WriteHeader {
-                            upstairs_id: self.cfg.upstairs_id,
-                            session_id: self.cfg.session_id,
-                            job_id: new_id,
-                            dependencies,
-                            blocks,
-                        },
-                        data,
-                    }
-                }
-                IOop::Flush {
+            }
+            IOop::Flush {
+                dependencies,
+                flush_number,
+                gen_number,
+                snapshot_details,
+                extent_limit,
+            } => {
+                cdt::ds__flush__io__start!(|| (new_id.0, client_id.get()));
+                Message::Flush {
+                    upstairs_id: self.cfg.upstairs_id,
+                    session_id: self.cfg.session_id,
+                    job_id: new_id,
                     dependencies,
                     flush_number,
                     gen_number,
                     snapshot_details,
                     extent_limit,
-                } => {
-                    cdt::ds__flush__io__start!(|| (new_id.0, client_id.get()));
-                    Message::Flush {
-                        upstairs_id: self.cfg.upstairs_id,
-                        session_id: self.cfg.session_id,
-                        job_id: new_id,
-                        dependencies,
-                        flush_number,
-                        gen_number,
-                        snapshot_details,
-                        extent_limit,
-                    }
                 }
-                IOop::Read {
+            }
+            IOop::Read {
+                dependencies,
+                requests,
+            } => {
+                cdt::ds__read__io__start!(|| (new_id.0, client_id.get()));
+                Message::ReadRequest {
+                    upstairs_id: self.cfg.upstairs_id,
+                    session_id: self.cfg.session_id,
+                    job_id: new_id,
                     dependencies,
                     requests,
-                } => {
-                    cdt::ds__read__io__start!(|| (new_id.0, client_id.get()));
-                    Message::ReadRequest {
-                        upstairs_id: self.cfg.upstairs_id,
-                        session_id: self.cfg.session_id,
-                        job_id: new_id,
-                        dependencies,
-                        requests,
-                    }
                 }
-                IOop::ExtentFlushClose {
-                    dependencies,
-                    extent,
-                    flush_number,
-                    gen_number,
-                    repair_downstairs,
-                } => {
-                    cdt::ds__close__start!(|| (
-                        new_id.0,
-                        client_id.get(),
-                        extent
-                    ));
-                    if repair_downstairs.contains(&client_id) {
-                        // We are the downstairs being repaired, so just close.
-                        Message::ExtentLiveClose {
-                            upstairs_id: self.cfg.upstairs_id,
-                            session_id: self.cfg.session_id,
-                            job_id: new_id,
-                            dependencies,
-                            extent_id: extent,
-                        }
-                    } else {
-                        Message::ExtentLiveFlushClose {
-                            upstairs_id: self.cfg.upstairs_id,
-                            session_id: self.cfg.session_id,
-                            job_id: new_id,
-                            dependencies,
-                            extent_id: extent,
-                            flush_number,
-                            gen_number,
-                        }
-                    }
-                }
-                IOop::ExtentLiveRepair {
-                    dependencies,
-                    extent,
-                    source_downstairs,
-                    source_repair_address,
-                    repair_downstairs,
-                } => {
-                    cdt::ds__repair__start!(|| (
-                        new_id.0,
-                        client_id.get(),
-                        extent
-                    ));
-                    if repair_downstairs.contains(&client_id) {
-                        Message::ExtentLiveRepair {
-                            upstairs_id: self.cfg.upstairs_id,
-                            session_id: self.cfg.session_id,
-                            job_id: new_id,
-                            dependencies,
-                            extent_id: extent,
-                            source_client_id: source_downstairs,
-                            source_repair_address,
-                        }
-                    } else {
-                        Message::ExtentLiveNoOp {
-                            upstairs_id: self.cfg.upstairs_id,
-                            session_id: self.cfg.session_id,
-                            job_id: new_id,
-                            dependencies,
-                        }
-                    }
-                }
-                IOop::ExtentLiveReopen {
-                    dependencies,
-                    extent,
-                } => {
-                    cdt::ds__reopen__start!(|| (
-                        new_id.0,
-                        client_id.get(),
-                        extent
-                    ));
-                    Message::ExtentLiveReopen {
+            }
+            IOop::ExtentFlushClose {
+                dependencies,
+                extent,
+                flush_number,
+                gen_number,
+                repair_downstairs,
+            } => {
+                cdt::ds__close__start!(|| (new_id.0, client_id.get(), extent));
+                if repair_downstairs.contains(&client_id) {
+                    // We are the downstairs being repaired, so just close.
+                    Message::ExtentLiveClose {
                         upstairs_id: self.cfg.upstairs_id,
                         session_id: self.cfg.session_id,
                         job_id: new_id,
                         dependencies,
                         extent_id: extent,
                     }
+                } else {
+                    Message::ExtentLiveFlushClose {
+                        upstairs_id: self.cfg.upstairs_id,
+                        session_id: self.cfg.session_id,
+                        job_id: new_id,
+                        dependencies,
+                        extent_id: extent,
+                        flush_number,
+                        gen_number,
+                    }
                 }
-                IOop::ExtentLiveNoOp { dependencies } => {
-                    cdt::ds__noop__start!(|| (new_id.0, client_id.get()));
+            }
+            IOop::ExtentLiveRepair {
+                dependencies,
+                extent,
+                source_downstairs,
+                source_repair_address,
+                repair_downstairs,
+            } => {
+                cdt::ds__repair__start!(|| (new_id.0, client_id.get(), extent));
+                if repair_downstairs.contains(&client_id) {
+                    Message::ExtentLiveRepair {
+                        upstairs_id: self.cfg.upstairs_id,
+                        session_id: self.cfg.session_id,
+                        job_id: new_id,
+                        dependencies,
+                        extent_id: extent,
+                        source_client_id: source_downstairs,
+                        source_repair_address,
+                    }
+                } else {
                     Message::ExtentLiveNoOp {
                         upstairs_id: self.cfg.upstairs_id,
                         session_id: self.cfg.session_id,
@@ -602,9 +574,31 @@ impl Downstairs {
                         dependencies,
                     }
                 }
-            };
-            self.clients[client_id].send(message).await
-        }
+            }
+            IOop::ExtentLiveReopen {
+                dependencies,
+                extent,
+            } => {
+                cdt::ds__reopen__start!(|| (new_id.0, client_id.get(), extent));
+                Message::ExtentLiveReopen {
+                    upstairs_id: self.cfg.upstairs_id,
+                    session_id: self.cfg.session_id,
+                    job_id: new_id,
+                    dependencies,
+                    extent_id: extent,
+                }
+            }
+            IOop::ExtentLiveNoOp { dependencies } => {
+                cdt::ds__noop__start!(|| (new_id.0, client_id.get()));
+                Message::ExtentLiveNoOp {
+                    upstairs_id: self.cfg.upstairs_id,
+                    session_id: self.cfg.session_id,
+                    job_id: new_id,
+                    dependencies,
+                }
+            }
+        };
+        self.clients[client_id].send(message)
     }
 
     /// Mark this request as in progress for this client, and return the
@@ -1942,14 +1936,14 @@ impl Downstairs {
     ///
     /// # Panics
     /// If `self.reconcile_current_work` is not `None`
-    pub(crate) async fn send_next_reconciliation_req(&mut self) -> bool {
+    pub(crate) fn send_next_reconciliation_req(&mut self) -> bool {
         assert!(self.reconcile_current_work.is_none());
         let Some(mut next) = self.reconcile_task_list.pop_front() else {
             info!(self.log, "done with reconciliation");
             return true;
         };
         for c in self.clients.iter_mut() {
-            c.send_next_reconciliation_req(&mut next).await;
+            c.send_next_reconciliation_req(&mut next);
         }
         self.reconcile_current_work = Some(next);
         false
@@ -1962,7 +1956,7 @@ impl Downstairs {
     /// If any of the downstairs clients are in an invalid state for
     /// reconciliation to continue, mark them as `FailedRepair` and restart
     /// them, clearing out the current reconciliation state.
-    pub(crate) async fn on_reconciliation_ack(
+    pub(crate) fn on_reconciliation_ack(
         &mut self,
         client_id: ClientId,
         m: Message,
@@ -1999,7 +1993,7 @@ impl Downstairs {
 
         if self.clients[client_id].on_reconciliation_job_done(repair_id, next) {
             self.reconcile_current_work = None;
-            self.send_next_reconciliation_req().await
+            self.send_next_reconciliation_req()
         } else {
             false
         }
@@ -5669,18 +5663,18 @@ pub(crate) mod test {
     }
 
     // Tests for reconciliation
-    #[tokio::test]
-    async fn send_next_reconciliation_req_none() {
+    #[test]
+    fn send_next_reconciliation_req_none() {
         // No repairs on the queue, should return None
         let mut ds = Downstairs::test_default();
         set_all_reconcile(&mut ds);
 
-        let w = ds.send_next_reconciliation_req().await;
+        let w = ds.send_next_reconciliation_req();
         assert!(w); // reconciliation is "done", because there's nothing there
     }
 
-    #[tokio::test]
-    async fn reconcile_repair_workflow_not_repair() {
+    #[test]
+    fn reconcile_repair_workflow_not_repair() {
         // Verify that reconciliation will not give out work if a downstairs is
         // not in the correct state, and that it will clear the work queue and
         // mark other downstairs as failed.
@@ -5706,7 +5700,7 @@ pub(crate) mod test {
         set_all_reconcile(&mut ds);
 
         // Send the first reconciliation req
-        assert!(!ds.send_next_reconciliation_req().await);
+        assert!(!ds.send_next_reconciliation_req());
 
         // Fault client 1, so that later event handling will kick us out of
         // repair
@@ -5716,15 +5710,13 @@ pub(crate) mod test {
         );
 
         // Send an ack to trigger the reconciliation state check
-        let nw = ds
-            .on_reconciliation_ack(
-                ClientId::new(0),
-                Message::RepairAckId {
-                    repair_id: close_id,
-                },
-                &UpstairsState::Active,
-            )
-            .await;
+        let nw = ds.on_reconciliation_ack(
+            ClientId::new(0),
+            Message::RepairAckId {
+                repair_id: close_id,
+            },
+            &UpstairsState::Active,
+        );
         assert!(!nw);
 
         // The two troublesome tasks will pass through DsState::ReconcileFailed and
@@ -5735,12 +5727,12 @@ pub(crate) mod test {
 
         // Verify that no more reconciliation work is happening
         assert!(ds.reconcile_task_list.is_empty());
-        let w = ds.send_next_reconciliation_req().await;
+        let w = ds.send_next_reconciliation_req();
         assert!(w);
     }
 
-    #[tokio::test]
-    async fn reconcile_repair_workflow_not_repair_later() {
+    #[test]
+    fn reconcile_repair_workflow_not_repair_later() {
         // Verify that rep_done still works even after we have a downstairs
         // in the FailedReconcile state. Verify that attempts to get new work
         // after a failed repair now return none.
@@ -5758,14 +5750,15 @@ pub(crate) mod test {
             },
         ));
         // Send that job
-        ds.send_next_reconciliation_req().await;
+        ds.send_next_reconciliation_req();
 
         // Downstairs 0 and 2 are okay, but 1 failed (for some reason!)
         let msg = Message::RepairAckId { repair_id: rep_id };
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(0), msg.clone(), &up_state)
-                .await
-        );
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(0),
+            msg.clone(),
+            &up_state
+        ));
         ds.on_reconciliation_failed(
             ClientId::new(1),
             Message::ExtentError {
@@ -5777,10 +5770,11 @@ pub(crate) mod test {
             },
             &up_state,
         );
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(2), msg.clone(), &up_state)
-                .await
-        );
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(2),
+            msg.clone(),
+            &up_state
+        ));
 
         // Getting the next work to do should verify the previous is done,
         // and handle a state change for a downstairs.
@@ -5792,9 +5786,9 @@ pub(crate) mod test {
         assert!(ds.reconcile_task_list.is_empty());
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic]
-    async fn reconcile_rep_in_progress_bad1() {
+    fn reconcile_rep_in_progress_bad1() {
         // Verify the same downstairs can't mark a job in progress twice
         let mut ds = Downstairs::test_default();
         set_all_reconcile(&mut ds);
@@ -5809,12 +5803,12 @@ pub(crate) mod test {
         ));
 
         // Send that req
-        assert!(!ds.send_next_reconciliation_req().await);
-        ds.send_next_reconciliation_req().await; // panics
+        assert!(!ds.send_next_reconciliation_req());
+        ds.send_next_reconciliation_req(); // panics
     }
 
-    #[tokio::test]
-    async fn reconcile_repair_workflow_1() {
+    #[test]
+    fn reconcile_repair_workflow_1() {
         let mut ds = Downstairs::test_default();
         set_all_reconcile(&mut ds);
 
@@ -5837,7 +5831,7 @@ pub(crate) mod test {
         ));
 
         // Send the close job.  Reconciliation isn't done at this point!
-        assert!(!ds.send_next_reconciliation_req().await);
+        assert!(!ds.send_next_reconciliation_req());
 
         // Ack the close job.  Reconciliation isn't done at this point, because
         // there's another job in the task list.
@@ -5845,7 +5839,7 @@ pub(crate) mod test {
             repair_id: close_id,
         };
         for i in ClientId::iter() {
-            assert!(!ds.on_reconciliation_ack(i, msg.clone(), &up_state).await);
+            assert!(!ds.on_reconciliation_ack(i, msg.clone(), &up_state));
         }
 
         // The third ack will have sent the next reconciliation job
@@ -5853,23 +5847,26 @@ pub(crate) mod test {
 
         // Now, make sure we consider this done only after all three are done
         let msg = Message::RepairAckId { repair_id: rep_id };
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(0), msg.clone(), &up_state)
-                .await
-        );
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(1), msg.clone(), &up_state)
-                .await
-        );
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(0),
+            msg.clone(),
+            &up_state
+        ));
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(1),
+            msg.clone(),
+            &up_state
+        ));
         // The third ack finishes reconciliation!
-        assert!(
-            ds.on_reconciliation_ack(ClientId::new(2), msg.clone(), &up_state)
-                .await
-        );
+        assert!(ds.on_reconciliation_ack(
+            ClientId::new(2),
+            msg.clone(),
+            &up_state
+        ));
     }
 
-    #[tokio::test]
-    async fn reconcile_repair_workflow_2() {
+    #[test]
+    fn reconcile_repair_workflow_2() {
         // Verify Done or Skipped works when checking for a complete repair
         let mut ds = Downstairs::test_default();
         set_all_reconcile(&mut ds);
@@ -5893,7 +5890,7 @@ pub(crate) mod test {
         ));
 
         // Send the job.  Reconciliation isn't done at this point!
-        assert!(!ds.send_next_reconciliation_req().await);
+        assert!(!ds.send_next_reconciliation_req());
 
         // Mark all three as in progress
         let Some(job) = &ds.reconcile_current_work else {
@@ -5904,21 +5901,23 @@ pub(crate) mod test {
         assert_eq!(job.state[ClientId::new(2)], IOState::InProgress);
 
         let msg = Message::RepairAckId { repair_id: rep_id };
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(1), msg.clone(), &up_state)
-                .await
-        );
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(1),
+            msg.clone(),
+            &up_state
+        ));
         // The second ack finishes reconciliation, because it was skipped for
         // client 0 (which was the source of repairs).
-        assert!(
-            ds.on_reconciliation_ack(ClientId::new(2), msg.clone(), &up_state)
-                .await
-        );
+        assert!(ds.on_reconciliation_ack(
+            ClientId::new(2),
+            msg.clone(),
+            &up_state
+        ));
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic]
-    async fn reconcile_repair_inprogress_not_done() {
+    fn reconcile_repair_inprogress_not_done() {
         // Verify Done or Skipped works when checking for a complete repair
         let mut ds = Downstairs::test_default();
         set_all_reconcile(&mut ds);
@@ -5942,7 +5941,7 @@ pub(crate) mod test {
         ));
 
         // Send the job.  Reconciliation isn't done at this point!
-        assert!(!ds.send_next_reconciliation_req().await);
+        assert!(!ds.send_next_reconciliation_req());
 
         // If we get back an ack from client 0, something has gone terribly
         // wrong (because the jobs should have been skipped for it)
@@ -5950,13 +5949,12 @@ pub(crate) mod test {
             ClientId::new(0),
             Message::RepairAckId { repair_id: rep_id },
             &up_state,
-        )
-        .await; // this should panic!
+        ); // this should panic!
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic]
-    async fn reconcile_leave_no_job_behind() {
+    fn reconcile_leave_no_job_behind() {
         // Verify we can't start a new job before the old is finished.
         // Verify Done or Skipped works when checking for a complete repair
         let mut ds = Downstairs::test_default();
@@ -5983,21 +5981,23 @@ pub(crate) mod test {
         ));
 
         // Send the first req; reconciliation is not yet done
-        assert!(!ds.send_next_reconciliation_req().await);
+        assert!(!ds.send_next_reconciliation_req());
 
         // Now, make sure we consider this done only after all three are done
         let msg = Message::RepairAckId { repair_id: rep_id };
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(1), msg.clone(), &up_state)
-                .await
-        );
-        assert!(
-            !ds.on_reconciliation_ack(ClientId::new(2), msg.clone(), &up_state)
-                .await
-        );
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(1),
+            msg.clone(),
+            &up_state
+        ));
+        assert!(!ds.on_reconciliation_ack(
+            ClientId::new(2),
+            msg.clone(),
+            &up_state
+        ));
         // don't finish
 
-        ds.send_next_reconciliation_req().await; // panics!
+        ds.send_next_reconciliation_req(); // panics!
     }
 
     #[test]

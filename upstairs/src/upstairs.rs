@@ -520,7 +520,7 @@ impl Upstairs {
                 cdt::up__action_downstairs!(|| (self
                     .counters
                     .action_downstairs));
-                self.apply_downstairs_action(d).await
+                self.apply_downstairs_action(d)
             }
             UpstairsAction::Guest(b) => {
                 self.counters.action_guest += 1;
@@ -542,7 +542,7 @@ impl Upstairs {
                 cdt::up__action_deferred_message!(|| (self
                     .counters
                     .action_deferred_message));
-                self.on_client_message(m).await;
+                self.on_client_message(m);
             }
             UpstairsAction::LeakCheck => {
                 self.counters.action_leak_check += 1;
@@ -614,7 +614,7 @@ impl Upstairs {
         // after `continue_live_repair`, which may enqueue jobs.
         for i in ClientId::iter() {
             if self.downstairs.clients[i].should_do_more_work() {
-                self.downstairs.io_send(i).await;
+                self.downstairs.io_send(i);
             }
         }
 
@@ -977,11 +977,11 @@ impl Upstairs {
             // These three options can be handled by this task directly,
             // and don't require the upstairs to be fully online.
             BlockOp::GoActive => {
-                self.set_active_request(res).await;
+                self.set_active_request(res);
             }
             BlockOp::GoActiveWithGen { gen } => {
                 self.cfg.generation.store(gen, Ordering::Release);
-                self.set_active_request(res).await;
+                self.set_active_request(res);
             }
             BlockOp::QueryGuestIOReady { data } => {
                 *data.lock().await = self.guest_io_ready();
@@ -1155,7 +1155,7 @@ impl Upstairs {
     }
 
     /// Request that the Upstairs go active
-    async fn set_active_request(&mut self, res: BlockRes) {
+    fn set_active_request(&mut self, res: BlockRes) {
         match &self.state {
             UpstairsState::Initializing => {
                 self.state = UpstairsState::GoActive(res);
@@ -1191,7 +1191,7 @@ impl Upstairs {
         // Notify all clients that they should go active when they hit an
         // appropriate state in their negotiation.
         for c in self.downstairs.clients.iter_mut() {
-            c.set_active_request().await;
+            c.set_active_request();
         }
     }
 
@@ -1493,16 +1493,16 @@ impl Upstairs {
     }
 
     /// React to an event sent by one of the downstairs clients
-    async fn apply_downstairs_action(&mut self, d: DownstairsAction) {
+    fn apply_downstairs_action(&mut self, d: DownstairsAction) {
         match d {
             DownstairsAction::Client { client_id, action } => {
-                self.apply_client_action(client_id, action).await;
+                self.apply_client_action(client_id, action);
             }
         }
     }
 
     /// React to an event sent by one of the downstairs clients
-    async fn apply_client_action(
+    fn apply_client_action(
         &mut self,
         client_id: ClientId,
         action: ClientAction,
@@ -1510,7 +1510,7 @@ impl Upstairs {
         match action {
             ClientAction::Connected => {
                 self.downstairs.clients[client_id].stats.connected += 1;
-                self.downstairs.clients[client_id].send_here_i_am().await;
+                self.downstairs.clients[client_id].send_here_i_am();
             }
             ClientAction::Response(m) => {
                 // We would not have received ClientAction::Response if the IO
@@ -1558,7 +1558,7 @@ impl Upstairs {
                         });
                     } else {
                         // Do decryption right here!
-                        self.on_client_message(dr.run()).await;
+                        self.on_client_message(dr.run());
                     }
                 } else {
                     let dm = DeferredMessage {
@@ -1568,7 +1568,7 @@ impl Upstairs {
                         connection_id: id,
                     };
                     if self.deferred_msgs.is_empty() {
-                        self.on_client_message(dm).await;
+                        self.on_client_message(dm);
                     } else {
                         self.deferred_msgs.push_immediate(dm);
                     }
@@ -1588,7 +1588,7 @@ impl Upstairs {
         }
     }
 
-    async fn on_client_message(&mut self, dm: DeferredMessage) {
+    fn on_client_message(&mut self, dm: DeferredMessage) {
         let (client_id, m, hashes) = (dm.client_id, dm.message, dm.hashes);
 
         // It's possible for a deferred message to arrive **after** we have
@@ -1645,8 +1645,7 @@ impl Upstairs {
             | Message::ExtentVersions { .. } => {
                 // negotiation and initial reconciliation
                 let r = self.downstairs.clients[client_id]
-                    .continue_negotiation(m, &self.state, &mut self.ddef)
-                    .await;
+                    .continue_negotiation(m, &self.state, &mut self.ddef);
 
                 match r {
                     // continue_negotiation returns an error if the upstairs
@@ -1661,7 +1660,7 @@ impl Upstairs {
 
                             DsState::WaitQuorum => {
                                 // See if we have a quorum
-                                if self.connect_region_set().await {
+                                if self.connect_region_set() {
                                     // We connected normally, so there's no need
                                     // to check for live-repair.
                                     self.repair_check_interval = None;
@@ -1688,11 +1687,11 @@ impl Upstairs {
                 );
             }
             Message::RepairAckId { .. } => {
-                if self
-                    .downstairs
-                    .on_reconciliation_ack(client_id, m, &self.state)
-                    .await
-                {
+                if self.downstairs.on_reconciliation_ack(
+                    client_id,
+                    m,
+                    &self.state,
+                ) {
                     // reconciliation is done, great work everyone
                     self.on_reconciliation_done(DsState::Reconcile);
                 }
@@ -1742,7 +1741,7 @@ impl Upstairs {
     /// **can't** activate, then we should notify the requestor of failure.
     ///
     /// If we have a problem here, we can't activate the upstairs.
-    async fn connect_region_set(&mut self) -> bool {
+    fn connect_region_set(&mut self) -> bool {
         /*
          * If reconciliation is required, it happens in three phases.
          * Typically an interruption of reconciliation will result in things
@@ -1846,7 +1845,7 @@ impl Upstairs {
                 // We have populated all of the reconciliation requests in
                 // `Downstairs::reconcile_task_list`.  Start reconciliation by
                 // sending the first request.
-                self.downstairs.send_next_reconciliation_req().await;
+                self.downstairs.send_next_reconciliation_req();
                 true
             }
             Ok(false) => {
@@ -2128,8 +2127,8 @@ pub(crate) mod test {
         up
     }
 
-    #[tokio::test]
-    async fn reconcile_not_ready() {
+    #[test]
+    fn reconcile_not_ready() {
         // Verify reconcile returns false when a downstairs is not ready
         let mut up = Upstairs::test_default(None);
         up.ds_transition(ClientId::new(0), DsState::WaitActive);
@@ -2138,7 +2137,7 @@ pub(crate) mod test {
         up.ds_transition(ClientId::new(1), DsState::WaitActive);
         up.ds_transition(ClientId::new(1), DsState::WaitQuorum);
 
-        let res = up.connect_region_set().await;
+        let res = up.connect_region_set();
         assert!(!res);
         assert!(!matches!(&up.state, &UpstairsState::Active))
     }
