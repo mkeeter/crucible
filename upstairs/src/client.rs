@@ -399,6 +399,18 @@ impl DownstairsClient {
         let old_state = self.set_job_state(job, IOState::InProgress);
         assert_eq!(old_state, IOState::New);
 
+        self.get_modified_ioop(job, repair_min_id)
+    }
+
+    /// Builds an `IOop` from the given `DownstairsIO` with updated dependencies
+    ///
+    /// The new `IOop` respects our extent limit and has dependencies pruned to
+    /// eliminate skipped jobs.
+    pub(crate) fn get_modified_ioop(
+        &self,
+        job: &DownstairsIO,
+        repair_min_id: Option<JobId>,
+    ) -> IOop {
         let mut out = job.work.clone();
         if self.dependencies_need_cleanup() {
             match &mut out {
@@ -882,6 +894,11 @@ impl DownstairsClient {
         self.state = DsState::Active;
     }
 
+    /// Attempts to enqueue the given job
+    ///
+    /// If the returned value includes `true`, the caller **must**
+    /// attempt to send the job (and should requeue it if that fails).
+    #[must_use]
     pub(crate) fn enqueue(
         &mut self,
         io: &mut DownstairsIO,
@@ -913,7 +930,6 @@ impl DownstairsClient {
                 // caller has provided it to us.
                 if io.work.send_io_live_repair(last_repair_extent) {
                     // Leave this IO as New, the downstairs will receive it.
-                    self.new_jobs.insert(io.ds_id);
                     IOState::New
                 } else {
                     // Move this IO to skipped, we are not ready for
@@ -923,15 +939,14 @@ impl DownstairsClient {
                     IOState::Skipped
                 }
             }
-            _ => {
-                self.new_jobs.insert(io.ds_id);
-                IOState::New
-            }
+            _ => IOState::New,
         };
+        // Update our counters and backpressure stats
         if r == IOState::New {
             self.bytes_outstanding += io.work.job_bytes();
         }
         self.io_state_count.incr(&r);
+
         r
     }
 

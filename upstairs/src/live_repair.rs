@@ -1184,7 +1184,7 @@ pub mod repair_test {
             for cid in ClientId::iter() {
                 assert_eq!(
                     job.state[cid],
-                    IOState::New,
+                    IOState::InProgress,
                     "bad state for {ids:?} {cid}"
                 );
             }
@@ -1217,7 +1217,7 @@ pub mod repair_test {
         for ids in [JobId(1004), JobId(1005), JobId(1006)] {
             let job = up.downstairs.ds_active.get(&ids).unwrap();
             for cid in ClientId::iter() {
-                assert_eq!(job.state[cid], IOState::New);
+                assert_eq!(job.state[cid], IOState::InProgress);
             }
         }
     }
@@ -1247,8 +1247,8 @@ pub mod repair_test {
         // Client 0 and 2 will send the jobs
         for ids in [JobId(1004), JobId(1005), JobId(1006)] {
             let job = up.downstairs.ds_active.get(&ids).unwrap();
-            assert_eq!(job.state[ClientId::new(0)], IOState::New);
-            assert_eq!(job.state[ClientId::new(2)], IOState::New);
+            assert_eq!(job.state[ClientId::new(0)], IOState::InProgress);
+            assert_eq!(job.state[ClientId::new(2)], IOState::InProgress);
         }
 
         // Client 1 will skip the jobs
@@ -1332,7 +1332,7 @@ pub mod repair_test {
         for ids in [JobId(1012), JobId(1013), JobId(1014)] {
             let job = up.downstairs.ds_active.get(&ids).unwrap();
             for cid in ClientId::iter() {
-                assert_eq!(job.state[cid], IOState::New);
+                assert_eq!(job.state[cid], IOState::InProgress);
             }
         }
     }
@@ -1388,7 +1388,7 @@ pub mod repair_test {
         // taken jobs 1008 -> 1011, so our new IO will start at 1012
         let job = up.downstairs.ds_active.get(&JobId(1012)).unwrap();
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(job.state[cid], IOState::InProgress);
         }
 
         // Verify that the future final repair job were added to our IOs
@@ -1449,7 +1449,7 @@ pub mod repair_test {
         // taken jobs 1008 -> 1011, so our new IO will start at 1012
         let job = up.downstairs.ds_active.get(&JobId(1012)).unwrap();
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(job.state[cid], IOState::InProgress);
         }
 
         // Verify that the future final repair job were added to our IOs
@@ -1515,7 +1515,7 @@ pub mod repair_test {
         // taken jobs 1004 -> 1011, so our new IO will start at 1012
         let job = up.downstairs.ds_active.get(&JobId(1012)).unwrap();
         for cid in ClientId::iter() {
-            assert_eq!(job.state[cid], IOState::New);
+            assert_eq!(job.state[cid], IOState::InProgress);
         }
 
         // Verify that the future final repair job were added to our IOs
