@@ -763,6 +763,7 @@ pub(crate) mod protocol_test {
                 match ds1_messages.try_recv() {
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {}
+                    Ok(_m) if i <= IO_OUTSTANDING_MAX_JOBS + 1 => {}
                     x => {
                         info!(
                             harness.log,
@@ -1805,7 +1806,9 @@ pub(crate) mod protocol_test {
         // downstairs 1, which should mark it as faulted and kick it out.
         const WRITE_SIZE: usize = 50 * 1024; // 50 KiB
         let write_buf = BytesMut::from(vec![1; WRITE_SIZE].as_slice()); // 50 KiB
-        let num_jobs = IO_OUTSTANDING_MAX_BYTES as usize / write_buf.len() + 10;
+        let expected_failure =
+            IO_OUTSTANDING_MAX_BYTES as usize / write_buf.len();
+        let num_jobs = expected_failure + 10;
         let mut job_ids = Vec::with_capacity(num_jobs);
         assert!(num_jobs < IO_OUTSTANDING_MAX_JOBS);
 
@@ -1837,16 +1840,14 @@ pub(crate) mod protocol_test {
                 match ds1_messages.try_recv() {
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {}
-                    x => {
+                    Ok(..) if i <= expected_failure + 1 => {}
+                    Ok(m) => {
                         info!(
                             harness.log,
-                            "Read {i} should return EMPTY, but we got:{:?}", x
+                            "Read {i} should return EMPTY, but we got:{m}"
                         );
 
-                        bail!(
-                            "Read {i} should return EMPTY, but we got:{:?}",
-                            x
-                        );
+                        bail!("Read {i} should return EMPTY, but we got:{m}");
                     }
                 }
             }
@@ -1976,6 +1977,7 @@ pub(crate) mod protocol_test {
                 match ds1_messages.try_recv() {
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {}
+                    Ok(_m) if i <= IO_OUTSTANDING_MAX_JOBS + 1 => {}
                     x => {
                         info!(
                             harness.log,
@@ -2690,6 +2692,7 @@ pub(crate) mod protocol_test {
                 match ds1_messages.try_recv() {
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {}
+                    Ok(_m) if i <= IO_OUTSTANDING_MAX_JOBS + 1 => {}
                     x => {
                         info!(
                             harness.log,
