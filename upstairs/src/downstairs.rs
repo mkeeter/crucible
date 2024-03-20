@@ -2327,10 +2327,6 @@ impl Downstairs {
                 skipped += 1;
             } else {
                 assert_eq!(job_state, IOState::New);
-                println!(
-                    "client state for {cid} is {:?}",
-                    self.clients[cid].state()
-                );
                 if matches!(
                     self.clients[cid].state(),
                     DsState::Active | DsState::LiveRepair
@@ -2343,7 +2339,6 @@ impl Downstairs {
                 }
             }
         }
-        println!("got {send_immediately:?} for {io:?}");
 
         // If this is a write (which will be fast-acked), increment our byte
         // counter for backpressure calculations.
@@ -8258,7 +8253,6 @@ pub(crate) mod test {
 
         let job = ds.ds_active.get(&repair_ids.repair_id).unwrap();
 
-        println!("Job is {:?}", job);
         match &job.work {
             IOop::ExtentLiveRepair {
                 dependencies,
