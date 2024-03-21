@@ -566,7 +566,7 @@ async fn is_message_valid(
 async fn do_work_task(
     ads: &Mutex<Downstairs>,
     upstairs_connection: UpstairsConnection,
-    mut job_channel_rx: mpsc::Receiver<()>,
+    mut job_channel_rx: mpsc::Receiver<NewWork>,
     resp_tx: mpsc::Sender<Message>,
 ) -> Result<()> {
     // The lossy attribute currently does not change at runtime. To avoid
@@ -579,15 +579,21 @@ async fn do_work_task(
     /*
      * job_channel_rx is a notification that we should look for new work.
      */
-    while job_channel_rx.recv().await.is_some() {
+    while let Some(work) = job_channel_rx.recv().await {
         // Add a little time to completion for this operation.
         if is_lossy && random() && random() {
             info!(ads.lock().await.log, "[lossy] sleeping 1 second");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        Downstairs::do_work_for(ads, upstairs_connection, &resp_tx, &stats)
-            .await?;
+        Downstairs::do_new_work(
+            ads,
+            upstairs_connection,
+            work,
+            &resp_tx,
+            &stats,
+        )
+        .await?;
     }
 
     // None means the channel is closed
@@ -624,6 +630,13 @@ pub struct UpstairsConnection {
     upstairs_id: Uuid,
     session_id: Uuid,
     gen: u64,
+}
+
+/// New work to be passed into the Downstairs
+#[derive(Debug)]
+struct NewWork {
+    ds_id: JobId,
+    io: IOop,
 }
 
 /*
@@ -1188,6 +1201,7 @@ where
         let adc = ads.clone();
         let tx = job_channel_tx.clone();
         let resp_channel_tx = resp_channel_tx.clone();
+        let log = log.clone();
         tokio::spawn(async move {
             while let Some(m) = message_channel_rx.recv().await {
                 match Downstairs::proc_frame(
@@ -1195,13 +1209,14 @@ where
                     upstairs_connection,
                     m,
                     &resp_channel_tx,
+                    &log,
                 )
                 .await
                 {
                     // If we added work, tell the work task to get busy.
-                    Ok(Some(new_ds_id)) => {
-                        cdt::work__start!(|| new_ds_id.0);
-                        tx.send(()).await?;
+                    Ok(Some(new_work)) => {
+                        cdt::work__start!(|| new_work.ds_id.0);
+                        tx.send(new_work).await?;
                     }
                     // If we handled the job locally, nothing to do here
                     Ok(None) => (),
@@ -2332,7 +2347,8 @@ impl Downstairs {
         upstairs_connection: UpstairsConnection,
         m: Message,
         resp_tx: &mpsc::Sender<Message>,
-    ) -> Result<Option<JobId>> {
+        log: &Logger,
+    ) -> Result<Option<NewWork>> {
         // Initial check against upstairs and session ID
         match m {
             Message::Write {
@@ -2411,10 +2427,10 @@ impl Downstairs {
                     dependencies: header.dependencies,
                     writes,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, header.job_id, new_write)?;
-                Some(header.job_id)
+                Some(NewWork {
+                    ds_id: header.job_id,
+                    io: new_write,
+                })
             }
             Message::Flush {
                 job_id,
@@ -2434,10 +2450,10 @@ impl Downstairs {
                     snapshot_details,
                     extent_limit,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_flush)?;
-                Some(job_id)
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: new_flush,
+                })
             }
             Message::WriteUnwritten { header, data } => {
                 cdt::submit__writeunwritten__start!(|| header.job_id.0);
@@ -2447,10 +2463,10 @@ impl Downstairs {
                     dependencies: header.dependencies,
                     writes,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, header.job_id, new_write)?;
-                Some(header.job_id)
+                Some(NewWork {
+                    ds_id: header.job_id,
+                    io: new_write,
+                })
             }
             Message::ReadRequest {
                 job_id,
@@ -2464,10 +2480,10 @@ impl Downstairs {
                     dependencies,
                     requests,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_read)?;
-                Some(job_id)
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: new_read,
+                })
             }
             // These are for repair while taking live IO
             Message::ExtentLiveClose {
@@ -2482,10 +2498,10 @@ impl Downstairs {
                     dependencies,
                     extent: extent_id,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, ext_close)?;
-                Some(job_id)
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: ext_close,
+                })
             }
             Message::ExtentLiveFlushClose {
                 job_id,
@@ -2503,10 +2519,10 @@ impl Downstairs {
                     flush_number,
                     gen_number,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_flush)?;
-                Some(job_id)
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: new_flush,
+                })
             }
             Message::ExtentLiveRepair {
                 job_id,
@@ -2523,11 +2539,11 @@ impl Downstairs {
 
                     source_repair_address,
                 };
-
-                let mut d = ad.lock().await;
-                debug!(d.log, "Received ExtentLiveRepair {}", job_id);
-                d.add_work(upstairs_connection, job_id, new_repair)?;
-                Some(job_id)
+                debug!(log, "Received ExtentLiveRepair {}", job_id);
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: new_repair,
+                })
             }
             Message::ExtentLiveReopen {
                 job_id,
@@ -2540,10 +2556,10 @@ impl Downstairs {
                     dependencies,
                     extent: extent_id,
                 };
-
-                let mut d = ad.lock().await;
-                d.add_work(upstairs_connection, job_id, new_open)?;
-                Some(job_id)
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: new_open,
+                })
             }
             Message::ExtentLiveNoOp {
                 job_id,
@@ -2551,12 +2567,12 @@ impl Downstairs {
                 ..
             } => {
                 cdt::submit__el__noop__start!(|| job_id.0);
-                let new_open = IOop::ExtentLiveNoOp { dependencies };
-
-                let mut d = ad.lock().await;
-                debug!(d.log, "Received NoOP {}", job_id);
-                d.add_work(upstairs_connection, job_id, new_open)?;
-                Some(job_id)
+                let new_noop = IOop::ExtentLiveNoOp { dependencies };
+                debug!(log, "Received NoOP {}", job_id);
+                Some(NewWork {
+                    ds_id: job_id,
+                    io: new_noop,
+                })
             }
 
             // These messages arrive during initial reconciliation.
@@ -2676,13 +2692,18 @@ impl Downstairs {
         Ok(r)
     }
 
-    async fn do_work_for(
+    async fn do_new_work(
         ads: &Mutex<Downstairs>,
         upstairs_connection: UpstairsConnection,
+        work: NewWork,
         resp_tx: &mpsc::Sender<Message>,
         stats: &DsStatOuter,
     ) -> Result<()> {
-        let ds = ads.lock().await;
+        let mut ds = ads.lock().await;
+
+        // Add this new work
+        ds.add_work(upstairs_connection, work.ds_id, work.io)?;
+
         if !ds.is_active(upstairs_connection) {
             // We are not an active downstairs, wait until we are
             return Ok(());
