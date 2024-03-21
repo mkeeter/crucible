@@ -571,9 +571,10 @@ async fn do_work_task(
 ) -> Result<()> {
     // The lossy attribute currently does not change at runtime. To avoid
     // continually locking the downstairs, cache the result here.
-    let ds = ads.lock().await;
-    let is_lossy = ds.lossy;
-    let stats = ds.dss.clone();
+    let (is_lossy, stats) = {
+        let ds = ads.lock().await;
+        (ds.lossy, ds.dss.clone())
+    };
 
     /*
      * job_channel_rx is a notification that we should look for new work.
