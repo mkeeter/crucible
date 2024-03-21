@@ -571,7 +571,9 @@ async fn do_work_task(
 ) -> Result<()> {
     // The lossy attribute currently does not change at runtime. To avoid
     // continually locking the downstairs, cache the result here.
-    let is_lossy = ads.lock().await.lossy;
+    let ds = ads.lock().await;
+    let is_lossy = ds.lossy;
+    let stats = ds.dss.clone();
 
     /*
      * job_channel_rx is a notification that we should look for new work.
@@ -583,7 +585,8 @@ async fn do_work_task(
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        Downstairs::do_work_for(ads, upstairs_connection, &resp_tx).await?;
+        Downstairs::do_work_for(ads, upstairs_connection, &resp_tx, &stats)
+            .await?;
     }
 
     // None means the channel is closed
@@ -1984,28 +1987,28 @@ impl Downstairs {
      * Oximeter counter for the operation.
      */
     fn complete_work_stat(
-        &mut self,
         _upstairs_connection: UpstairsConnection,
         m: &Message,
         ds_id: JobId,
+        dss: &DsStatOuter,
     ) -> Result<()> {
         // XXX dss per upstairs connection?
         match m {
             Message::FlushAck { .. } => {
                 cdt::submit__flush__done!(|| ds_id.0);
-                self.dss.add_flush();
+                dss.add_flush();
             }
             Message::WriteAck { .. } => {
                 cdt::submit__write__done!(|| ds_id.0);
-                self.dss.add_write();
+                dss.add_write();
             }
             Message::WriteUnwrittenAck { .. } => {
                 cdt::submit__writeunwritten__done!(|| ds_id.0);
-                self.dss.add_write();
+                dss.add_write();
             }
             Message::ReadResponse { .. } => {
                 cdt::submit__read__done!(|| ds_id.0);
-                self.dss.add_read();
+                dss.add_read();
             }
             Message::ExtentLiveClose { .. } => {
                 cdt::submit__el__close__done!(|| ds_id.0);
@@ -2676,6 +2679,7 @@ impl Downstairs {
         ads: &Mutex<Downstairs>,
         upstairs_connection: UpstairsConnection,
         resp_tx: &mpsc::Sender<Message>,
+        stats: &DsStatOuter,
     ) -> Result<()> {
         let ds = ads.lock().await;
         if !ds.is_active(upstairs_connection) {
@@ -2771,10 +2775,11 @@ impl Downstairs {
                 // The job completed successfully, so inform the
                 // Upstairs
 
-                ads.lock().await.complete_work_stat(
+                Self::complete_work_stat(
                     upstairs_connection,
                     &m,
                     job_id,
+                    stats,
                 )?;
 
                 // Notify the upstairs before completing work, which
@@ -3290,7 +3295,7 @@ pub async fn start_downstairs(
                  * Add one to the counter every time we have a connection
                  * from an upstairs
                  */
-                let mut ds = d.lock().await;
+                let ds = d.lock().await;
                 ds.dss.add_connection();
             }
 

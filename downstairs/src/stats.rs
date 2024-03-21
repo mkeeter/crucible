@@ -79,22 +79,22 @@ impl DsStatOuter {
      * one of these methods will be called.  Each method will get the
      * correct field of DsCountStat to record the update.
      */
-    pub fn add_connection(&mut self) {
+    pub fn add_connection(&self) {
         let mut dss = self.ds_stat_wrap.lock().unwrap();
         let datum = dss.up_connect_count.datum_mut();
         *datum += 1;
     }
-    pub fn add_write(&mut self) {
+    pub fn add_write(&self) {
         let mut dss = self.ds_stat_wrap.lock().unwrap();
         let datum = dss.write_count.datum_mut();
         *datum += 1;
     }
-    pub fn add_read(&mut self) {
+    pub fn add_read(&self) {
         let mut dss = self.ds_stat_wrap.lock().unwrap();
         let datum = dss.read_count.datum_mut();
         *datum += 1;
     }
-    pub fn add_flush(&mut self) {
+    pub fn add_flush(&self) {
         let mut dss = self.ds_stat_wrap.lock().unwrap();
         let datum = dss.flush_count.datum_mut();
         *datum += 1;
