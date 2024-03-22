@@ -203,7 +203,7 @@ impl Region {
         options: RegionOptions,
         log: Logger,
     ) -> Result<Region> {
-        Self::create_with_backend(dir, options, Backend::RawFile, log).await
+        Self::create_with_backend(dir, options, Backend::RawFileV2, log).await
     }
 
     pub async fn create_with_backend<P: AsRef<Path>>(
@@ -259,7 +259,7 @@ impl Region {
             options,
             verbose,
             read_only,
-            Backend::RawFile,
+            Backend::RawFileV2,
             log,
         )
         .await
@@ -467,7 +467,7 @@ impl Region {
             &self.def,
             eid as u32,
             self.read_only,
-            Backend::RawFile,
+            Backend::RawFileV2,
             &self.log,
         )?;
 
@@ -1337,14 +1337,18 @@ pub(crate) mod test {
         region_options
     }
 
-    #[tokio::test]
-    async fn region_create_drop_open() -> Result<()> {
+    async fn region_create_drop_open(backend: Backend) -> Result<()> {
         // Create a region, make three extents.
         // Drop the region, then open it.
         let dir = tempdir()?;
         let log = csl();
-        let mut region =
-            Region::create(&dir, new_region_options(), log.clone()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            log.clone(),
+        )
+        .await?;
         region.extend(3).await?;
 
         drop(region);
@@ -1353,6 +1357,16 @@ pub(crate) mod test {
             Region::open(&dir, new_region_options(), true, false, &log).await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn region_create_drop_open_raw() -> Result<()> {
+        region_create_drop_open(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn region_create_drop_open_raw_v2() -> Result<()> {
+        region_create_drop_open(Backend::RawFileV2).await
     }
 
     #[tokio::test]
@@ -1439,14 +1453,18 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn copy_extent_dir() -> Result<()> {
+    async fn copy_extent_dir(backend: Backend) -> Result<()> {
         // Create the region, make three extents
         // Create the copy directory, make sure it exists.
         // Remove the copy directory, make sure it goes away.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         let cp = copy_dir(&dir, 1);
@@ -1459,14 +1477,28 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn copy_extent_dir_twice() -> Result<()> {
+    async fn copy_extent_dir_raw() -> Result<()> {
+        copy_extent_dir(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn copy_extent_dir_raw_v2() -> Result<()> {
+        copy_extent_dir(Backend::RawFileV2).await
+    }
+
+    async fn copy_extent_dir_twice(backend: Backend) -> Result<()> {
         // Create the region, make three extents
         // Create the copy directory, make sure it exists.
         // Verify a second create will fail.
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(3).await.unwrap();
 
         Region::create_copy_dir(&dir, 1).unwrap();
@@ -1476,11 +1508,25 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn close_extent() -> Result<()> {
+    async fn copy_extent_dir_twice_raw() -> Result<()> {
+        copy_extent_dir_twice(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn copy_extent_dir_twice_raw_v2() -> Result<()> {
+        copy_extent_dir_twice(Backend::RawFileV2).await
+    }
+
+    async fn close_extent(backend: Backend) -> Result<()> {
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         // Close extent 1
@@ -1511,13 +1557,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn reopen_extent_cleanup_one() -> Result<()> {
+    async fn close_extent_raw() -> Result<()> {
+        close_extent(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn close_extent_raw_v2() -> Result<()> {
+        close_extent(Backend::RawFileV2).await
+    }
+
+    async fn reopen_extent_cleanup_one(backend: Backend) -> Result<()> {
         // Verify the copy directory is removed if an extent is
         // opened with that directory present.
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         // Close extent 1
@@ -1543,13 +1603,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn reopen_extent_cleanup_two() -> Result<()> {
+    async fn reopen_extent_cleanup_one_raw() -> Result<()> {
+        reopen_extent_cleanup_one(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_cleanup_one_raw_v2() -> Result<()> {
+        reopen_extent_cleanup_one(Backend::RawFileV2).await
+    }
+
+    async fn reopen_extent_cleanup_two(backend: Backend) -> Result<()> {
         // Verify that the completed directory is removed if present
         // when an extent is re-opened.
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         // Close extent 1
@@ -1582,14 +1656,28 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn reopen_extent_cleanup_replay() -> Result<()> {
+    async fn reopen_extent_cleanup_two_raw() -> Result<()> {
+        reopen_extent_cleanup_two(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_cleanup_two_raw_v2() -> Result<()> {
+        reopen_extent_cleanup_two(Backend::RawFileV2).await
+    }
+
+    async fn reopen_extent_cleanup_replay(backend: Backend) -> Result<()> {
         // Verify on extent open that a replacement directory will
         // have it's contents replace an extents existing data and
         // metadata files.
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         // Close extent 1
@@ -1629,6 +1717,16 @@ pub(crate) mod test {
         assert!(!Path::new(&cd).exists());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_cleanup_replay_raw() -> Result<()> {
+        reopen_extent_cleanup_replay(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_cleanup_replay_raw_v2() -> Result<()> {
+        reopen_extent_cleanup_replay(Backend::RawFileV2).await
     }
 
     #[tokio::test]
@@ -1698,16 +1796,22 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn reopen_extent_cleanup_replay_short() -> Result<()> {
+    async fn reopen_extent_cleanup_replay_short(
+        backend: Backend,
+    ) -> Result<()> {
         // test move_replacement_extent(), create a copy dir, populate it
         // and let the reopen do the work.  This time we make sure our
         // copy dir only has the extent data file.
 
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         // Close extent 1
@@ -1749,6 +1853,16 @@ pub(crate) mod test {
         assert!(!Path::new(&cd).exists());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_cleanup_replay_short_raw() -> Result<()> {
+        reopen_extent_cleanup_replay_short(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_cleanup_replay_short_raw_v2() -> Result<()> {
+        reopen_extent_cleanup_replay_short(Backend::RawFileV2).await
     }
 
     #[tokio::test]
@@ -1889,8 +2003,7 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn reopen_extent_no_replay_readonly() -> Result<()> {
+    async fn reopen_extent_no_replay_readonly(backend: Backend) -> Result<()> {
         // Verify on a read-only region a replacement directory will
         // be ignored.  This is required by the dump command, as it would
         // be tragic if the command to inspect a region changed that
@@ -1898,8 +2011,13 @@ pub(crate) mod test {
 
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         // Make copy directory for this extent
@@ -1932,6 +2050,16 @@ pub(crate) mod test {
         assert!(Path::new(&rd).exists());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_no_replay_readonly_raw() -> Result<()> {
+        reopen_extent_no_replay_readonly(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn reopen_extent_no_replay_readonly_raw_v2() -> Result<()> {
+        reopen_extent_no_replay_readonly(Backend::RawFileV2).await
     }
 
     #[tokio::test]
@@ -2259,12 +2387,16 @@ pub(crate) mod test {
         assert!(!validate_clone_files(1, &good_files));
     }
 
-    #[tokio::test]
-    async fn reopen_all_extents() -> Result<()> {
+    async fn reopen_all_extents(backend: Backend) -> Result<()> {
         // Create the region, make three extents
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(5).await?;
 
         // Close extent 1
@@ -2294,19 +2426,59 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn new_region() -> Result<()> {
+    async fn reopen_all_extents_raw() -> Result<()> {
+        reopen_all_extents(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn reopen_all_extents_raw_v2() -> Result<()> {
+        reopen_all_extents(Backend::RawFileV2).await
+    }
+
+    async fn new_region(backend: Backend) -> Result<()> {
         let dir = tempdir()?;
-        let _ = Region::create(&dir, new_region_options(), csl()).await;
+        let _ = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await;
         Ok(())
     }
 
     #[tokio::test]
-    async fn new_existing_region() -> Result<()> {
+    async fn new_region_raw() -> Result<()> {
+        new_region(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn new_region_raw_v2() -> Result<()> {
+        new_region(Backend::RawFileV2).await
+    }
+
+    async fn new_existing_region(backend: Backend) -> Result<()> {
         let dir = tempdir()?;
-        let _ = Region::create(&dir, new_region_options(), csl()).await;
+        let _ = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await;
         let _ = Region::open(&dir, new_region_options(), false, false, &csl())
             .await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_existing_region_raw() -> Result<()> {
+        new_existing_region(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn new_existing_region_raw_v2() -> Result<()> {
+        new_existing_region(Backend::RawFileV2).await
     }
 
     #[tokio::test]
@@ -2331,15 +2503,19 @@ pub(crate) mod test {
         );
     }
 
-    #[tokio::test]
-    async fn dump_a_region() -> Result<()> {
+    async fn dump_a_region(backend: Backend) -> Result<()> {
         /*
          * Create a region, give it actual size
          */
         let dir = tempdir()?;
-        let mut r1 = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut r1 = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         r1.extend(2).await?;
 
         /*
@@ -2356,7 +2532,16 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn dump_two_region() -> Result<()> {
+    async fn dump_a_region_raw() -> Result<()> {
+        dump_a_region(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn dump_a_region_raw_v2() -> Result<()> {
+        dump_a_region(Backend::RawFileV2).await
+    }
+
+    async fn dump_two_region(backend: Backend) -> Result<()> {
         /*
          * Create our temp dirs
          */
@@ -2365,12 +2550,22 @@ pub(crate) mod test {
         /*
          * Create the regions, give them some actual size
          */
-        let mut r1 = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
-        let mut r2 = Region::create(&dir2, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut r1 = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
+        let mut r2 = Region::create_with_backend(
+            &dir2,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         r1.extend(2).await?;
         r2.extend(2).await?;
 
@@ -2392,7 +2587,16 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn dump_extent() -> Result<()> {
+    async fn dump_two_region_raw() -> Result<()> {
+        dump_two_region(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn dump_two_region_raw_v2() -> Result<()> {
+        dump_two_region(Backend::RawFileV2).await
+    }
+
+    async fn dump_extent(backend: Backend) -> Result<()> {
         /*
          * Create our temp dirs
          */
@@ -2402,13 +2606,23 @@ pub(crate) mod test {
         /*
          * Create the regions, give them some actual size
          */
-        let mut r1 = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut r1 = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         r1.extend(3).await?;
-        let mut r2 = Region::create(&dir2, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut r2 = Region::create_with_backend(
+            &dir2,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         r2.extend(3).await?;
 
         /*
@@ -2429,10 +2643,24 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_big_write() -> Result<()> {
+    async fn dump_extent_raw() -> Result<()> {
+        dump_extent(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn dump_extent_raw_v2() -> Result<()> {
+        dump_extent(Backend::RawFileV2).await
+    }
+
+    async fn test_big_write(backend: Backend) -> Result<()> {
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         let ddef = region.def();
@@ -2474,14 +2702,14 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
 
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            for i in 0..ddef.extent_size().value as usize {
+                read_from_files
+                    .extend(&data[i * (512 + backend.block_offset())..][..512]);
+            }
         }
 
         assert_eq!(buffer.len(), read_from_files.len());
@@ -2506,6 +2734,16 @@ pub(crate) mod test {
         assert_eq!(buffer, responses.data);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_big_write_raw() -> Result<()> {
+        test_big_write(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_big_write_raw_v2() -> Result<()> {
+        test_big_write(Backend::RawFileV2).await
     }
 
     #[tokio::test]
@@ -2620,11 +2858,15 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_ok_hash_ok() -> Result<()> {
+    async fn test_ok_hash_ok(backend: Backend) -> Result<()> {
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(1).await?;
 
         let data = BytesMut::from(&[1u8; 512][..]);
@@ -2654,12 +2896,26 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_when_empty() -> Result<()> {
+    async fn test_ok_hash_ok_raw() -> Result<()> {
+        test_ok_hash_ok(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_ok_hash_ok_raw_v2() -> Result<()> {
+        test_ok_hash_ok(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_when_empty(backend: Backend) -> Result<()> {
         // Verify that a read fill does write to a block when there is
         // no data written yet.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(1).await?;
 
         // Fill a buffer with "9"'s (random)
@@ -2708,12 +2964,26 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_when_written() -> Result<()> {
+    async fn test_write_unwritten_when_empty_raw() -> Result<()> {
+        test_write_unwritten_when_empty(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_when_empty_raw_v2() -> Result<()> {
+        test_write_unwritten_when_empty(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_when_written(backend: Backend) -> Result<()> {
         // Verify that a read fill does not write to the block when
         // there is data written already.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(1).await?;
 
         // Fill a buffer with "9"'s (random)
@@ -2785,13 +3055,29 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_when_written_flush() -> Result<()> {
+    async fn test_write_unwritten_when_written_raw() -> Result<()> {
+        test_write_unwritten_when_written(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_when_written_raw_v2() -> Result<()> {
+        test_write_unwritten_when_written(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_when_written_flush(
+        backend: Backend,
+    ) -> Result<()> {
         // Verify that a read fill does not write to the block when
         // there is data written already.  This time run a flush after the
         // first write.  Verify correct state of dirty bit as well.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(1).await?;
 
         // Fill a buffer with "9"'s
@@ -2878,12 +3164,26 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_big_write() -> Result<()> {
+    async fn test_write_unwritten_when_written_flush_raw() -> Result<()> {
+        test_write_unwritten_when_written_flush(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_when_written_flush_raw_v2() -> Result<()> {
+        test_write_unwritten_when_written_flush(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_big_write(backend: Backend) -> Result<()> {
         // Do a multi block write where all blocks start new (unwritten)
         // Verify only empty blocks have data.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         let ddef = region.def();
@@ -2924,14 +3224,14 @@ pub(crate) mod test {
 
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            for i in 0..ddef.extent_size().value as usize {
+                read_from_files
+                    .extend(&data[i * (512 + backend.block_offset())..][..512]);
+            }
         }
 
         assert_eq!(buffer, read_from_files);
@@ -2956,13 +3256,29 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_big_write_partial_0() -> Result<()> {
+    async fn test_write_unwritten_big_write_raw() -> Result<()> {
+        test_write_unwritten_big_write(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_big_write_raw_v2() -> Result<()> {
+        test_write_unwritten_big_write(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_big_write_partial_0(
+        backend: Backend,
+    ) -> Result<()> {
         // Do a write to block zero, then do a multi block write with
         // only_write_unwritten set. Verify block zero is the first write, and
         // the remaining blocks have the contents from the multi block fill.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         let ddef = region.def();
@@ -3039,13 +3355,14 @@ pub(crate) mod test {
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
 
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            for i in 0..ddef.extent_size().value as usize {
+                read_from_files
+                    .extend(&data[i * (512 + backend.block_offset())..][..512]);
+            }
         }
 
         assert_eq!(buffer, read_from_files);
@@ -3070,14 +3387,30 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_big_write_partial_1() -> Result<()> {
+    async fn test_write_unwritten_big_write_partial_0_raw() -> Result<()> {
+        test_write_unwritten_big_write_partial_0(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_big_write_partial_0_raw_v2() -> Result<()> {
+        test_write_unwritten_big_write_partial_0(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_big_write_partial_1(
+        backend: Backend,
+    ) -> Result<()> {
         // Write to the second block, then do a multi block fill.
         // Verify the second block has the original data we wrote, and all
         // the other blocks have the data from the multi block fill.
 
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(3).await?;
 
         let ddef = region.def();
@@ -3153,14 +3486,14 @@ pub(crate) mod test {
 
         // read data into File, compare what was written to buffer
         let mut read_from_files: Vec<u8> = Vec::with_capacity(total_size);
-
-        let extent_data_size =
-            (ddef.extent_size().value * ddef.block_size()) as usize;
         for i in 0..ddef.extent_count() {
             let path = extent_path(&dir, i);
             let data = std::fs::read(path).expect("Unable to read file");
 
-            read_from_files.extend(&data[..extent_data_size]);
+            for i in 0..ddef.extent_size().value as usize {
+                read_from_files
+                    .extend(&data[i * (512 + backend.block_offset())..][..512]);
+            }
         }
 
         assert_eq!(buffer, read_from_files);
@@ -3185,7 +3518,18 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_big_write_partial_final() -> Result<()> {
+    async fn test_write_unwritten_big_write_partial_1_raw() -> Result<()> {
+        test_write_unwritten_big_write_partial_1(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_big_write_partial_1_raw_v2() -> Result<()> {
+        test_write_unwritten_big_write_partial_1(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_big_write_partial_final(
+        backend: Backend,
+    ) -> Result<()> {
         // Do a write to the fourth block, then do a multi block read fill
         // where the last block of the read fill is what we wrote to in
         // our first write.
@@ -3193,8 +3537,13 @@ pub(crate) mod test {
         // three blocks have the data from the multi block read fill.
 
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(5).await?;
 
         let ddef = region.def();
@@ -3291,12 +3640,29 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_big_write_partial_sparse() -> Result<()> {
+    async fn test_write_unwritten_big_write_partial_final_raw() -> Result<()> {
+        test_write_unwritten_big_write_partial_final(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_big_write_partial_final_raw_v2() -> Result<()>
+    {
+        test_write_unwritten_big_write_partial_final(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_big_write_partial_sparse(
+        backend: Backend,
+    ) -> Result<()> {
         // Do a multi block write_unwritten where a few different blocks have
         // data. Verify only unwritten blocks get the data.
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(4).await?;
 
         let ddef = region.def();
@@ -3397,6 +3763,17 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_write_unwritten_big_write_partial_sparse_raw() -> Result<()> {
+        test_write_unwritten_big_write_partial_sparse(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_big_write_partial_sparse_raw_v2() -> Result<()>
+    {
+        test_write_unwritten_big_write_partial_sparse(Backend::RawFileV2).await
+    }
+
     // A test function to return a generic'ish write command.
     // We use the "all 9's data" and checksum.
     fn create_generic_write(
@@ -3425,13 +3802,17 @@ pub(crate) mod test {
         writes
     }
 
-    #[tokio::test]
-    async fn test_flush_extent_limit_base() {
+    async fn test_flush_extent_limit_base(backend: Backend) {
         // Check that the extent_limit value in region_flush is honored
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(2).await.unwrap();
 
         // Write to extent 0 block 0 first
@@ -3460,13 +3841,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_flush_extent_limit_end() {
+    async fn test_flush_extent_limit_base_raw() {
+        test_flush_extent_limit_base(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_flush_extent_limit_base_raw_v2() {
+        test_flush_extent_limit_base(Backend::RawFileV2).await
+    }
+
+    async fn test_flush_extent_limit_end(backend: Backend) {
         // Check that the extent_limit value in region_flush is honored
         // Write to the last block in the extents.
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(3).await.unwrap();
 
         // Write to extent 1 block 9 first
@@ -3503,13 +3898,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_flush_extent_limit_walk_it_off() {
+    async fn test_flush_extent_limit_end_raw() {
+        test_flush_extent_limit_end(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_flush_extent_limit_end_raw_v2() {
+        test_flush_extent_limit_end(Backend::RawFileV2).await
+    }
+
+    async fn test_flush_extent_limit_walk_it_off(backend: Backend) {
         // Check that the extent_limit value in region_flush is honored
         // Write to all the extents, then flush them one at a time.
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(10).await.unwrap();
 
         // Write to extents 0 to 9
@@ -3550,13 +3959,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_flush_extent_limit_too_large() {
+    async fn test_flush_extent_limit_walk_it_off_raw() {
+        test_flush_extent_limit_walk_it_off(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_flush_extent_limit_walk_it_off_raw_v2() {
+        test_flush_extent_limit_walk_it_off(Backend::RawFileV2).await
+    }
+
+    async fn test_flush_extent_limit_too_large(backend: Backend) {
         // Check that the extent_limit value in region_flush will return
         // an error if the extent_limit is too large.
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(1).await.unwrap();
 
         // Call flush with an invalid extent
@@ -3567,13 +3990,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_extent_write_flush_close() {
+    async fn test_flush_extent_limit_too_large_raw() {
+        test_flush_extent_limit_too_large(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_flush_extent_limit_too_large_raw_v2() {
+        test_flush_extent_limit_too_large(Backend::RawFileV2).await
+    }
+
+    async fn test_extent_write_flush_close(backend: Backend) {
         // Verify that a write then close of an extent will return the
         // expected gen flush and dirty bits for that extent.
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(1).await.unwrap();
 
         // Fill a buffer with "9"'s
@@ -3621,13 +4058,27 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_extent_close_reopen_flush_close() {
+    async fn test_extent_write_flush_close_raw() {
+        test_extent_write_flush_close(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_extent_write_flush_close_raw_v2() {
+        test_extent_write_flush_close(Backend::RawFileV2).await
+    }
+
+    async fn test_extent_close_reopen_flush_close(backend: Backend) {
         // Do several extent open close operations, verifying that the
         // gen/flush/dirty return values are as expected.
         let dir = tempdir().unwrap();
-        let mut region = Region::create(&dir, new_region_options(), csl())
-            .await
-            .unwrap();
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await
+        .unwrap();
         region.extend(1).await.unwrap();
 
         // Fill a buffer with "9"'s
@@ -3698,15 +4149,28 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_extent_close_reopen_flush_close_raw() {
+        test_extent_close_reopen_flush_close(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_extent_close_reopen_flush_close_raw_v2() {
+        test_extent_close_reopen_flush_close(Backend::RawFileV2).await
+    }
+
     /// We need to make sure that a flush will properly adjust the DB hashes
     /// after issuing multiple writes to different disconnected sections of
     /// an extent
-    async fn test_flush_after_multiple_disjoint_writes() -> Result<()> {
+    async fn test_flush_after_multiple_disjoint_writes(
+        backend: Backend,
+    ) -> Result<()> {
         let dir = tempdir()?;
         let mut region_opts = new_region_options();
         region_opts.set_extent_size(Block::new_512(1024));
         let mut region =
-            Region::create(&dir, region_opts, csl()).await.unwrap();
+            Region::create_with_backend(&dir, region_opts, backend, csl())
+                .await
+                .unwrap();
         region.extend(1).await.unwrap();
 
         // Write some data to 3 different areas
@@ -3798,16 +4262,29 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_flush_after_multiple_disjoint_writes_raw() -> Result<()> {
+        test_flush_after_multiple_disjoint_writes(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_flush_after_multiple_disjoint_writes_raw_v2() -> Result<()> {
+        test_flush_after_multiple_disjoint_writes(Backend::RawFileV2).await
+    }
+
     /// This test ensures that our flush logic works even for full-extent
     /// flushes. That's the case where the set of modified blocks will be full.
-    async fn test_big_extent_full_write_and_flush() -> Result<()> {
+    async fn test_big_extent_full_write_and_flush(
+        backend: Backend,
+    ) -> Result<()> {
         let dir = tempdir()?;
 
         const EXTENT_SIZE: u64 = 4096;
         let mut region_opts = new_region_options();
         region_opts.set_extent_size(Block::new_512(EXTENT_SIZE));
         let mut region =
-            Region::create(&dir, region_opts, csl()).await.unwrap();
+            Region::create_with_backend(&dir, region_opts, backend, csl())
+                .await
+                .unwrap();
         region.extend(1).await.unwrap();
 
         // writing the entire region a few times over before the flush.
@@ -3883,10 +4360,24 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_bad_hash_bad() -> Result<()> {
+    async fn test_big_extent_full_write_and_flush_raw() -> Result<()> {
+        test_big_extent_full_write_and_flush(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_big_extent_full_write_and_flush_raw_v2() -> Result<()> {
+        test_big_extent_full_write_and_flush(Backend::RawFileV2).await
+    }
+
+    async fn test_bad_hash_bad(backend: Backend) -> Result<()> {
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(1).await?;
 
         let data = BytesMut::from(&[1u8; 512][..]);
@@ -3927,10 +4418,24 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_blank_block_read_ok() -> Result<()> {
+    async fn test_bad_hash_bad_raw() -> Result<()> {
+        test_bad_hash_bad(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_bad_hash_bad_raw_v2() -> Result<()> {
+        test_bad_hash_bad(Backend::RawFileV2).await
+    }
+
+    async fn test_blank_block_read_ok(backend: Backend) -> Result<()> {
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
         region.extend(1).await?;
 
         let responses = region
@@ -3950,11 +4455,27 @@ pub(crate) mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_blank_block_read_ok_raw() -> Result<()> {
+        test_blank_block_read_ok(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_blank_block_read_ok_raw_v2() -> Result<()> {
+        test_blank_block_read_ok(Backend::RawFileV2).await
+    }
+
     async fn prepare_random_region(
+        backend: Backend,
     ) -> Result<(tempfile::TempDir, Region, Vec<u8>)> {
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
 
         // Create 3 extents, each size 10 blocks
         assert_eq!(region.def().extent_size().value, 10);
@@ -3998,9 +4519,8 @@ pub(crate) mod test {
         Ok((dir, region, buffer))
     }
 
-    #[tokio::test]
-    async fn test_read_single_large_contiguous() -> Result<()> {
-        let (_dir, mut region, data) = prepare_random_region().await?;
+    async fn test_read_single_large_contiguous(backend: Backend) -> Result<()> {
+        let (_dir, mut region, data) = prepare_random_region(backend).await?;
 
         // Call region_read with a single large contiguous range
         let requests: Vec<crucible_protocol::ReadRequest> = (1..8)
@@ -4019,8 +4539,19 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_read_single_large_contiguous_span_extents() -> Result<()> {
-        let (_dir, mut region, data) = prepare_random_region().await?;
+    async fn test_read_single_large_contiguous_raw() -> Result<()> {
+        test_read_single_large_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_read_single_large_contiguous_raw_v2() -> Result<()> {
+        test_read_single_large_contiguous(Backend::RawFileV2).await
+    }
+
+    async fn test_read_single_large_contiguous_span_extents(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, data) = prepare_random_region(backend).await?;
 
         // Call region_read with a single large contiguous range that spans
         // multiple extents
@@ -4040,8 +4571,21 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_read_multiple_disjoint_large_contiguous() -> Result<()> {
-        let (_dir, mut region, data) = prepare_random_region().await?;
+    async fn test_read_single_large_contiguous_span_extents_raw() -> Result<()>
+    {
+        test_read_single_large_contiguous_span_extents(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_read_single_large_contiguous_span_extents_raw_v2(
+    ) -> Result<()> {
+        test_read_single_large_contiguous_span_extents(Backend::RawFileV2).await
+    }
+
+    async fn test_read_multiple_disjoint_large_contiguous(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, data) = prepare_random_region(backend).await?;
 
         // Call region_read with a multiple disjoint large contiguous ranges
         let requests: Vec<crucible_protocol::ReadRequest> = vec![
@@ -4085,8 +4629,20 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_read_multiple_disjoint_none_contiguous() -> Result<()> {
-        let (_dir, mut region, data) = prepare_random_region().await?;
+    async fn test_read_multiple_disjoint_large_contiguous_raw() -> Result<()> {
+        test_read_multiple_disjoint_large_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_read_multiple_disjoint_large_contiguous_raw_v2() -> Result<()>
+    {
+        test_read_multiple_disjoint_large_contiguous(Backend::RawFileV2).await
+    }
+
+    async fn test_read_multiple_disjoint_none_contiguous(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, data) = prepare_random_region(backend).await?;
 
         // Call region_read with a multiple disjoint non-contiguous ranges
         let requests: Vec<crucible_protocol::ReadRequest> = vec![
@@ -4123,6 +4679,17 @@ pub(crate) mod test {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_multiple_disjoint_none_contiguous_raw() -> Result<()> {
+        test_read_multiple_disjoint_none_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_read_multiple_disjoint_none_contiguous_raw_v2() -> Result<()>
+    {
+        test_read_multiple_disjoint_none_contiguous(Backend::RawFileV2).await
     }
 
     fn prepare_writes(
@@ -4179,9 +4746,11 @@ pub(crate) mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_write_single_large_contiguous() -> Result<()> {
-        let (_dir, mut region, mut data) = prepare_random_region().await?;
+    async fn test_write_single_large_contiguous(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, mut data) =
+            prepare_random_region(backend).await?;
 
         // Call region_write with a single large contiguous range
         let writes = prepare_writes(1..8, &mut data);
@@ -4194,8 +4763,20 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_single_large_contiguous_span_extents() -> Result<()> {
-        let (_dir, mut region, mut data) = prepare_random_region().await?;
+    async fn test_write_single_large_contiguous_raw() -> Result<()> {
+        test_write_single_large_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_single_large_contiguous_raw_v2() -> Result<()> {
+        test_write_single_large_contiguous(Backend::RawFileV2).await
+    }
+
+    async fn test_write_single_large_contiguous_span_extents(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, mut data) =
+            prepare_random_region(backend).await?;
 
         // Call region_write with a single large contiguous range that spans
         // multiple extents
@@ -4209,8 +4790,23 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_multiple_disjoint_large_contiguous() -> Result<()> {
-        let (_dir, mut region, mut data) = prepare_random_region().await?;
+    async fn test_write_single_large_contiguous_span_extents_raw() -> Result<()>
+    {
+        test_write_single_large_contiguous_span_extents(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_single_large_contiguous_span_extents_raw_v2(
+    ) -> Result<()> {
+        test_write_single_large_contiguous_span_extents(Backend::RawFileV2)
+            .await
+    }
+
+    async fn test_write_multiple_disjoint_large_contiguous(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, mut data) =
+            prepare_random_region(backend).await?;
 
         // Call region_write with a multiple disjoint large contiguous ranges
         let writes = [
@@ -4228,8 +4824,21 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_multiple_disjoint_none_contiguous() -> Result<()> {
-        let (_dir, mut region, mut data) = prepare_random_region().await?;
+    async fn test_write_multiple_disjoint_large_contiguous_raw() -> Result<()> {
+        test_write_multiple_disjoint_large_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_multiple_disjoint_large_contiguous_raw_v2() -> Result<()>
+    {
+        test_write_multiple_disjoint_large_contiguous(Backend::RawFileV2).await
+    }
+
+    async fn test_write_multiple_disjoint_none_contiguous(
+        backend: Backend,
+    ) -> Result<()> {
+        let (_dir, mut region, mut data) =
+            prepare_random_region(backend).await?;
 
         // Call region_write with a multiple disjoint non-contiguous ranges
         let writes = [
@@ -4248,11 +4857,28 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_write_unwritten_single_large_contiguous() -> Result<()> {
+    async fn test_write_multiple_disjoint_none_contiguous_raw() -> Result<()> {
+        test_write_multiple_disjoint_none_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_multiple_disjoint_none_contiguous_raw_v2() -> Result<()>
+    {
+        test_write_multiple_disjoint_none_contiguous(Backend::RawFileV2).await
+    }
+
+    async fn test_write_unwritten_single_large_contiguous(
+        backend: Backend,
+    ) -> Result<()> {
         // Create a blank region
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
 
         // Create 3 extents, each size 10 blocks
         assert_eq!(region.def().extent_size().value, 10);
@@ -4272,12 +4898,28 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_write_unwritten_single_large_contiguous_raw() -> Result<()> {
+        test_write_unwritten_single_large_contiguous(Backend::RawFile).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_single_large_contiguous_raw_v2() -> Result<()>
+    {
+        test_write_unwritten_single_large_contiguous(Backend::RawFileV2).await
+    }
+
     async fn test_write_unwritten_single_large_contiguous_span_extents(
+        backend: Backend,
     ) -> Result<()> {
         // Create a blank region
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
 
         // Create 3 extents, each size 10 blocks
         assert_eq!(region.def().extent_size().value, 10);
@@ -4298,12 +4940,35 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_write_unwritten_single_large_contiguous_span_extents_raw(
+    ) -> Result<()> {
+        test_write_unwritten_single_large_contiguous_span_extents(
+            Backend::RawFile,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_single_large_contiguous_span_extents_raw_v2(
+    ) -> Result<()> {
+        test_write_unwritten_single_large_contiguous_span_extents(
+            Backend::RawFileV2,
+        )
+        .await
+    }
+
     async fn test_write_unwritten_multiple_disjoint_large_contiguous(
+        backend: Backend,
     ) -> Result<()> {
         // Create a blank region
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
 
         // Create 3 extents, each size 10 blocks
         assert_eq!(region.def().extent_size().value, 10);
@@ -4328,12 +4993,35 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn test_write_unwritten_multiple_disjoint_large_contiguous_raw(
+    ) -> Result<()> {
+        test_write_unwritten_multiple_disjoint_large_contiguous(
+            Backend::RawFile,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_multiple_disjoint_large_contiguous_raw_v2(
+    ) -> Result<()> {
+        test_write_unwritten_multiple_disjoint_large_contiguous(
+            Backend::RawFileV2,
+        )
+        .await
+    }
+
     async fn test_write_unwritten_multiple_disjoint_none_contiguous(
+        backend: Backend,
     ) -> Result<()> {
         // Create a blank region
         let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
+        let mut region = Region::create_with_backend(
+            &dir,
+            new_region_options(),
+            backend,
+            csl(),
+        )
+        .await?;
 
         // Create 3 extents, each size 10 blocks
         assert_eq!(region.def().extent_size().value, 10);
@@ -4356,5 +5044,21 @@ pub(crate) mod test {
         // Validate written data by reading everything back and comparing with
         // data buffer
         validate_whole_region(&mut region, &data).await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_multiple_disjoint_none_contiguous_raw(
+    ) -> Result<()> {
+        test_write_unwritten_multiple_disjoint_none_contiguous(Backend::RawFile)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_write_unwritten_multiple_disjoint_none_contiguous_raw_v2(
+    ) -> Result<()> {
+        test_write_unwritten_multiple_disjoint_none_contiguous(
+            Backend::RawFileV2,
+        )
+        .await
     }
 }

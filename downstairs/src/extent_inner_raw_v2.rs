@@ -23,7 +23,7 @@ use std::{
 ///
 /// This must be large enough to fit an `Option<BlockContext>`
 /// serialized using `bincode`.
-const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 40;
+pub(crate) const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 40;
 
 /// `RawInnerV2` is a wrapper around a [`std::fs::File`] representing an extent
 ///
@@ -416,8 +416,8 @@ impl RawInnerV2 {
 
         let mut iovecs = Vec::with_capacity(n_blocks * 2);
         for (ctx, w) in ctxs.iter().zip(writes.iter()) {
-            iovecs.push(IoSlice::new(ctx));
             iovecs.push(IoSlice::new(&w.data));
+            iovecs.push(IoSlice::new(ctx));
         }
 
         let start_block = writes[0].offset;
@@ -505,8 +505,8 @@ impl RawInnerV2 {
         for (ctx, chunk) in
             ctxs.iter_mut().zip(buf.chunks_mut(block_size as usize))
         {
-            iovecs.push(IoSliceMut::new(ctx));
             iovecs.push(IoSliceMut::new(chunk));
+            iovecs.push(IoSliceMut::new(ctx));
         }
 
         let expected_bytes = n_blocks as u64

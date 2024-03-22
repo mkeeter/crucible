@@ -184,7 +184,7 @@ mod test {
                 blocks_per_extent,
                 extent_count,
                 false,
-                Backend::RawFile,
+                Backend::RawFileV2,
             )
             .await
         }
@@ -216,7 +216,7 @@ mod test {
                 blocks_per_extent,
                 extent_count,
                 false,
-                Backend::RawFile,
+                Backend::RawFileV2,
             )
             .await
         }
@@ -231,7 +231,7 @@ mod test {
                 blocks_per_extent,
                 extent_count,
                 true, // problematic
-                Backend::RawFile,
+                Backend::RawFileV2,
             )
             .await
         }
@@ -359,7 +359,7 @@ mod test {
                 self.blocks_per_extent,
                 self.extent_count,
                 false,
-                Backend::RawFile,
+                Backend::RawFileV2,
             )
             .await
         }
@@ -2707,7 +2707,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -2822,7 +2822,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -2883,7 +2883,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -2917,7 +2917,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -2950,7 +2950,7 @@ mod test {
             5,
             3,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -2965,7 +2965,7 @@ mod test {
             5,
             2, // <- Different than above
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -2986,7 +2986,7 @@ mod test {
             9,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -3001,7 +3001,7 @@ mod test {
             5, // <- Different than above
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -3022,7 +3022,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -3036,7 +3036,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -3057,7 +3057,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -3071,7 +3071,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();
@@ -3243,7 +3243,7 @@ mod test {
             5,
             2,
             false,
-            Backend::RawFile,
+            Backend::RawFileV2,
         )
         .await
         .unwrap();

@@ -1383,7 +1383,7 @@ impl DownstairsBuilder<'_> {
         let read_errors = self.read_errors.unwrap_or(false);
         let write_errors = self.write_errors.unwrap_or(false);
         let flush_errors = self.flush_errors.unwrap_or(false);
-        let backend = self.backend.unwrap_or(Backend::RawFile);
+        let backend = self.backend.unwrap_or(Backend::RawFileV2);
 
         let log = match &self.log {
             Some(log) => log.clone(),
@@ -1465,7 +1465,7 @@ impl Downstairs {
             read_errors: Some(false),
             write_errors: Some(false),
             flush_errors: Some(false),
-            backend: Some(Backend::RawFile),
+            backend: Some(Backend::RawFileV2),
             log: None,
         }
     }
@@ -3093,6 +3093,21 @@ pub enum Backend {
     SQLite,
 }
 
+#[cfg(test)]
+impl Backend {
+    /// Returns an offset between consecutive data blocks in a raw file
+    ///
+    /// This is used when checking our implementation against raw data on disk
+    pub fn block_offset(&self) -> usize {
+        match self {
+            Backend::RawFile | Backend::SQLite => 0,
+            Backend::RawFileV2 => {
+                extent_inner_raw_v2::BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize
+            }
+        }
+    }
+}
+
 pub async fn create_region(
     block_size: u64,
     data: PathBuf,
@@ -3111,7 +3126,7 @@ pub async fn create_region(
         extent_count,
         uuid,
         encrypted,
-        Backend::RawFile,
+        Backend::RawFileV2,
         log,
     )
     .await

@@ -719,7 +719,7 @@ pub(crate) fn move_replacement_extent<P: AsRef<Path>>(
             sync_path(&original_file, log)?;
         } else if original_file.exists() {
             // If we are cloning, then our new region will have been
-            // created with Backend::RawFile, and we should have no SQLite
+            // created with Backend::RawFile(V2), and we should have no SQLite
             // files.
             assert!(!clone);
             info!(
@@ -747,7 +747,7 @@ pub(crate) fn move_replacement_extent<P: AsRef<Path>>(
             sync_path(&original_file, log)?;
         } else if original_file.exists() {
             // If we are cloning, then our new region will have been
-            // created with Backend::RawFile, and we should have no SQLite
+            // created with Backend::RawFile(V2), and we should have no SQLite
             // files.
             assert!(!clone);
             info!(
