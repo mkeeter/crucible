@@ -43,7 +43,7 @@ const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 40;
 /// `bincode`.
 const BLOCK_META_SIZE_BYTES: u64 = 32;
 
-/// `RawInner` is a wrapper around a [`std::fs::File`] representing an extent
+/// `RawInnerV2` is a wrapper around a [`std::fs::File`] representing an extent
 ///
 /// The file is structured as follows:
 /// - Block data and metadata, structured as an array of (context, data) tuples.
@@ -67,7 +67,7 @@ const BLOCK_META_SIZE_BYTES: u64 = 32;
 ///   lets us deserialize it without knowing anything else about the file, then
 ///   dispatch based on extent version.
 #[derive(Debug)]
-pub struct RawInner {
+pub struct RawInnerV2 {
     file: File,
 
     /// Our extent number
@@ -88,7 +88,7 @@ pub struct RawInner {
     dirty: bool,
 }
 
-impl ExtentInner for RawInner {
+impl ExtentInner for RawInnerV2 {
     fn flush_number(&self) -> Result<u64, CrucibleError> {
         self.get_metadata().map(|v| v.flush_number)
     }
@@ -219,7 +219,7 @@ impl ExtentInner for RawInner {
     }
 }
 
-impl RawInner {
+impl RawInnerV2 {
     pub fn create(
         dir: &Path,
         def: &RegionDefinition,
@@ -796,7 +796,7 @@ mod test {
     fn test_write_unwritten_without_flush() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInnerV2::create(dir.as_ref(), &new_region_definition(), 0)
                 .unwrap();
 
         // Write a block, but don't flush.
@@ -914,7 +914,7 @@ mod test {
     fn test_multiple_writes_to_same_location_raw() -> Result<()> {
         let dir = tempdir()?;
         let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
+            RawInnerV2::create(dir.as_ref(), &new_region_definition(), 0)
                 .unwrap();
 
         // Write the same block four times in the same write command.
