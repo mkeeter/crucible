@@ -147,6 +147,7 @@ pub const EXTENT_META_SQLITE: u32 = 1;
 ///
 /// See [`extent_inner_raw::RawInner`] for the implementation.
 pub const EXTENT_META_RAW: u32 = 2;
+pub const EXTENT_META_RAW_V2: u32 = 3;
 
 impl ExtentMeta {
     pub fn new(ext_version: u32) -> ExtentMeta {

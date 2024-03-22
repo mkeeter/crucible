@@ -46,6 +46,7 @@ pub mod repair;
 mod stats;
 
 mod extent_inner_raw;
+mod extent_inner_raw_v2;
 mod extent_inner_sqlite;
 
 use extent::ExtentState;
