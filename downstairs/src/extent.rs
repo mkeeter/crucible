@@ -56,12 +56,13 @@ pub(crate) trait ExtentInner: Send + Sync + Debug {
         &mut self,
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
+        iov_max: usize,
     ) -> Result<RawReadResponse, CrucibleError> {
         let block_size = requests[0].offset.block_size_in_bytes();
         let mut out =
             RawReadResponse::with_capacity(requests.len(), block_size as u64);
         if !requests.is_empty() {
-            self.read_into(job_id, requests, &mut out)?;
+            self.read_into(job_id, requests, &mut out, iov_max)?;
         }
         Ok(out)
     }
@@ -526,7 +527,7 @@ impl Extent {
             (job_id.0, self.number, requests.len() as u64)
         });
 
-        self.inner.read_into(job_id, requests, out)?;
+        self.inner.read_into(job_id, requests, out, self.iov_max)?;
         cdt::extent__read__done!(|| {
             (job_id.0, self.number, requests.len() as u64)
         });
@@ -596,16 +597,6 @@ impl Extent {
             flush_number: self.inner.flush_number().unwrap(),
             dirty: self.inner.dirty().unwrap(),
         }
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        self.inner.get_block_contexts(block, count)
     }
 }
 

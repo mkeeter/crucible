@@ -1,25 +1,23 @@
 // Copyright 2023 Oxide Computer Company
 use crate::{
     cdt,
-    extent::{
-        check_input, extent_path, DownstairsBlockContext, ExtentInner,
-        EXTENT_META_RAW,
-    },
-    integrity_hash, mkdir_for_file,
-    region::{BatchedPwritev, JobOrReconciliationId},
-    Block, BlockContext, CrucibleError, JobId, RegionDefinition,
+    extent::{check_input, extent_path, ExtentInner, EXTENT_META_RAW_V2},
+    mkdir_for_file,
+    region::JobOrReconciliationId,
+    Block, CrucibleError, JobId, RegionDefinition,
 };
 
 use crucible_protocol::{RawReadResponse, ReadResponseBlockMetadata};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
 
-use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
 use std::io::{BufReader, IoSliceMut, Read};
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::{
+    fs::{File, OpenOptions},
+    io::IoSlice,
+};
 
 /// Equivalent to `ExtentMeta`, but ordered for efficient on-disk serialization
 ///
@@ -61,13 +59,13 @@ const BLOCK_META_SIZE_BYTES: u64 = 32;
 ///   `u8` (where `1` is dirty and `0` is clean).
 ///
 /// There are a few considerations that led to this particular ordering:
-/// - Active context slots and metadata must be contiguous, because we want to
-///   write them atomically when clearing the `dirty` flag
-/// - The metadata contains an extent version (currently [`EXTENT_META_RAW`]).
-///   We will eventually have multiple raw file formats, so it's convenient to
-///   always place the metadata at the end; this lets us deserialize it without
-///   knowing anything else about the file, then dispatch based on extent
-///   version.
+/// - Written blocks and metadata must be contiguous, because we want to write
+///   them atomically when clearing the `dirty` flag
+/// - The metadata contains an extent version (currently
+///   [`EXTENT_META_RAW_V2`]). We will eventually have multiple raw file
+///   formats, so it's convenient to always place the metadata at the end; this
+///   lets us deserialize it without knowing anything else about the file, then
+///   dispatch based on extent version.
 #[derive(Debug)]
 pub struct RawInner {
     file: File,
@@ -136,7 +134,7 @@ impl ExtentInner for RawInner {
             {
                 end += 1;
             }
-            self.write_contiguous(job_id, &writes[start..end]);
+            self.write_contiguous(job_id, &writes[start..end])?;
             start = end;
         }
         Ok(())
@@ -330,14 +328,17 @@ impl RawInner {
             // figure out which context slot is active.
             let mut file_buffered = BufReader::with_capacity(64 * 1024, &file);
             let mut block_written = vec![];
-            for i in 0..layout.block_count() {
+            for _ in 0..layout.block_count() {
+                // Read the entire slot, though we only care about the first
+                // byte.  We could deserialize, but it's easier just to check
+                // the byte by hand, since we know the encoding.
                 let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
                 file_buffered.read_exact(&mut buf)?;
                 block_written.push(buf[0] != 0);
 
                 // Skip the bulk data, on to the next block's context slot
                 file_buffered
-                    .seek_relative(extent_size.block_size_in_bytes() as i64);
+                    .seek_relative(extent_size.block_size_in_bytes() as i64)?;
             }
             block_written
         };
@@ -357,6 +358,38 @@ impl RawInner {
             self.layout.set_dirty(&self.file)?;
             self.dirty = true;
         }
+        Ok(())
+    }
+
+    /// Updates `self.block_written[block]` based on data read from the file
+    ///
+    /// Specifically, if the context is written (has a non-zero `Option` tag),
+    /// then the block is guaranteed to be written, because they are always
+    /// written together in an atomic operation.
+    ///
+    /// We expect to call this function rarely, so it does not attempt to
+    /// minimize the number of syscalls it executes.
+    fn recompute_block_written_from_file(
+        &mut self,
+        block: u64,
+    ) -> Result<(), CrucibleError> {
+        // Read the block data itself:
+        let block_size = self.extent_size.block_size_in_bytes();
+        let mut tag = [0u8];
+        pread_all(
+            self.file.as_fd(),
+            &mut tag,
+            ((block_size as u64 + BLOCK_CONTEXT_SLOT_SIZE_BYTES) * block)
+                as i64,
+        )
+        .map_err(|e| {
+            CrucibleError::IoError(format!(
+                "extent {}: reading block {block} data failed: {e}",
+                self.extent_number
+            ))
+        })?;
+
+        self.block_written[block as usize] = tag[0] != 0;
         Ok(())
     }
 
@@ -390,7 +423,78 @@ impl RawInner {
         job_id: JobId,
         writes: &[crucible_protocol::Write],
     ) -> Result<(), CrucibleError> {
-        todo!()
+        let block_size = self.extent_size.block_size_in_bytes();
+        let n_blocks = writes.len();
+
+        let mut ctxs =
+            vec![[0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]; n_blocks];
+        for (ctx, w) in ctxs.iter_mut().zip(writes.iter()) {
+            bincode::serialize_into(ctx.as_mut(), &w.block_context).unwrap();
+        }
+
+        let mut iovecs = Vec::with_capacity(n_blocks * 2);
+        for (ctx, w) in ctxs.iter().zip(writes.iter()) {
+            iovecs.push(IoSlice::new(ctx));
+            iovecs.push(IoSlice::new(&w.data));
+        }
+
+        let start_block = writes[0].offset;
+        let start_pos = start_block.value
+            * (block_size as u64 + BLOCK_CONTEXT_SLOT_SIZE_BYTES);
+
+        let expected_bytes = n_blocks as u64
+            * (block_size as u64 + BLOCK_CONTEXT_SLOT_SIZE_BYTES);
+
+        self.set_dirty()?;
+
+        cdt::extent__write__file__start!(|| {
+            (job_id.0, self.extent_number, writes.len() as u64)
+        });
+
+        let r = nix::sys::uio::pwritev(
+            self.file.as_fd(),
+            &iovecs,
+            start_pos as i64,
+        )
+        .map_err(|e| {
+            CrucibleError::IoError(format!(
+                "extent {}: read failed: {e}",
+                self.extent_number
+            ))
+        });
+        let r = match r {
+            Err(e) => Err(e),
+            Ok(num_bytes_written)
+                if num_bytes_written as u64 != expected_bytes =>
+            {
+                Err(CrucibleError::IoError(format!(
+                    "extent {}: incomplete write \
+                    (expected {expected_bytes}, got {num_bytes_written})",
+                    self.extent_number
+                )))
+            }
+            Ok(..) => Ok(()),
+        };
+
+        if r.is_err() {
+            for write in writes.iter() {
+                let block = write.offset.value;
+
+                // Try to recompute the context slot from the file.  If this
+                // fails, then we _really_ can't recover, so bail out
+                // unceremoniously.
+                self.recompute_block_written_from_file(block).unwrap();
+            }
+        } else {
+            // Now that writes have gone through, mark as written
+            self.block_written[start_block.value as usize..][..n_blocks]
+                .fill(true);
+        }
+        cdt::extent__write__file__done!(|| {
+            (job_id.0, self.extent_number, writes.len() as u64)
+        });
+
+        Ok(())
     }
 
     fn read_contiguous_into(
@@ -403,7 +507,14 @@ impl RawInner {
 
         let mut buf = out.data.split_off(out.data.len());
         let n_blocks = requests.len();
+
+        // Resizing the buffer should fill memory, but should not reallocate
         buf.resize(n_blocks * block_size as usize, 1u8);
+
+        let start_block = requests[0].offset;
+        let start_pos = start_block.value
+            * (block_size as u64 + BLOCK_CONTEXT_SLOT_SIZE_BYTES);
+        check_input(self.extent_size, start_block, &buf)?;
 
         let mut ctxs =
             vec![[0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]; n_blocks];
@@ -416,130 +527,54 @@ impl RawInner {
             iovecs.push(IoSliceMut::new(chunk));
         }
 
-        // TODO build iovecs
-        // Do the read
-        // Deserialize the contexts
-        // Etc, etc
+        let expected_bytes = n_blocks as u64
+            * (block_size as u64 + BLOCK_CONTEXT_SLOT_SIZE_BYTES);
 
+        // Finally we get to read the actual data. That's why we're here
+        cdt::extent__read__file__start!(|| {
+            (job_id.0, self.extent_number, n_blocks as u64)
+        });
+        let num_bytes_read = nix::sys::uio::preadv(
+            self.file.as_fd(),
+            &mut iovecs,
+            start_pos as i64,
+        )
+        .map_err(|e| {
+            CrucibleError::IoError(format!(
+                "extent {}: read failed: {e}",
+                self.extent_number
+            ))
+        })?;
+
+        if num_bytes_read != expected_bytes as usize {
+            return Err(CrucibleError::IoError(format!(
+                "extent {}: incomplete read \
+                 (expected {expected_bytes}, got {num_bytes_read})",
+                self.extent_number
+            )));
+        }
+        cdt::extent__read__file__done!(|| {
+            (job_id.0, self.extent_number, n_blocks as u64)
+        });
+
+        for (i, c) in ctxs.into_iter().enumerate() {
+            let ctx = bincode::deserialize(&c)
+                .map_err(|e| CrucibleError::BadContextSlot(e.to_string()))?;
+            out.blocks.push(ReadResponseBlockMetadata {
+                eid: self.extent_number as u64,
+                offset: Block {
+                    value: start_block.value + i as u64,
+                    ..start_block
+                },
+                block_contexts: vec![ctx],
+            });
+        }
+
+        // Rejoin the data buffer (this should be zero-cost, because it was
+        // split off at the beginning of the function and no allocations should
+        // have happened)
         out.data.unsplit(buf);
 
-        // This code batches up operations for contiguous regions of
-        // ReadRequests, so we can perform larger read syscalls queries. This
-        // significantly improves read throughput.
-
-        // Keep track of the index of the first request in any contiguous run
-        // of requests. Of course, a "contiguous run" might just be a single
-        // request.
-        let mut req_run_start = 0;
-        let block_size = self.extent_size.block_size_in_bytes();
-
-        while req_run_start < requests.len() {
-            let first_req = &requests[req_run_start];
-
-            // Starting from the first request in the potential run, we scan
-            // forward until we find a request with a block that isn't
-            // contiguous with the request before it. Since we're counting
-            // pairs, and the number of pairs is one less than the number of
-            // requests, we need to add 1 to get our actual run length.
-            let mut n_contiguous_blocks = 1;
-
-            for request_window in requests[req_run_start..].windows(2) {
-                if request_window[0].offset.value + 1
-                    == request_window[1].offset.value
-                {
-                    n_contiguous_blocks += 1;
-                } else {
-                    break;
-                }
-            }
-
-            // Create our responses and push them into the output. While we're
-            // at it, check for overflows.
-            let resp_run_start = out.blocks.len();
-            for req in requests[req_run_start..][..n_contiguous_blocks].iter() {
-                let resp = ReadResponseBlockMetadata {
-                    eid: req.eid,
-                    offset: req.offset,
-                    block_contexts: Vec::with_capacity(1),
-                };
-                out.blocks.push(resp);
-            }
-
-            // Calculate the number of expected bytes, then resize our buffer
-            //
-            // This should fill memory, but should not reallocate
-            let expected_bytes = n_contiguous_blocks * block_size as usize;
-            buf.resize(expected_bytes, 1);
-
-            let first_resp = &out.blocks[resp_run_start];
-            check_input(self.extent_size, first_resp.offset, &buf)?;
-
-            // Finally we get to read the actual data. That's why we're here
-            cdt::extent__read__file__start!(|| {
-                (job_id.0, self.extent_number, n_contiguous_blocks as u64)
-            });
-
-            // Perform the bulk read, then check against the expected number of
-            // bytes.  We could do more robust error handling here (e.g.
-            // retrying in a loop), but for now, simply bailing out seems wise.
-            let num_bytes = nix::sys::uio::pread(
-                self.file.as_fd(),
-                &mut buf,
-                first_req.offset.value as i64 * block_size as i64,
-            )
-            .map_err(|e| {
-                CrucibleError::IoError(format!(
-                    "extent {}: read failed: {e}",
-                    self.extent_number
-                ))
-            })?;
-            if num_bytes != expected_bytes {
-                return Err(CrucibleError::IoError(format!(
-                    "extent {}: incomplete read \
-                     (expected {expected_bytes}, got {num_bytes})",
-                    self.extent_number
-                )));
-            }
-
-            cdt::extent__read__file__done!(|| {
-                (job_id.0, self.extent_number, n_contiguous_blocks as u64)
-            });
-
-            // Reattach this chunk to the main `BytesMut` array
-            //
-            // This should be O(1), because we allocated enough space to not
-            // reallocate anywhere in the process.
-            let chunk = buf.split_to(expected_bytes);
-
-            // Query the block metadata
-            cdt::extent__read__get__contexts__start!(|| {
-                (job_id.0, self.extent_number, n_contiguous_blocks as u64)
-            });
-            let block_contexts = self.get_block_contexts(
-                first_req.offset.value,
-                n_contiguous_blocks as u64,
-            )?;
-            cdt::extent__read__get__contexts__done!(|| {
-                (job_id.0, self.extent_number, n_contiguous_blocks as u64)
-            });
-
-            // Now it's time to put block contexts into the responses.
-            // We use into_iter here to move values out of enc_ctxts/hashes,
-            // avoiding a clone(). For code consistency, we use iters for the
-            // response and data chunks too. These iters will be the same length
-            // (equal to n_contiguous_blocks) so zipping is fine
-            let resp_iter =
-                out.blocks[resp_run_start..][..n_contiguous_blocks].iter_mut();
-            let ctx_iter = block_contexts.into_iter();
-
-            for (resp, r_ctx) in resp_iter.zip(ctx_iter) {
-                assert!(resp.block_contexts.is_empty());
-                resp.block_contexts
-                    .extend(r_ctx.into_iter().map(|x| x.block_context));
-            }
-
-            req_run_start += n_contiguous_blocks;
-        }
         Ok(())
     }
 }
@@ -653,7 +688,7 @@ impl RawLayout {
             dirty,
             flush_number,
             gen_number,
-            ext_version: EXTENT_META_RAW,
+            ext_version: EXTENT_META_RAW_V2,
         };
         let mut meta = [0u8; BLOCK_META_SIZE_BYTES as usize];
         bincode::serialize_into(meta.as_mut_slice(), &d).unwrap();
@@ -744,9 +779,10 @@ mod test {
     use super::*;
     use anyhow::Result;
     use bytes::{Bytes, BytesMut};
+    use crucible_common::integrity_hash;
+    use crucible_protocol::BlockContext;
     use crucible_protocol::EncryptionContext;
     use crucible_protocol::ReadRequest;
-    use rand::Rng;
     use tempfile::tempdir;
 
     const IOV_MAX_TEST: usize = 1000;
@@ -754,207 +790,6 @@ mod test {
     fn new_region_definition() -> RegionDefinition {
         let opt = crate::region::test::new_region_options();
         RegionDefinition::from_options(&opt).unwrap()
-    }
-
-    #[tokio::test]
-    async fn encryption_context() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Encryption context for blocks 0 and 1 should start blank
-
-        assert!(inner.get_block_context(0)?.is_none());
-        assert!(inner.get_block_context(1)?.is_none());
-
-        // Set and verify block 0's context
-        inner.set_dirty_and_block_context(&DownstairsBlockContext {
-            block_context: BlockContext {
-                encryption_context: Some(EncryptionContext {
-                    nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-                    tag: [
-                        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-                        19,
-                    ],
-                }),
-                hash: 123,
-            },
-            block: 0,
-            on_disk_hash: 456,
-        })?;
-
-        let ctx = inner.get_block_context(0)?.unwrap();
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        );
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
-            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-        );
-        assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
-
-        // Block 1 should still be blank
-        assert!(inner.get_block_context(1)?.is_none());
-
-        // Set and verify a new context for block 0
-        let blob1 = rand::thread_rng().gen::<[u8; 12]>();
-        let blob2 = rand::thread_rng().gen::<[u8; 16]>();
-
-        // Set and verify block 0's context
-        inner.set_dirty_and_block_context(&DownstairsBlockContext {
-            block_context: BlockContext {
-                encryption_context: Some(EncryptionContext {
-                    nonce: blob1,
-                    tag: blob2,
-                }),
-                hash: 1024,
-            },
-            block: 0,
-            on_disk_hash: 65536,
-        })?;
-
-        let ctx = inner.get_block_context(0)?.unwrap();
-
-        // Second context was appended
-        assert_eq!(ctx.block_context.encryption_context.unwrap().nonce, blob1);
-        assert_eq!(ctx.block_context.encryption_context.unwrap().tag, blob2);
-        assert_eq!(ctx.block_context.hash, 1024);
-        assert_eq!(ctx.on_disk_hash, 65536);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn multiple_context() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Encryption context for blocks 0 and 1 should start blank
-
-        assert!(inner.get_block_context(0)?.is_none());
-        assert!(inner.get_block_context(1)?.is_none());
-
-        // Set block 0's and 1's context and dirty flag
-        inner.set_dirty_and_block_context(&DownstairsBlockContext {
-            block_context: BlockContext {
-                encryption_context: Some(EncryptionContext {
-                    nonce: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-                    tag: [
-                        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-                        19,
-                    ],
-                }),
-                hash: 123,
-            },
-            block: 0,
-            on_disk_hash: 456,
-        })?;
-        inner.set_dirty_and_block_context(&DownstairsBlockContext {
-            block_context: BlockContext {
-                encryption_context: Some(EncryptionContext {
-                    nonce: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-                    tag: [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
-                }),
-                hash: 9999,
-            },
-            block: 1,
-            on_disk_hash: 1234567890,
-        })?;
-
-        // Verify block 0's context
-        let ctx = inner.get_block_context(0)?.unwrap();
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        );
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
-            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-        );
-        assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
-
-        // Verify block 1's context
-        let ctx = inner.get_block_context(1)?.unwrap();
-
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
-            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        );
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
-            [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-        );
-        assert_eq!(ctx.block_context.hash, 9999);
-        assert_eq!(ctx.on_disk_hash, 1234567890);
-
-        // Return both block 0's and block 1's context, and verify
-
-        let ctxs = inner.get_block_contexts(0, 2)?;
-        let ctx = ctxs[0].as_ref().unwrap();
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        );
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
-            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-        );
-        assert_eq!(ctx.block_context.hash, 123);
-        assert_eq!(ctx.on_disk_hash, 456);
-
-        let ctx = ctxs[1].as_ref().unwrap();
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().nonce,
-            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        );
-        assert_eq!(
-            ctx.block_context.encryption_context.unwrap().tag,
-            [8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
-        );
-        assert_eq!(ctx.block_context.hash, 9999);
-        assert_eq!(ctx.on_disk_hash, 1234567890);
-
-        // Append a whole bunch of block context rows
-        for i in 0..10 {
-            inner.set_dirty_and_block_context(&DownstairsBlockContext {
-                block_context: BlockContext {
-                    encryption_context: Some(EncryptionContext {
-                        nonce: rand::thread_rng().gen::<[u8; 12]>(),
-                        tag: rand::thread_rng().gen::<[u8; 16]>(),
-                    }),
-                    hash: rand::thread_rng().gen::<u64>(),
-                },
-                block: 0,
-                on_disk_hash: i,
-            })?;
-            inner.set_dirty_and_block_context(&DownstairsBlockContext {
-                block_context: BlockContext {
-                    encryption_context: Some(EncryptionContext {
-                        nonce: rand::thread_rng().gen::<[u8; 12]>(),
-                        tag: rand::thread_rng().gen::<[u8; 16]>(),
-                    }),
-                    hash: rand::thread_rng().gen::<u64>(),
-                },
-                block: 1,
-                on_disk_hash: i,
-            })?;
-        }
-
-        let ctxs = inner.get_block_contexts(0, 2)?;
-
-        assert!(ctxs[0].is_some());
-        assert_eq!(ctxs[0].as_ref().unwrap().on_disk_hash, 9);
-
-        assert!(ctxs[1].is_some());
-        assert_eq!(ctxs[1].as_ref().unwrap().on_disk_hash, 9);
-
-        Ok(())
     }
 
     #[test]
@@ -1001,7 +836,7 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(0),
             };
-            let resp = inner.read(JobId(21), &[read])?;
+            let resp = inner.read(JobId(21), &[read], IOV_MAX_TEST)?;
 
             // We should not get back our data, because block 0 was written.
             assert_ne!(
@@ -1035,7 +870,7 @@ mod test {
                 eid: 0,
                 offset: Block::new_512(1),
             };
-            let resp = inner.read(JobId(31), &[read])?;
+            let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
 
             // We should get back our data! Block 1 was never written.
             assert_eq!(
@@ -1071,7 +906,7 @@ mod test {
             ext_version: u32::MAX,
         };
         let mut meta_buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
-        bincode::serialize_into(meta_buf.as_mut_slice(), &Some(m)).unwrap();
+        bincode::serialize_into(meta_buf.as_mut_slice(), &m).unwrap();
     }
 
     /// Test that multiple writes to the same location work
@@ -1111,7 +946,7 @@ mod test {
             eid: 0,
             offset: Block::new_512(0),
         };
-        let resp = inner.read(JobId(31), &[read])?;
+        let resp = inner.read(JobId(31), &[read], IOV_MAX_TEST)?;
 
         let data = Bytes::from(vec![0x03; 512]);
         let hash = integrity_hash(&[&data[..]]);

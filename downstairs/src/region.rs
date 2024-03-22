@@ -3763,7 +3763,7 @@ pub(crate) mod test {
                 512,
             );
             let reqs = range
-                .into_iter()
+                .clone()
                 .map(|i| ReadRequest {
                     eid: 0,
                     offset: Block::new_512(i),
@@ -3848,19 +3848,26 @@ pub(crate) mod test {
         let ext = region.get_opened_extent_mut(0);
 
         // Get the contexts for the range
-        let ctxts = ext.get_block_contexts(0, EXTENT_SIZE).await?;
+        let reqs = (0..EXTENT_SIZE)
+            .map(|i| ReadRequest {
+                eid: 0,
+                offset: Block::new_512(i),
+            })
+            .collect::<Vec<_>>();
+        let mut out = RawReadResponse::with_capacity(EXTENT_SIZE as usize, 512);
+        ext.read_into(JobId(0), &reqs, &mut out).await?;
 
         // Every block should have at most 1 block
         assert_eq!(
-            ctxts.iter().map(|block_ctxts| block_ctxts.len()).max(),
+            out.blocks.iter().map(|b| b.block_contexts.len()).max(),
             Some(1)
         );
 
         // Now that we've checked that, flatten out for an easier eq
-        let actual_ctxts: Vec<_> = ctxts
+        let actual_ctxts: Vec<_> = out
+            .blocks
             .iter()
-            .flatten()
-            .map(|downstairs_context| &downstairs_context.block_context)
+            .flat_map(|b| b.block_contexts.iter())
             .collect();
 
         // What we expect is the hashes for the last write we did
