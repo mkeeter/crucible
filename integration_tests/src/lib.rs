@@ -253,7 +253,6 @@ mod test {
             problematic: bool,
             backend: Backend,
         ) -> Result<TestDownstairsSet> {
-            assert!(!matches!(backend, Backend::SQLite));
             let downstairs1 = TestDownstairs::new(
                 "127.0.0.1".parse()?,
                 true,
