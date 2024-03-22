@@ -109,7 +109,7 @@ impl ExtentInner for RawInnerV2 {
             //
             // After this loop, `end` is the index of the first block that
             // **should not** be written.
-            while end < writes.len().min(start + iov_max * 2)
+            while end < writes.len().min(start + iov_max / 2)
                 && writes[end - 1].offset.value + 1 == writes[end].offset.value
                 && !(only_write_unwritten
                     && self.block_written[writes[end].offset.value as usize])
@@ -143,7 +143,7 @@ impl ExtentInner for RawInnerV2 {
             //
             // After this loop, `end` is the index of the first block that
             // **should not** be written.
-            while end < requests.len().min(start + iov_max * 2)
+            while end < requests.len().min(start + iov_max / 2)
                 && requests[end - 1].offset.value + 1
                     == requests[end].offset.value
             {
@@ -440,10 +440,11 @@ impl RawInnerV2 {
         )
         .map_err(|e| {
             CrucibleError::IoError(format!(
-                "extent {}: read failed: {e}",
+                "extent {}: write failed: {e}",
                 self.extent_number
             ))
         });
+
         let r = match r {
             Err(e) => Err(e),
             Ok(num_bytes_written)
