@@ -94,7 +94,9 @@ impl ExtentInner for RawInnerV2 {
         let mut start = 0;
         while start < writes.len() {
             // Skip written blocks if `only_write_unwritten` is true
-            if only_write_unwritten && self.block_written[start] {
+            if only_write_unwritten
+                && self.block_written[writes[start].offset.value as usize]
+            {
                 start += 1;
                 continue;
             }
@@ -411,7 +413,8 @@ impl RawInnerV2 {
         let mut ctxs =
             vec![[0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]; n_blocks];
         for (ctx, w) in ctxs.iter_mut().zip(writes.iter()) {
-            bincode::serialize_into(ctx.as_mut(), &w.block_context).unwrap();
+            bincode::serialize_into(ctx.as_mut(), &Some(w.block_context))
+                .unwrap();
         }
 
         let mut iovecs = Vec::with_capacity(n_blocks * 2);
@@ -541,7 +544,7 @@ impl RawInnerV2 {
         });
 
         for (i, c) in ctxs.into_iter().enumerate() {
-            let ctx = bincode::deserialize(&c)
+            let ctx: Option<_> = bincode::deserialize(&c)
                 .map_err(|e| CrucibleError::BadContextSlot(e.to_string()))?;
             out.blocks.push(ReadResponseBlockMetadata {
                 eid: self.extent_number as u64,
@@ -549,7 +552,7 @@ impl RawInnerV2 {
                     value: start_block.value + i as u64,
                     ..start_block
                 },
-                block_contexts: vec![ctx],
+                block_contexts: ctx.into_iter().collect(),
             });
         }
 
