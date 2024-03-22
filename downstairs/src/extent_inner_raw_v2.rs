@@ -17,7 +17,7 @@ use slog::{error, Logger};
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, IoSliceMut, Read};
 use std::os::fd::AsFd;
 use std::path::Path;
 
@@ -51,6 +51,11 @@ const BLOCK_META_SIZE_BYTES: u64 = 32;
 /// - Block data and metadata, structured as an array of (context, data) tuples.
 ///   This has the total size
 ///   ([`BLOCK_CONTEXT_SLOT_SIZE_BYTES`] + block_size) × `extent_size`
+/// - Written blocks, stored as a bit-packed array (where 0 is unwritten and 1
+///   is written).  This array contains `(extent_size + 7) / 8` bytes.  It is
+///   only valid when the `dirty` bit is cleared.  This is an optimization that
+///   speeds up opening a clean extent file; otherwise, we would have to read
+///   every block to find whether it has been written or not.
 /// - [`BLOCK_META_SIZE_BYTES`], which contains an [`OnDiskMeta`] serialized
 ///   using `bincode`.  The first byte of this range is `dirty`, serialized as a
 ///   `u8` (where `1` is dirty and `0` is clean).
@@ -75,6 +80,9 @@ pub struct RawInner {
 
     /// Helper `struct` controlling layout within the file
     layout: RawLayout,
+
+    /// Has this block been written?
+    block_written: Vec<bool>,
 
     /// Local cache for the `dirty` value
     ///
@@ -102,30 +110,34 @@ impl ExtentInner for RawInner {
         only_write_unwritten: bool,
         iov_max: usize,
     ) -> Result<(), CrucibleError> {
-        // If the same block is written multiple times in a single write, then
-        // (1) that's weird, and (2) we need to handle it specially.  To handle
-        // such cases, we split the `writes` slice into sub-slices of unique
-        // writes.
-        let mut seen = HashSet::new();
+        // Find the largest contiguous write, as a slice of the `writes` input
         let mut start = 0;
-        for i in 0..=writes.len() {
-            // If this value is a duplicate or we have reached the end of
-            // the list, then write everything up to this point and adjust
-            // our starting point and `seen` array
-            if i == writes.len() || !seen.insert(writes[i].offset.value) {
-                self.write_without_overlaps(
-                    job_id,
-                    &writes[start..i],
-                    only_write_unwritten,
-                    iov_max,
-                )?;
-                // Keep going, resetting the hashmap and start position
-                if i != writes.len() {
-                    seen.clear();
-                    seen.insert(writes[i].offset.value);
-                    start = i;
-                }
+        while start < writes.len() {
+            // Skip written blocks if `only_write_unwritten` is true
+            if only_write_unwritten && self.block_written[start] {
+                start += 1;
+                continue;
             }
+            let mut end = start + 1;
+
+            // Loop until
+            // - We run off the end of the array
+            // - We hit the max iovec size (with each write taking 2 ioops)
+            // - We find a block which is not contiguous with its predecessor
+            // - We find a block that should be skipped due to
+            //   only_write_unwritten
+            //
+            // After this loop, `end` is the index of the first block that
+            // **should not** be written.
+            while end < writes.len().min(start + iov_max * 2)
+                && writes[end - 1].offset.value + 1 == writes[end].offset.value
+                && !(only_write_unwritten
+                    && self.block_written[writes[end].offset.value as usize])
+            {
+                end += 1;
+            }
+            self.write_contiguous(job_id, &writes[start..end]);
+            start = end;
         }
         Ok(())
     }
@@ -135,7 +147,282 @@ impl ExtentInner for RawInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         out: &mut RawReadResponse,
+        iov_max: usize,
     ) -> Result<(), CrucibleError> {
+        // Find the largest contiguous read, as a slice of the `requests` input
+        let mut start = 0;
+        while start < requests.len() {
+            let mut end = start + 1;
+
+            // Loop until
+            // - We run off the end of the array
+            // - We hit the max iovec size (with each write taking 2 ioops)
+            // - We find a block which is not contiguous with its predecessor
+            // - We find a block that should be skipped due to
+            //   only_write_unwritten
+            //
+            // After this loop, `end` is the index of the first block that
+            // **should not** be written.
+            while end < requests.len().min(start + iov_max * 2)
+                && requests[end - 1].offset.value + 1
+                    == requests[end].offset.value
+            {
+                end += 1;
+            }
+            self.read_contiguous_into(job_id, &requests[start..end], out)?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+        job_id: JobOrReconciliationId,
+    ) -> Result<(), CrucibleError> {
+        if !self.dirty()? {
+            /*
+             * If we have made no writes to this extent since the last flush,
+             * we do not need to update the extent on disk
+             */
+            return Ok(());
+        }
+
+        cdt::extent__flush__start!(|| {
+            (job_id.get(), self.extent_number, 0)
+        });
+
+        // We put all of our metadata updates into a single write to make this
+        // operation atomic.
+        self.set_flush_number(new_flush, new_gen)?;
+
+        // Now, we fsync to ensure data is flushed to disk.  It's okay to crash
+        // before this point, because setting the flush number is atomic.
+        cdt::extent__flush__file__start!(|| {
+            (job_id.get(), self.extent_number, 0)
+        });
+        if let Err(e) = self.file.sync_all() {
+            /*
+             * XXX Retry?  Mark extent as broken?
+             */
+            return Err(CrucibleError::IoError(format!(
+                "extent {}: fsync 1 failure: {e:?}",
+                self.extent_number,
+            )));
+        }
+        cdt::extent__flush__file__done!(|| {
+            (job_id.get(), self.extent_number, 0)
+        });
+
+        cdt::extent__flush__done!(|| { (job_id.get(), self.extent_number, 0) });
+
+        Ok(())
+    }
+}
+
+impl RawInner {
+    pub fn create(
+        dir: &Path,
+        def: &RegionDefinition,
+        extent_number: u32,
+    ) -> Result<Self, CrucibleError> {
+        let path = extent_path(dir, extent_number);
+        let extent_size = def.extent_size();
+        let layout = RawLayout::new(extent_size);
+        let size = layout.file_size();
+
+        mkdir_for_file(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+
+        // All 0s are fine for everything except extent version in the metadata
+        file.set_len(size)?;
+        let mut out = Self {
+            file,
+            dirty: false,
+            extent_size,
+            block_written: vec![false; def.extent_size().value as usize],
+            layout,
+            extent_number,
+        };
+        // Setting the flush number also writes the extent version, since
+        // they're serialized together in the same block.
+        out.set_flush_number(0, 0)?;
+
+        // Sync the file to disk, to avoid any questions
+        if let Err(e) = out.file.sync_all() {
+            return Err(CrucibleError::IoError(format!(
+                "extent {}: fsync 1 failure during initial sync: {e}",
+                out.extent_number,
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Constructs a new `Inner` object from files that already exist on disk
+    pub fn open(
+        dir: &Path,
+        def: &RegionDefinition,
+        extent_number: u32,
+        read_only: bool,
+        log: &Logger,
+    ) -> Result<Self, CrucibleError> {
+        let path = extent_path(dir, extent_number);
+        let extent_size = def.extent_size();
+        let layout = RawLayout::new(extent_size);
+        let size = layout.file_size();
+
+        /*
+         * Open the extent file and verify the size is as we expect.
+         */
+        let file =
+            match OpenOptions::new().read(true).write(!read_only).open(&path) {
+                Err(e) => {
+                    error!(
+                        log,
+                        "Open of {path:?} for extent#{extent_number} \
+                         returned: {e}",
+                    );
+                    return Err(CrucibleError::IoError(format!(
+                        "extent {extent_number}: open of {path:?} failed: {e}",
+                    )));
+                }
+                Ok(f) => {
+                    let cur_size = f.metadata().unwrap().len();
+                    if size != cur_size {
+                        return Err(CrucibleError::IoError(format!(
+                            "extent {extent_number}: file size {cur_size:?} \
+                             does not match expected {size:?}",
+                        )));
+                    }
+                    f
+                }
+            };
+
+        // Just in case, let's be very sure that the file on disk is what it
+        // should be
+        if !read_only {
+            if let Err(e) = file.sync_all() {
+                return Err(CrucibleError::IoError(format!(
+                    "extent {extent_number}: \
+                     fsync 1 failure during initial rehash: {e}",
+                )));
+            }
+        }
+
+        let layout = RawLayout::new(def.extent_size());
+        let meta = layout.get_metadata(&file)?;
+
+        // If the file is dirty, then we have to recompute whether blocks are
+        // written or not.  This is slow, but can't be avoided; we closed the
+        // file without a flush so we can't be confident about the data that was
+        // on disk.
+        let block_written = if !meta.dirty {
+            // Easy case first: if it's **not** dirty, then just assign active
+            // slots based on the bitpacked active context buffer from the file.
+            layout.get_block_written_array(&file)?
+        } else {
+            // Now that we've read the context slot arrays, read file data and
+            // figure out which context slot is active.
+            let mut file_buffered = BufReader::with_capacity(64 * 1024, &file);
+            let mut block_written = vec![];
+            for i in 0..layout.block_count() {
+                let mut buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
+                file_buffered.read_exact(&mut buf)?;
+                block_written.push(buf[0] != 0);
+
+                // Skip the bulk data, on to the next block's context slot
+                file_buffered
+                    .seek_relative(extent_size.block_size_in_bytes() as i64);
+            }
+            block_written
+        };
+
+        Ok(Self {
+            file,
+            dirty: meta.dirty,
+            extent_number,
+            extent_size: def.extent_size(),
+            block_written,
+            layout: RawLayout::new(def.extent_size()),
+        })
+    }
+
+    fn set_dirty(&mut self) -> Result<(), CrucibleError> {
+        if !self.dirty {
+            self.layout.set_dirty(&self.file)?;
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn get_metadata(&self) -> Result<OnDiskMeta, CrucibleError> {
+        self.layout.get_metadata(&self.file)
+    }
+
+    /// Update the flush number, generation number, and clear the dirty bit
+    fn set_flush_number(
+        &mut self,
+        new_flush: u64,
+        new_gen: u64,
+    ) -> Result<(), CrucibleError> {
+        self.layout.write_block_written_and_metadata(
+            &self.file,
+            &self.block_written,
+            false, // dirty
+            new_flush,
+            new_gen,
+        )?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Implementation details for `ExtentInner::write`
+    ///
+    /// This function requires that `writes` be a contiguous set of blocks of
+    /// size `iov_max / 2` or smaller.
+    fn write_contiguous(
+        &mut self,
+        job_id: JobId,
+        writes: &[crucible_protocol::Write],
+    ) -> Result<(), CrucibleError> {
+        todo!()
+    }
+
+    fn read_contiguous_into(
+        &mut self,
+        job_id: JobId,
+        requests: &[crucible_protocol::ReadRequest],
+        out: &mut RawReadResponse,
+    ) -> Result<(), CrucibleError> {
+        let block_size = self.extent_size.block_size_in_bytes();
+
+        let mut buf = out.data.split_off(out.data.len());
+        let n_blocks = requests.len();
+        buf.resize(n_blocks * block_size as usize, 1u8);
+
+        let mut ctxs =
+            vec![[0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize]; n_blocks];
+
+        let mut iovecs = Vec::with_capacity(n_blocks * 2);
+        for (ctx, chunk) in
+            ctxs.iter_mut().zip(buf.chunks_mut(block_size as usize))
+        {
+            iovecs.push(IoSliceMut::new(ctx));
+            iovecs.push(IoSliceMut::new(chunk));
+        }
+
+        // TODO build iovecs
+        // Do the read
+        // Deserialize the contexts
+        // Etc, etc
+
+        out.data.unsplit(buf);
+
         // This code batches up operations for contiguous regions of
         // ReadRequests, so we can perform larger read syscalls queries. This
         // significantly improves read throughput.
@@ -146,7 +433,6 @@ impl ExtentInner for RawInner {
         let mut req_run_start = 0;
         let block_size = self.extent_size.block_size_in_bytes();
 
-        let mut buf = out.data.split_off(out.data.len());
         while req_run_start < requests.len() {
             let first_req = &requests[req_run_start];
 
@@ -224,7 +510,6 @@ impl ExtentInner for RawInner {
             // This should be O(1), because we allocated enough space to not
             // reallocate anywhere in the process.
             let chunk = buf.split_to(expected_bytes);
-            out.data.unsplit(chunk);
 
             // Query the block metadata
             cdt::extent__read__get__contexts__start!(|| {
@@ -255,633 +540,6 @@ impl ExtentInner for RawInner {
 
             req_run_start += n_contiguous_blocks;
         }
-        Ok(())
-    }
-
-    fn flush(
-        &mut self,
-        new_flush: u64,
-        new_gen: u64,
-        job_id: JobOrReconciliationId,
-    ) -> Result<(), CrucibleError> {
-        if !self.dirty()? {
-            /*
-             * If we have made no writes to this extent since the last flush,
-             * we do not need to update the extent on disk
-             */
-            return Ok(());
-        }
-
-        cdt::extent__flush__start!(|| {
-            (job_id.get(), self.extent_number, 0)
-        });
-
-        // We put all of our metadata updates into a single write to make this
-        // operation atomic.
-        self.set_flush_number(new_flush, new_gen)?;
-
-        // Now, we fsync to ensure data is flushed to disk.  It's okay to crash
-        // before this point, because setting the flush number is atomic.
-        cdt::extent__flush__file__start!(|| {
-            (job_id.get(), self.extent_number, 0)
-        });
-        if let Err(e) = self.file.sync_all() {
-            /*
-             * XXX Retry?  Mark extent as broken?
-             */
-            return Err(CrucibleError::IoError(format!(
-                "extent {}: fsync 1 failure: {e:?}",
-                self.extent_number,
-            )));
-        }
-        cdt::extent__flush__file__done!(|| {
-            (job_id.get(), self.extent_number, 0)
-        });
-
-        cdt::extent__flush__done!(|| { (job_id.get(), self.extent_number, 0) });
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
-    ) -> Result<(), CrucibleError> {
-        self.set_dirty()?;
-        self.set_block_contexts(&[*block_context])?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        let out = RawInner::get_block_contexts(self, block, count)?;
-        Ok(out.into_iter().map(|v| v.into_iter().collect()).collect())
-    }
-}
-
-impl RawInner {
-    pub fn create(
-        dir: &Path,
-        def: &RegionDefinition,
-        extent_number: u32,
-    ) -> Result<Self, CrucibleError> {
-        let path = extent_path(dir, extent_number);
-        let extent_size = def.extent_size();
-        let layout = RawLayout::new(extent_size);
-        let size = layout.file_size();
-
-        mkdir_for_file(&path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)?;
-
-        // All 0s are fine for everything except extent version in the metadata
-        file.set_len(size)?;
-        let mut out = Self {
-            file,
-            dirty: false,
-            extent_size,
-            layout,
-            extent_number,
-        };
-        // Setting the flush number also writes the extent version, since
-        // they're serialized together in the same block.
-        out.set_flush_number(0, 0)?;
-
-        // Sync the file to disk, to avoid any questions
-        if let Err(e) = out.file.sync_all() {
-            return Err(CrucibleError::IoError(format!(
-                "extent {}: fsync 1 failure during initial sync: {e}",
-                out.extent_number,
-            )));
-        }
-        Ok(out)
-    }
-
-    /// Constructs a new `Inner` object from files that already exist on disk
-    pub fn open(
-        dir: &Path,
-        def: &RegionDefinition,
-        extent_number: u32,
-        read_only: bool,
-        log: &Logger,
-    ) -> Result<Self, CrucibleError> {
-        let path = extent_path(dir, extent_number);
-        let extent_size = def.extent_size();
-        let layout = RawLayout::new(extent_size);
-        let size = layout.file_size();
-
-        /*
-         * Open the extent file and verify the size is as we expect.
-         */
-        let file =
-            match OpenOptions::new().read(true).write(!read_only).open(&path) {
-                Err(e) => {
-                    error!(
-                        log,
-                        "Open of {path:?} for extent#{extent_number} \
-                         returned: {e}",
-                    );
-                    return Err(CrucibleError::IoError(format!(
-                        "extent {extent_number}: open of {path:?} failed: {e}",
-                    )));
-                }
-                Ok(f) => {
-                    let cur_size = f.metadata().unwrap().len();
-                    if size != cur_size {
-                        return Err(CrucibleError::IoError(format!(
-                            "extent {extent_number}: file size {cur_size:?} \
-                             does not match expected {size:?}",
-                        )));
-                    }
-                    f
-                }
-            };
-
-        // Just in case, let's be very sure that the file on disk is what it
-        // should be
-        if !read_only {
-            if let Err(e) = file.sync_all() {
-                return Err(CrucibleError::IoError(format!(
-                    "extent {extent_number}: \
-                     fsync 1 failure during initial rehash: {e}",
-                )));
-            }
-        }
-
-        let layout = RawLayout::new(def.extent_size());
-        let meta = layout.get_metadata(&file)?;
-
-        // If the file is dirty, then we have to recompute which context slot is
-        // active for every block.  This is slow, but can't be avoided; we
-        // closed the file without a flush so we can't be confident about the
-        // data that was on disk.
-        let active_context = if !meta.dirty {
-            // Easy case first: if it's **not** dirty, then just assign active
-            // slots based on the bitpacked active context buffer from the file.
-            layout.get_active_contexts(&file)?
-        } else {
-            // Otherwise, read block-size chunks and check hashes against
-            // both context slots, looking for a match.
-            let ctx_a = layout.read_context_slots_contiguous(
-                &file,
-                0,
-                layout.block_count(),
-                ContextSlot::A,
-            )?;
-            let ctx_b = layout.read_context_slots_contiguous(
-                &file,
-                0,
-                layout.block_count(),
-                ContextSlot::B,
-            )?;
-
-            // Now that we've read the context slot arrays, read file data and
-            // figure out which context slot is active.
-            let mut file_buffered = BufReader::with_capacity(64 * 1024, &file);
-            let mut active_context = vec![];
-            let mut buf = vec![0; extent_size.block_size_in_bytes() as usize];
-            let mut last_seek_block = 0;
-            for (block, (context_a, context_b)) in
-                ctx_a.into_iter().zip(ctx_b).enumerate()
-            {
-                let slot = if context_a.is_none() && context_b.is_none() {
-                    // Small optimization: if both context slots are empty, the
-                    // block must also be empty (and we don't need to read +
-                    // hash it, saving a little time)
-                    //
-                    // Note that if `context_a == context_b` but they are both
-                    // `Some(..)`, we still want to read + hash the block to
-                    // make sure that it matches. Otherwise, someone has managed
-                    // to corrupt our extent file on disk, which is Bad News.
-                    ContextSlot::A
-                } else {
-                    // Otherwise, we have to compute hashes from the file.
-                    if block != last_seek_block {
-                        file_buffered.seek_relative(
-                            (block - last_seek_block) as i64
-                                * extent_size.block_size_in_bytes() as i64,
-                        )?;
-                    }
-                    file_buffered.read_exact(&mut buf)?;
-                    last_seek_block = block + 1; // since we just read a block
-                    let hash = integrity_hash(&[&buf]);
-
-                    let mut matching_slot = None;
-                    let mut empty_slot = None;
-
-                    for slot in [ContextSlot::A, ContextSlot::B] {
-                        let context = [context_a, context_b][slot as usize];
-                        if let Some(context) = context {
-                            if context.on_disk_hash == hash {
-                                matching_slot = Some(slot);
-                            }
-                        } else if empty_slot.is_none() {
-                            empty_slot = Some(slot);
-                        }
-                    }
-
-                    matching_slot.or(empty_slot).ok_or(
-                        CrucibleError::MissingContextSlot(block as u64),
-                    )?
-                };
-                active_context.push(slot);
-            }
-            active_context
-        };
-
-        Ok(Self {
-            file,
-            active_context,
-            dirty: meta.dirty,
-            extent_number,
-            extent_size: def.extent_size(),
-            layout: RawLayout::new(def.extent_size()),
-        })
-    }
-
-    fn set_dirty(&mut self) -> Result<(), CrucibleError> {
-        if !self.dirty {
-            self.layout.set_dirty(&self.file)?;
-            self.dirty = true;
-        }
-        Ok(())
-    }
-
-    fn set_block_contexts(
-        &mut self,
-        block_contexts: &[DownstairsBlockContext],
-    ) -> Result<(), CrucibleError> {
-        // If any of these block contexts will be overwriting an unsynched
-        // context slot, then we insert a sync here.
-        let needs_sync = block_contexts.iter().any(|block_context| {
-            let block = block_context.block as usize;
-            // We'll be writing to the inactive slot
-            let slot = !self.active_context[block];
-            (self.context_slot_dirty[block] & (1 << slot as usize)) != 0
-        });
-        if needs_sync {
-            self.file.sync_all().map_err(|e| {
-                CrucibleError::IoError(format!(
-                    "extent {}: fsync 1 failure: {e}",
-                    self.extent_number,
-                ))
-            })?;
-            self.context_slot_dirty.fill(0);
-        }
-        // Mark the to-be-written slots as unsynched on disk
-        //
-        // It's harmless if we bail out before writing the actual context slot
-        // here, because all it will do is force a sync next time this is called
-        // (that sync is right above here!)
-        for block_context in block_contexts {
-            let block = block_context.block as usize;
-            let slot = !self.active_context[block];
-            self.context_slot_dirty[block] |= 1 << (slot as usize);
-        }
-
-        let mut start = 0;
-        let mut write_count = 0;
-        for i in 0..block_contexts.len() {
-            if i + 1 == block_contexts.len()
-                || block_contexts[i].block + 1 != block_contexts[i + 1].block
-            {
-                write_count += self.set_block_contexts_contiguous(
-                    &block_contexts[start..=i],
-                )?;
-                start = i + 1;
-            }
-        }
-        cdt::extent__set__block__contexts__write__count!(|| (
-            self.extent_number,
-            write_count,
-        ));
-        Ok(())
-    }
-
-    /// Efficiently sets block contexts in bulk
-    ///
-    /// Returns the number of writes, for profiling
-    ///
-    /// # Panics
-    /// `block_contexts` must represent a contiguous set of blocks
-    fn set_block_contexts_contiguous(
-        &mut self,
-        block_contexts: &[DownstairsBlockContext],
-    ) -> Result<u64, CrucibleError> {
-        for (a, b) in block_contexts.iter().zip(block_contexts.iter().skip(1)) {
-            assert_eq!(a.block + 1, b.block, "blocks must be contiguous");
-        }
-
-        let mut writes = 0u64;
-        for (slot, group) in block_contexts
-            .iter()
-            .group_by(|block_context| {
-                // We'll be writing to the inactive slot
-                !self.active_context[block_context.block as usize]
-            })
-            .into_iter()
-        {
-            let mut group = group.peekable();
-            let start = group.peek().unwrap().block;
-            self.layout.write_context_slots_contiguous(
-                &self.file,
-                start,
-                group.map(Option::Some),
-                slot,
-            )?;
-            writes += 1;
-        }
-        if let Some(writes) = writes.checked_sub(1) {
-            self.extra_syscall_count += writes;
-            self.extra_syscall_denominator += 1;
-        }
-
-        Ok(writes)
-    }
-
-    fn get_metadata(&self) -> Result<OnDiskMeta, CrucibleError> {
-        self.layout.get_metadata(&self.file)
-    }
-
-    /// Update the flush number, generation number, and clear the dirty bit
-    fn set_flush_number(
-        &mut self,
-        new_flush: u64,
-        new_gen: u64,
-    ) -> Result<(), CrucibleError> {
-        self.layout.write_metadata(
-            &self.file, false, // dirty
-            new_flush, new_gen,
-        )?;
-        self.dirty = false;
-        Ok(())
-    }
-
-    /// Returns the valid block contexts (or `None`) for the given block range
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Option<DownstairsBlockContext>>, CrucibleError> {
-        let mut out = vec![];
-        let mut reads = 0u64;
-        for (slot, group) in (block..block + count)
-            .group_by(|block| self.active_context[*block as usize])
-            .into_iter()
-        {
-            let mut group = group.peekable();
-            let start = *group.peek().unwrap();
-            let count = group.count();
-            out.extend(self.layout.read_context_slots_contiguous(
-                &self.file,
-                start,
-                count as u64,
-                slot,
-            )?);
-            reads += 1;
-        }
-        if let Some(reads) = reads.checked_sub(1) {
-            self.extra_syscall_count += reads;
-            self.extra_syscall_denominator += 1;
-        }
-
-        Ok(out)
-    }
-
-    fn write_inner(
-        &self,
-        writes: &[crucible_protocol::Write],
-        writes_to_skip: &HashSet<u64>,
-        iov_max: usize,
-    ) -> Result<(), CrucibleError> {
-        // Now, batch writes into iovecs and use pwritev to write them all out.
-        let mut batched_pwritev = BatchedPwritev::new(
-            self.file.as_fd(),
-            writes.len(),
-            self.extent_size.block_size_in_bytes().into(),
-            iov_max,
-        );
-
-        for write in writes {
-            if !writes_to_skip.contains(&write.offset.value) {
-                batched_pwritev.add_write(write)?;
-            }
-        }
-
-        // Write any remaining data
-        batched_pwritev.perform_writes()?;
-
-        Ok(())
-    }
-
-    /// Helper function to get a single block context
-    ///
-    /// This is inefficient and should only be used in unit tests
-    #[cfg(test)]
-    fn get_block_context(
-        &mut self,
-        block: u64,
-    ) -> Result<Option<DownstairsBlockContext>, CrucibleError> {
-        let mut out = self.get_block_contexts(block, 1)?;
-        assert_eq!(out.len(), 1);
-        Ok(out.pop().unwrap())
-    }
-
-    /// Implementation details for `ExtentInner::write`
-    ///
-    /// This function requires that `writes` not have any overlapping writes,
-    /// i.e. blocks that are written multiple times.  We write the contexts
-    /// first, then block data; if a single block is written multiple times,
-    /// then we'd write multiple contexts, then multiple block data, and it
-    /// would be possible for them to get out of sync.
-    fn write_without_overlaps(
-        &mut self,
-        job_id: JobId,
-        writes: &[crucible_protocol::Write],
-        only_write_unwritten: bool,
-        iov_max: usize,
-    ) -> Result<(), CrucibleError> {
-        /*
-         * In order to be crash consistent, perform the following steps in
-         * order:
-         *
-         * 1) set the dirty bit
-         * 2) for each write:
-         *   a) write out encryption context and hashes first
-         *   b) write out extent data second
-         *
-         * If encryption context is written after the extent data, a crash or
-         * interruption before extent data is written would potentially leave
-         * data on the disk that cannot be decrypted.
-         *
-         * If hash is written after extent data, same thing - a crash or
-         * interruption would leave data on disk that would fail the
-         * integrity hash check.
-         *
-         * Note that writing extent data here does not assume that it is
-         * durably on disk - the only guarantee of that is returning
-         * ok from fsync. The data is only potentially on disk and
-         * this depends on operating system implementation.
-         *
-         * To minimize the performance hit of sending many transactions to the
-         * filesystem, as much as possible is written at the same time. This
-         * means multiple loops are required. The steps now look like:
-         *
-         * 1) set the dirty bit
-         * 2) gather and write all encryption contexts + hashes
-         * 3) write all extent data
-         *
-         * If "only_write_unwritten" is true, then we only issue a write for
-         * a block if that block has not been written to yet.  Note
-         * that we can have a write that is "sparse" if the range of
-         * blocks it contains has a mix of written an unwritten
-         * blocks.
-         *
-         * We define a block being written to or not has if that block has
-         * `Some(...)` with a matching checksum serialized into a context slot
-         * or not. So it is required that a written block has a checksum.
-         */
-
-        // If `only_write_written`, we need to skip writing to blocks that
-        // already contain data. We'll first query the metadata to see which
-        // blocks have hashes
-        let mut writes_to_skip = HashSet::new();
-        if only_write_unwritten {
-            cdt::extent__write__get__hashes__start!(|| {
-                (job_id.0, self.extent_number, writes.len() as u64)
-            });
-            let mut write_run_start = 0;
-            while write_run_start < writes.len() {
-                let first_write = &writes[write_run_start];
-
-                // Starting from the first write in the potential run, we scan
-                // forward until we find a write with a block that isn't
-                // contiguous with the request before it. Since we're counting
-                // pairs, and the number of pairs is one less than the number of
-                // writes, we need to add 1 to get our actual run length.
-                let n_contiguous_writes = writes[write_run_start..]
-                    .windows(2)
-                    .take_while(|wr_pair| {
-                        wr_pair[0].offset.value + 1 == wr_pair[1].offset.value
-                    })
-                    .count()
-                    + 1;
-
-                // Query hashes for the write range.
-                let block_contexts = self.get_block_contexts(
-                    first_write.offset.value,
-                    n_contiguous_writes as u64,
-                )?;
-
-                for (i, block_contexts) in block_contexts.iter().enumerate() {
-                    if block_contexts.is_some() {
-                        let _ = writes_to_skip
-                            .insert(i as u64 + first_write.offset.value);
-                    }
-                }
-
-                write_run_start += n_contiguous_writes;
-            }
-            cdt::extent__write__get__hashes__done!(|| {
-                (job_id.0, self.extent_number, writes.len() as u64)
-            });
-
-            if writes_to_skip.len() == writes.len() {
-                // Nothing to do
-                return Ok(());
-            }
-        }
-
-        self.set_dirty()?;
-
-        // Write all the context data to the raw file
-        //
-        // TODO right now we're including the integrity_hash() time in the
-        // measured time.  Is it small enough to be ignored?
-        cdt::extent__write__raw__context__insert__start!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
-        });
-
-        // Compute block contexts, then write them to disk
-        let block_ctx: Vec<_> = writes
-            .iter()
-            .filter(|write| !writes_to_skip.contains(&write.offset.value))
-            .map(|write| {
-                // TODO it would be nice if we could profile what % of time we're
-                // spending on hashes locally vs writing to disk
-                let on_disk_hash = integrity_hash(&[&write.data[..]]);
-
-                DownstairsBlockContext {
-                    block_context: write.block_context,
-                    block: write.offset.value,
-                    on_disk_hash,
-                }
-            })
-            .collect();
-
-        self.set_block_contexts(&block_ctx)?;
-
-        cdt::extent__write__raw__context__insert__done!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
-        });
-
-        // PERFORMANCE TODO:
-        //
-        // Something worth considering for small writes is that, based on
-        // my memory of conversations we had with propolis folks about what
-        // OSes expect out of an NVMe driver, I believe our contract with the
-        // upstairs doesn't require us to have the writes inside the file
-        // until after a flush() returns. If that is indeed true, we could
-        // buffer a certain amount of writes, only actually writing that
-        // buffer when either a flush is issued or the buffer exceeds some
-        // set size (based on our memory constraints). This would have
-        // benefits on any workload that frequently writes to the same block
-        // between flushes, would have benefits for small contiguous writes
-        // issued over multiple write commands by letting us batch them into
-        // a larger write, and (speculation) may benefit non-contiguous writes
-        // by cutting down the number of metadata writes. But, it introduces
-        // complexity. The time spent implementing that would probably better be
-        // spent switching to aio or something like that.
-        cdt::extent__write__file__start!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
-        });
-
-        let r = self.write_inner(writes, &writes_to_skip, iov_max);
-
-        if r.is_err() {
-            for write in writes.iter() {
-                let block = write.offset.value;
-                if !writes_to_skip.contains(&block) {
-                    // Try to recompute the context slot from the file.  If this
-                    // fails, then we _really_ can't recover, so bail out
-                    // unceremoniously.
-                    self.recompute_slot_from_file(block).unwrap();
-                }
-            }
-        } else {
-            // Now that writes have gone through, update active context slots
-            for write in writes.iter() {
-                let block = write.offset.value;
-                if !writes_to_skip.contains(&block) {
-                    // We always write to the inactive slot, so just swap it
-                    self.active_context[block as usize] =
-                        !self.active_context[block as usize];
-                }
-            }
-        }
-
-        cdt::extent__write__file__done!(|| {
-            (job_id.0, self.extent_number, writes.len() as u64)
-        });
-
         Ok(())
     }
 }
@@ -925,6 +583,7 @@ impl RawLayout {
         (self.block_size() + BLOCK_CONTEXT_SLOT_SIZE_BYTES)
             .checked_mul(block_count)
             .unwrap()
+            + (block_count + 7) / 8
             + BLOCK_META_SIZE_BYTES
     }
 
@@ -933,9 +592,19 @@ impl RawLayout {
         self.extent_size.value
     }
 
+    /// Returns the byte offset of the `block_written` bitpacked array
+    fn block_written_array_offset(&self) -> u64 {
+        self.block_count() * (self.block_size() + BLOCK_CONTEXT_SLOT_SIZE_BYTES)
+    }
+
+    /// Returns the size of the `block_written` bitpacked array, in bytes
+    fn block_written_array_size(&self) -> u64 {
+        (self.block_count() + 7) / 8
+    }
+
     /// Returns the offset of the metadata chunk of the file
     fn metadata_offset(&self) -> u64 {
-        (self.block_count() + BLOCK_CONTEXT_SLOT_SIZE_BYTES) * self.block_size()
+        self.block_written_array_offset() + self.block_written_array_size()
     }
 
     /// Number of bytes in each block
@@ -959,15 +628,27 @@ impl RawLayout {
     /// This is done in a single write, so it should be atomic.
     ///
     /// # Panics
-    /// `active_context.len()` must match `self.block_count()`, and the function
+    /// `block_written.len()` must match `self.block_count()`, and the function
     /// will panic otherwise.
-    fn write_metadata(
+    fn write_block_written_and_metadata(
         &self,
         file: &File,
+        block_written: &[bool],
         dirty: bool,
         flush_number: u64,
         gen_number: u64,
     ) -> Result<(), CrucibleError> {
+        assert_eq!(block_written.len(), self.block_count() as usize);
+
+        let mut buf = vec![];
+        for c in block_written.chunks(8) {
+            let mut v = 0;
+            for (i, w) in c.iter().enumerate() {
+                v |= (*w as u8) << i;
+            }
+            buf.push(v);
+        }
+
         let d = OnDiskMeta {
             dirty,
             flush_number,
@@ -976,14 +657,44 @@ impl RawLayout {
         };
         let mut meta = [0u8; BLOCK_META_SIZE_BYTES as usize];
         bincode::serialize_into(meta.as_mut_slice(), &d).unwrap();
+        bincode::serialize_into(meta.as_mut_slice(), &d).unwrap();
+        buf.extend(meta);
 
-        let offset = self.metadata_offset();
+        let offset = self.block_written_array_offset();
 
         pwrite_all(file.as_fd(), &meta, offset as i64).map_err(|e| {
             CrucibleError::IoError(format!("writing metadata failed: {e}"))
         })?;
 
         Ok(())
+    }
+
+    /// Decodes the block written array from the given file
+    ///
+    /// The file descriptor offset is not changed by this function
+    fn get_block_written_array(
+        &self,
+        file: &File,
+    ) -> Result<Vec<bool>, CrucibleError> {
+        let mut buf = vec![0u8; self.block_written_array_size() as usize];
+        let offset = self.block_written_array_offset();
+        pread_all(file.as_fd(), &mut buf, offset as i64).map_err(|e| {
+            CrucibleError::IoError(format!(
+                "could not read active contexts: {e}"
+            ))
+        })?;
+
+        let mut block_written = vec![];
+        for bit in buf
+            .iter()
+            .flat_map(|b| (0..8).map(move |i| b & (1 << i)))
+            .take(self.block_count() as usize)
+        {
+            // Unpack bits from each byte
+            block_written.push(bit != 0);
+        }
+        assert_eq!(block_written.len(), self.block_count() as usize);
+        Ok(block_written)
     }
 }
 
@@ -1342,658 +1053,16 @@ mod test {
     }
 
     #[test]
-    fn test_auto_sync() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write a block, but don't flush.
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
-            data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
-        };
-
-        // Write block 1, so that we can notice when a sync happens.  The write
-        // should go to slot B.
-        let write1 = crucible_protocol::Write {
-            offset: Block::new_512(1),
-            ..write.clone()
-        };
-        inner.write(JobId(10), &[write1], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.context_slot_dirty[0], 0b00);
-        assert_eq!(inner.context_slot_dirty[1], 0b10);
-
-        // The context should be written to block 0, slot B
-        inner.write(JobId(10), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.context_slot_dirty[0], 0b10);
-        assert_eq!(inner.context_slot_dirty[1], 0b10); // unchanged
-
-        // The context should be written to block 0, slot A
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.context_slot_dirty[0], 0b11);
-        assert_eq!(inner.context_slot_dirty[1], 0b10); // unchanged
-
-        // The context should be written to slot B, forcing a sync
-        inner.write(JobId(12), &[write], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.context_slot_dirty[0], 0b10);
-        assert_eq!(inner.context_slot_dirty[1], 0b00);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_auto_sync_flush() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write a block, but don't flush.
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
-            data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
-        };
-        // The context should be written to slot B
-        inner.write(JobId(10), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::B);
-        assert_eq!(inner.context_slot_dirty[0], 0b10);
-
-        // Flush!  This will mark all slots as synched
-        inner.flush(12, 12, JobId(11).into())?;
-        assert_eq!(inner.active_context[0], ContextSlot::B);
-        assert_eq!(inner.context_slot_dirty[0], 0b00);
-
-        // The context should be written to slot A
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::A);
-        assert_eq!(inner.context_slot_dirty[0], 0b01);
-
-        // The context should be written to slot B
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::B);
-        assert_eq!(inner.context_slot_dirty[0], 0b11);
-
-        // The context should be written to slot A, forcing a sync
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::A);
-        assert_eq!(inner.context_slot_dirty[0], 0b01);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_auto_sync_flush_2() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write a block, but don't flush.
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        let write = crucible_protocol::Write {
-            eid: 0,
-            offset: Block::new_512(0),
-            data,
-            block_context: BlockContext {
-                encryption_context: None,
-                hash,
-            },
-        };
-        // The context should be written to slot B
-        inner.write(JobId(10), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::B);
-        assert_eq!(inner.context_slot_dirty[0], 0b10);
-
-        // The context should be written to slot A
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::A);
-        assert_eq!(inner.context_slot_dirty[0], 0b11);
-
-        // Flush!  This will mark all slots as synched
-        inner.flush(12, 12, JobId(11).into())?;
-        assert_eq!(inner.active_context[0], ContextSlot::A);
-        assert_eq!(inner.context_slot_dirty[0], 0b00);
-
-        // The context should be written to slot B
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::B);
-        assert_eq!(inner.context_slot_dirty[0], 0b10);
-
-        // The context should be written to slot A
-        inner.write(JobId(12), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::A);
-        assert_eq!(inner.context_slot_dirty[0], 0b11);
-
-        // The context should be written to slot B, forcing a sync
-        inner.write(JobId(11), &[write.clone()], false, IOV_MAX_TEST)?;
-        assert_eq!(inner.active_context[0], ContextSlot::B);
-        assert_eq!(inner.context_slot_dirty[0], 0b10);
-
-        Ok(())
-    }
-
-    /// If a write successfully put a context into a context slot, but it never
-    /// actually got the data onto the disk, that block should revert back to
-    /// being "unwritten". After all, the data never was truly written.
-    ///
-    /// This test is very similar to test_region_open_removes_partial_writes.
-    #[test]
-    fn test_reopen_marks_blocks_unwritten_if_data_never_hit_disk() -> Result<()>
-    {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Partial write, the data never hits disk, but there's a context
-        // in the DB and the dirty flag is set.
-        inner.set_dirty_and_block_context(&DownstairsBlockContext {
-            block_context: BlockContext {
-                encryption_context: None,
-                hash: 1024,
-            },
-            block: 0,
-            on_disk_hash: 65536,
-        })?;
-        drop(inner);
-
-        // Reopen, which should note that the hash doesn't match on-disk values
-        // and decide that block 0 is unwritten.
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Writing to block 0 should succeed with only_write_unwritten
-        {
-            let data = Bytes::from(vec![0x66; 512]);
-            let hash = integrity_hash(&[&data[..]]);
-            let block_context = BlockContext {
-                encryption_context: None,
-                hash,
-            };
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(0),
-                data: data.clone(),
-                block_context,
-            };
-            inner.write(JobId(30), &[write], true, IOV_MAX_TEST)?;
-
-            let read = ReadRequest {
-                eid: 0,
-                offset: Block::new_512(0),
-            };
-            let resp = inner.read(JobId(31), &[read])?;
-
-            // We should get back our data! Block 1 was never written.
-            assert_eq!(
-                resp.blocks,
-                vec![ReadResponseBlockMetadata {
-                    eid: 0,
-                    offset: Block::new_512(0),
-                    block_contexts: vec![block_context]
-                }]
-            );
-            assert_eq!(resp.data, BytesMut::from(data.as_ref()));
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_defragment_full() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write every other block, so that the active context slot alternates
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        for i in 0..5 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
-        }
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-        assert_eq!(inner.extra_syscall_count, 0);
-        assert_eq!(inner.extra_syscall_denominator, 5);
-        inner.flush(10, 10, JobId(10).into())?;
-        assert!(inner.context_slot_dirty.iter().all(|v| *v == 0));
-
-        // This should not have changed active context slots!
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-
-        // Now, do one big write, which will be forced to bounce between the
-        // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        for i in 0..10 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            writes.push(write);
-        }
-        // This write has toggled every single context slot
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 {
-                    ContextSlot::A
-                } else {
-                    ContextSlot::B
-                },
-                "invalid context slot at {i}",
-            );
-        }
-        assert!(inner.extra_syscall_count > 0);
-        assert_eq!(inner.extra_syscall_denominator, 1);
-
-        // Do a flush!  Because we had a bunch of extra syscalls, this should
-        // trigger defragmentation; after the flush, every context slot should
-        // be in array A.
-        inner.flush(11, 11, JobId(11).into())?;
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                ContextSlot::A,
-                "invalid context slot at {i}",
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_defragment_into_b() -> Result<()> {
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write every other block, so that the active context slot alternates
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-
-        for i in 0..3 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
-        }
-        // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
-        // --|---|---|---|---|---|---|---|---|---
-        // B | A | B | A | B | A | A | A | A | A
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 4 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-        assert_eq!(inner.extra_syscall_count, 0);
-        assert_eq!(inner.extra_syscall_denominator, 3);
-        inner.flush(10, 10, JobId(10).into())?;
-
-        // This should not have changed active context slots!
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 4 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-
-        // Now, do one big write, which will be forced to bounce between the
-        // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        for i in 0..10 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            writes.push(write);
-        }
-        // This write should toggled every single context slot:
-        // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
-        // --|---|---|---|---|---|---|---|---|---
-        // A | B | A | B | A | B | B | B | B | B
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 4 {
-                    ContextSlot::A
-                } else {
-                    ContextSlot::B
-                },
-                "invalid context slot at {i}",
-            );
-        }
-        assert!(inner.extra_syscall_count > 0);
-        assert_eq!(inner.extra_syscall_denominator, 1);
-
-        // Do a flush!  Because we had a bunch of extra syscalls, this should
-        // trigger defragmentation; after the flush, every context slot should
-        // be in array B (which minimizes copies)
-        inner.flush(11, 11, JobId(11).into())?;
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                ContextSlot::B,
-                "invalid context slot at {i}",
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_defragment_into_a() -> Result<()> {
-        // Identical to `test_defragment_a`, except that we force the
-        // defragmentation to copy into the A slots
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write every other block, so that the active context slot alternates
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-
-        for i in 0..3 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
-        }
-        // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
-        // --|---|---|---|---|---|---|---|---|---
-        // B | A | B | A | B | A | A | A | A | A
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 4 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-        assert_eq!(inner.extra_syscall_count, 0);
-        assert_eq!(inner.extra_syscall_denominator, 3);
-        inner.flush(10, 10, JobId(10).into())?;
-
-        // This should not have changed active context slots!
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 4 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-
-        // Now, do two big writes, which will be forced to bounce between the
-        // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        for i in 0..10 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            writes.push(write);
-        }
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        // This write should toggled every single context slot:
-        // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
-        // --|---|---|---|---|---|---|---|---|---
-        // B | A | B | A | B | A | A | A | A | A
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 4 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                },
-                "invalid context slot at {i}",
-            );
-        }
-        assert!(inner.extra_syscall_count > 0);
-        assert_eq!(inner.extra_syscall_denominator, 2);
-
-        // Do a flush!  Because we had a bunch of extra syscalls, this should
-        // trigger defragmentation; after the flush, every context slot should
-        // be in array A (which minimizes copies)
-        inner.flush(11, 11, JobId(11).into())?;
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                ContextSlot::A,
-                "invalid context slot at {i}",
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_defragment_not_enough() -> Result<()> {
-        // Identical to `test_defragment_a`, except that we force the
-        // defragmentation to copy into the A slots
-        let dir = tempdir()?;
-        let mut inner =
-            RawInner::create(dir.as_ref(), &new_region_definition(), 0)
-                .unwrap();
-
-        // Write every other block, so that the active context slot alternates
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-
-        for i in 0..2 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i * 2),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            inner.write(JobId(30), &[write], false, IOV_MAX_TEST)?;
-        }
-        // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
-        // --|---|---|---|---|---|---|---|---|---
-        // B | A | B | A | A | A | A | A | A | A
-
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 2 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-        assert_eq!(inner.extra_syscall_count, 0);
-        assert_eq!(inner.extra_syscall_denominator, 2);
-        inner.flush(10, 10, JobId(10).into())?;
-
-        // This should not have changed active context slots!
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 2 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                }
-            );
-        }
-
-        // Now, do two big writes, which will be forced to bounce between the
-        // context slots.
-        let mut writes = vec![];
-        let data = Bytes::from(vec![0x33; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-        for i in 0..10 {
-            let write = crucible_protocol::Write {
-                eid: 0,
-                offset: Block::new_512(i),
-                data: data.clone(),
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash,
-                },
-            };
-            writes.push(write);
-        }
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
-        // This write should toggled every single context slot:
-        // 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
-        // --|---|---|---|---|---|---|---|---|---
-        // B | A | B | A | A | A | A | A | A | A
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 2 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                },
-                "invalid context slot at {i}",
-            );
-        }
-        assert!(inner.extra_syscall_count > 0);
-        assert_eq!(inner.extra_syscall_denominator, 2);
-
-        // This write didn't add enough extra syscalls to trigger
-        // defragmentation.
-        inner.flush(11, 11, JobId(11).into())?;
-
-        // These should be the same!
-        for i in 0..10 {
-            assert_eq!(
-                inner.active_context[i],
-                if i % 2 == 0 && i <= 2 {
-                    ContextSlot::B
-                } else {
-                    ContextSlot::A
-                },
-                "invalid context slot at {i}",
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn test_serialized_sizes() {
-        let c = OnDiskDownstairsBlockContext {
-            block_context: BlockContext {
-                hash: u64::MAX,
-                encryption_context: Some(EncryptionContext {
-                    nonce: [0xFF; 12],
-                    tag: [0xFF; 16],
-                }),
-            },
-            on_disk_hash: u64::MAX,
+        let ctx = BlockContext {
+            hash: u64::MAX,
+            encryption_context: Some(EncryptionContext {
+                nonce: [0xFF; 12],
+                tag: [0xFF; 16],
+            }),
         };
         let mut ctx_buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
-        bincode::serialize_into(ctx_buf.as_mut_slice(), &Some(c)).unwrap();
+        bincode::serialize_into(ctx_buf.as_mut_slice(), &Some(ctx)).unwrap();
 
         let m = OnDiskMeta {
             dirty: true,
@@ -2032,12 +1101,10 @@ mod test {
             })
             .collect();
 
-        assert_eq!(inner.context_slot_dirty[0], 0b00);
         inner.write(JobId(30), &writes, false, IOV_MAX_TEST)?;
 
         // The write should be split into four separate calls to
-        // `write_without_overlaps`, triggering one bonus fsync.
-        assert_eq!(inner.context_slot_dirty[0], 0b11);
+        // `write_without_overlaps`
 
         // Block 0 should be 0x03 repeated.
         let read = ReadRequest {

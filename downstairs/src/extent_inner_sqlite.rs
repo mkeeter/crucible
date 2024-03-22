@@ -48,6 +48,7 @@ impl ExtentInner for SqliteInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         out: &mut RawReadResponse,
+        _iov_max: usize, // unused by SQLite backend
     ) -> Result<(), CrucibleError> {
         self.0.lock().unwrap().read_into(job_id, requests, out)
     }
@@ -65,26 +66,6 @@ impl ExtentInner for SqliteInner {
             only_write_unwritten,
             iov_max,
         )
-    }
-
-    #[cfg(test)]
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        self.0.lock().unwrap().get_block_contexts(block, count)
-    }
-
-    #[cfg(test)]
-    fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
-    ) -> Result<(), CrucibleError> {
-        self.0
-            .lock()
-            .unwrap()
-            .set_dirty_and_block_context(block_context)
     }
 }
 
@@ -138,6 +119,26 @@ impl SqliteInner {
             .truncate_encryption_contexts_and_hashes(
                 extent_block_indexes_and_hashes,
             )
+    }
+
+    #[cfg(test)]
+    fn set_dirty_and_block_context(
+        &mut self,
+        block_context: &DownstairsBlockContext,
+    ) -> Result<(), CrucibleError> {
+        self.0
+            .lock()
+            .unwrap()
+            .set_dirty_and_block_context(block_context)
+    }
+
+    #[cfg(test)]
+    fn get_block_contexts(
+        &mut self,
+        block: u64,
+        count: u64,
+    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
+        self.0.lock().unwrap().get_block_contexts(block, count)
     }
 }
 

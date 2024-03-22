@@ -47,6 +47,7 @@ pub(crate) trait ExtentInner: Send + Sync + Debug {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         out: &mut RawReadResponse,
+        iov_max: usize,
     ) -> Result<(), CrucibleError>;
 
     /// Performs a read then destructures into a `Vec<ReadResponse>`
@@ -71,23 +72,6 @@ pub(crate) trait ExtentInner: Send + Sync + Debug {
         writes: &[crucible_protocol::Write],
         only_write_unwritten: bool,
         iov_max: usize,
-    ) -> Result<(), CrucibleError>;
-
-    #[cfg(test)]
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError>;
-
-    /// Sets the dirty flag and updates a block context
-    ///
-    /// This should only be called from test functions, where we want to
-    /// manually modify block contexts and test associated behavior
-    #[cfg(test)]
-    fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
     ) -> Result<(), CrucibleError>;
 }
 
@@ -612,15 +596,6 @@ impl Extent {
             flush_number: self.inner.flush_number().unwrap(),
             dirty: self.inner.dirty().unwrap(),
         }
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
-    ) -> Result<(), CrucibleError> {
-        self.inner.set_dirty_and_block_context(block_context)
     }
 
     #[cfg(test)]

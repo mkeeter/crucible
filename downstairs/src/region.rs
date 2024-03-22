@@ -1307,7 +1307,6 @@ pub(crate) mod test {
     use crate::dump::dump_region;
     use crate::extent::{
         completed_dir, copy_dir, extent_path, remove_copy_cleanup_dir,
-        DownstairsBlockContext,
     };
 
     use super::*;
@@ -2622,88 +2621,6 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
-    async fn test_region_open_removes_partial_writes() -> Result<()> {
-        // Opening a dirty extent should fully rehash the extent to remove any
-        // contexts that don't correlate with data on disk. This is necessary
-        // for write_unwritten to work after a crash, and to move us into a
-        // good state for flushes (flushes only clear out contexts for blocks
-        // written since the last flush)
-        //
-        // Specifically, this test checks for the case where we had a brand new
-        // block and a write to that blocks that failed such that only the
-        // write's block context was persisted, leaving the data all zeros. In
-        // this case, there is no data, so we should remove the invalid block
-        // context row.
-
-        let dir = tempdir()?;
-        let mut region =
-            Region::create(&dir, new_region_options(), csl()).await?;
-        region.extend(1).await?;
-
-        // A write of some sort only wrote a block context row and dirty flag
-        {
-            let ext = region.get_opened_extent_mut(0);
-            ext.set_dirty_and_block_context(&DownstairsBlockContext {
-                block_context: BlockContext {
-                    encryption_context: None,
-                    hash: 1024,
-                },
-                block: 0,
-                on_disk_hash: 65536,
-            })
-            .await?;
-        }
-
-        // This should clear out the invalid contexts
-        for eid in 0..region.extents.len() {
-            region.close_extent(eid).await.unwrap();
-        }
-
-        region.reopen_all_extents().await?;
-
-        // Verify no block context rows exist
-        {
-            let ext = region.get_opened_extent_mut(0);
-            assert!(ext.get_block_contexts(0, 1).await?[0].is_empty());
-        }
-
-        // Assert write unwritten will write to the first block
-
-        let data = Bytes::from(vec![0x55; 512]);
-        let hash = integrity_hash(&[&data[..]]);
-
-        region
-            .region_write(
-                &[crucible_protocol::Write {
-                    eid: 0,
-                    offset: Block::new_512(0),
-                    data,
-                    block_context: BlockContext {
-                        encryption_context: None,
-                        hash,
-                    },
-                }],
-                JobId(124),
-                true, // only_write_unwritten
-            )
-            .await?;
-
-        let responses = region
-            .region_read(
-                &[crucible_protocol::ReadRequest {
-                    eid: 0,
-                    offset: Block::new_512(0),
-                }],
-                JobId(125),
-            )
-            .await?;
-
-        assert_eq!(responses.data, vec![0x55; 512]);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_ok_hash_ok() -> Result<()> {
         let dir = tempdir()?;
         let mut region =
@@ -3841,21 +3758,30 @@ pub(crate) mod test {
 
         for (i, range) in ranges.iter().enumerate() {
             // Get the contexts for the range
-            let ctxts = ext
-                .get_block_contexts(range.start, range.end - range.start)
-                .await?;
+            let mut resp = RawReadResponse::with_capacity(
+                (range.end - range.start) as usize,
+                512,
+            );
+            let reqs = range
+                .into_iter()
+                .map(|i| ReadRequest {
+                    eid: 0,
+                    offset: Block::new_512(i),
+                })
+                .collect::<Vec<_>>();
+            ext.read_into(JobId(i as u64), &reqs, &mut resp).await?;
 
             // Every block should have at most 1 block
             assert_eq!(
-                ctxts.iter().map(|block_ctxts| block_ctxts.len()).max(),
+                resp.blocks.iter().map(|b| b.block_contexts.len()).max(),
                 Some(1)
             );
 
             // Now that we've checked that, flatten out for an easier eq
-            let actual_ctxts: Vec<_> = ctxts
+            let actual_ctxts: Vec<_> = resp
+                .blocks
                 .iter()
-                .flatten()
-                .map(|downstairs_context| &downstairs_context.block_context)
+                .flat_map(|b| b.block_contexts.iter())
                 .collect();
 
             // What we expect is the hashes for the last write we did

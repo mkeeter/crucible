@@ -189,6 +189,7 @@ impl ExtentInner for RawInner {
         job_id: JobId,
         requests: &[crucible_protocol::ReadRequest],
         out: &mut RawReadResponse,
+        _iov_max: usize, // unused by raw file backend
     ) -> Result<(), CrucibleError> {
         // This code batches up operations for contiguous regions of
         // ReadRequests, so we can perform larger read syscalls queries. This
@@ -370,28 +371,6 @@ impl ExtentInner for RawInner {
         cdt::extent__flush__done!(|| { (job_id.get(), self.extent_number, 0) });
 
         r
-    }
-
-    #[cfg(test)]
-    fn set_dirty_and_block_context(
-        &mut self,
-        block_context: &DownstairsBlockContext,
-    ) -> Result<(), CrucibleError> {
-        self.set_dirty()?;
-        self.set_block_contexts(&[*block_context])?;
-        self.active_context[block_context.block as usize] =
-            !self.active_context[block_context.block as usize];
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn get_block_contexts(
-        &mut self,
-        block: u64,
-        count: u64,
-    ) -> Result<Vec<Vec<DownstairsBlockContext>>, CrucibleError> {
-        let out = RawInner::get_block_contexts(self, block, count)?;
-        Ok(out.into_iter().map(|v| v.into_iter().collect()).collect())
     }
 }
 
@@ -1187,6 +1166,18 @@ impl RawInner {
             (job_id.0, self.extent_number, writes.len() as u64)
         });
 
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_dirty_and_block_context(
+        &mut self,
+        block_context: &DownstairsBlockContext,
+    ) -> Result<(), CrucibleError> {
+        self.set_dirty()?;
+        self.set_block_contexts(&[*block_context])?;
+        self.active_context[block_context.block as usize] =
+            !self.active_context[block_context.block as usize];
         Ok(())
     }
 }
