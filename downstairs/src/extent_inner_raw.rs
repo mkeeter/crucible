@@ -64,7 +64,6 @@ impl OnDiskMeta {
         let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
         f.seek(SeekFrom::End(-(BLOCK_META_SIZE_BYTES as i64)))?;
         f.read_exact(&mut buf)?;
-        println!("got buf contents {buf:?}");
         let meta: OnDiskMeta = bincode::deserialize(&buf)
             .map_err(|e| CrucibleError::BadMetadata(e.to_string()))?;
         Ok(meta.ext_version)
