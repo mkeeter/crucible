@@ -2,13 +2,13 @@
 use crate::{
     cdt,
     extent::{check_input, extent_path, ExtentInner, EXTENT_META_RAW_V2},
+    extent_inner_raw::{OnDiskMeta, BLOCK_META_SIZE_BYTES},
     mkdir_for_file,
     region::JobOrReconciliationId,
     Block, CrucibleError, JobId, RegionDefinition,
 };
 
 use crucible_protocol::{RawReadResponse, ReadResponseBlockMetadata};
-use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
 
 use std::io::{BufReader, IoSliceMut, Read};
@@ -19,29 +19,11 @@ use std::{
     io::IoSlice,
 };
 
-/// Equivalent to `ExtentMeta`, but ordered for efficient on-disk serialization
-///
-/// In particular, the `dirty` byte is first, so it's easy to read at a known
-/// offset within the file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OnDiskMeta {
-    dirty: bool,
-    gen_number: u64,
-    flush_number: u64,
-    ext_version: u32,
-}
-
 /// Size of backup data
 ///
 /// This must be large enough to fit an `Option<BlockContext>`
 /// serialized using `bincode`.
 const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 40;
-
-/// Size of metadata region
-///
-/// This must be large enough to contain an `OnDiskMeta` serialized using
-/// `bincode`.
-const BLOCK_META_SIZE_BYTES: u64 = 32;
 
 /// `RawInnerV2` is a wrapper around a [`std::fs::File`] representing an extent
 ///
@@ -888,7 +870,7 @@ mod test {
     }
 
     #[test]
-    fn test_serialized_sizes() {
+    fn test_serialized_context_size() {
         let ctx = BlockContext {
             hash: u64::MAX,
             encryption_context: Some(EncryptionContext {
@@ -898,15 +880,6 @@ mod test {
         };
         let mut ctx_buf = [0u8; BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize];
         bincode::serialize_into(ctx_buf.as_mut_slice(), &Some(ctx)).unwrap();
-
-        let m = OnDiskMeta {
-            dirty: true,
-            gen_number: u64::MAX,
-            flush_number: u64::MAX,
-            ext_version: u32::MAX,
-        };
-        let mut meta_buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
-        bincode::serialize_into(meta_buf.as_mut_slice(), &m).unwrap();
     }
 
     /// Test that multiple writes to the same location work

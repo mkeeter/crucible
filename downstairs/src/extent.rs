@@ -351,7 +351,7 @@ impl Extent {
         //  haven't gotten to deleting the `.db` file).
         let mut has_sqlite = path.with_extension("db").exists();
         let force_sqlite_backend = match backend {
-            Backend::RawFile => false,
+            Backend::RawFile | Backend::RawFileV2 => false,
             #[cfg(any(test, feature = "integration-tests"))]
             Backend::SQLite => true,
         };
@@ -427,10 +427,26 @@ impl Extent {
                 )?;
                 Box::new(inner)
             } else {
-                let inner = extent_inner_raw::RawInner::open(
-                    dir, def, number, read_only, log,
-                )?;
-                Box::new(inner)
+                match extent_inner_raw::OnDiskMeta::get_version_tag(
+                    dir, number,
+                )? {
+                    EXTENT_META_RAW => {
+                        Box::new(extent_inner_raw::RawInner::open(
+                            dir, def, number, read_only, log,
+                        )?)
+                    }
+                    EXTENT_META_RAW_V2 => {
+                        Box::new(extent_inner_raw_v2::RawInnerV2::open(
+                            dir, def, number, read_only, log,
+                        )?)
+                    }
+                    i => {
+                        return Err(CrucibleError::IoError(format!(
+                            "raw extent {number} has unknown tag {i}"
+                        ))
+                        .into())
+                    }
+                }
             }
         };
 
@@ -492,6 +508,9 @@ impl Extent {
             Backend::RawFile => {
                 Box::new(extent_inner_raw::RawInner::create(dir, def, number)?)
             }
+            Backend::RawFileV2 => Box::new(
+                extent_inner_raw_v2::RawInnerV2::create(dir, def, number)?,
+            ),
             #[cfg(any(test, feature = "integration-tests"))]
             Backend::SQLite => Box::new(
                 extent_inner_sqlite::SqliteInner::create(dir, def, number)?,

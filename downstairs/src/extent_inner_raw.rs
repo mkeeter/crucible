@@ -17,7 +17,7 @@ use slog::{error, Logger};
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::path::Path;
 
@@ -33,11 +33,41 @@ struct OnDiskDownstairsBlockContext {
 /// In particular, the `dirty` byte is first, so it's easy to read at a known
 /// offset within the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OnDiskMeta {
-    dirty: bool,
-    gen_number: u64,
-    flush_number: u64,
-    ext_version: u32,
+pub(crate) struct OnDiskMeta {
+    pub dirty: bool,
+    pub gen_number: u64,
+    pub flush_number: u64,
+    pub ext_version: u32,
+}
+
+impl OnDiskMeta {
+    /// Looks up the version tag
+    ///
+    /// Across all of our raw file formats, `OnDiskMeta` is guaranteed to be
+    /// placed at the end of the file in a `BLOCK_META_SIZE_BYTES`-length chunk,
+    /// so we can get a tag without knowing anything else about the file.
+    pub fn get_version_tag(
+        dir: &Path,
+        extent_number: u32,
+    ) -> Result<u32, CrucibleError> {
+        let path = extent_path(dir, extent_number);
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(&path)
+            .map_err(|e| {
+                CrucibleError::IoError(format!(
+                    "extent {extent_number}: open of {path:?} failed: {e}",
+                ))
+            })?;
+
+        let mut buf = [0u8; BLOCK_META_SIZE_BYTES as usize];
+        f.seek(SeekFrom::End(-(BLOCK_META_SIZE_BYTES as i64)))?;
+        f.read_exact(&mut buf)?;
+        let meta: OnDiskMeta = bincode::deserialize(&buf)
+            .map_err(|e| CrucibleError::BadMetadata(e.to_string()))?;
+        Ok(meta.ext_version)
+    }
 }
 
 /// Size of backup data
@@ -50,7 +80,7 @@ const BLOCK_CONTEXT_SLOT_SIZE_BYTES: u64 = 48;
 ///
 /// This must be large enough to contain an `OnDiskMeta` serialized using
 /// `bincode`.
-const BLOCK_META_SIZE_BYTES: u64 = 32;
+pub(crate) const BLOCK_META_SIZE_BYTES: u64 = 32;
 
 /// Number of extra syscalls per read / write that triggers defragmentation
 const DEFRAGMENT_THRESHOLD: u64 = 3;

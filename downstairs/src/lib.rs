@@ -3087,6 +3087,7 @@ enum WrappedStream {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Backend {
     RawFile,
+    RawFileV2,
 
     #[cfg(any(test, feature = "integration-tests"))]
     SQLite,
