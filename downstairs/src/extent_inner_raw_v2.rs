@@ -679,7 +679,7 @@ impl RawLayout {
 
         let offset = self.block_written_array_offset();
 
-        pwrite_all(file.as_fd(), &meta, offset as i64).map_err(|e| {
+        pwrite_all(file.as_fd(), &buf, offset as i64).map_err(|e| {
             CrucibleError::IoError(format!("writing metadata failed: {e}"))
         })?;
 
