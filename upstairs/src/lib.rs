@@ -55,6 +55,9 @@ mod buffer;
 pub use buffer::Buffer; // used in BlockIO::Read, so it must be public
 pub(crate) use buffer::UninitializedBuffer; // only used in pub(crate) functions
 
+mod backpressure;
+pub(crate) use backpressure::{BackpressureConfig, BackpressureScale};
+
 mod mend;
 pub use mend::{DownstairsMend, ExtentFix, RegionMetadata};
 pub use pseudo_file::CruciblePseudoFile;
@@ -1700,7 +1703,7 @@ pub fn up_main(
     };
 
     #[cfg(test)]
-    let disable_backpressure = guest.is_queue_backpressure_disabled();
+    let disable_backpressure = guest.is_backpressure_disabled();
 
     /*
      * Build the Upstairs struct that we use to share data between

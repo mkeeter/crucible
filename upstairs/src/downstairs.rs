@@ -13,12 +13,12 @@ use crate::{
     live_repair::ExtentInfo,
     stats::UpStatOuter,
     upstairs::{UpstairsConfig, UpstairsState},
-    AckStatus, ActiveJobs, AllocRingBuffer, ClientData, ClientIOStateCount,
-    ClientId, ClientMap, CrucibleError, DownstairsIO, DownstairsMend, DsState,
-    ExtentFix, ExtentRepairIDs, GuestWorkId, IOState, IOStateCount, IOop,
-    ImpactedBlocks, JobId, Message, ReadRequest, ReadResponse, ReconcileIO,
-    ReconciliationId, RegionDefinition, ReplaceResult, SnapshotDetails,
-    WorkSummary,
+    AckStatus, ActiveJobs, AllocRingBuffer, BackpressureConfig,
+    BackpressureScale, ClientData, ClientIOStateCount, ClientId, ClientMap,
+    CrucibleError, DownstairsIO, DownstairsMend, DsState, ExtentFix,
+    ExtentRepairIDs, GuestWorkId, IOState, IOStateCount, IOop, ImpactedBlocks,
+    JobId, Message, ReadRequest, ReadResponse, ReconcileIO, ReconciliationId,
+    RegionDefinition, ReplaceResult, SnapshotDetails, WorkSummary,
 };
 use crucible_protocol::{RawWrite, WriteHeader};
 
@@ -65,7 +65,17 @@ pub(crate) struct Downstairs {
     pub(crate) clients: ClientData<DownstairsClient>,
 
     /// Per-client backpressure configuration
-    backpressure_config: DownstairsBackpressureConfig,
+    ///
+    /// This backpressure adds an artificial delay to the client queues, to keep
+    /// the three clients relatively in sync.  The delay is varied based on two
+    /// metrics:
+    ///
+    /// - number of write bytes outstanding
+    /// - queue length
+    ///
+    /// These metrics are _relative_ to the slowest downstairs; the goal is to
+    /// slow down the faster Downstairs to keep the gap bounded.
+    backpressure_config: BackpressureConfig,
 
     /// The active list of IO for the downstairs.
     pub(crate) ds_active: ActiveJobs,
@@ -304,22 +314,20 @@ impl Downstairs {
         let clients = clients.map(Option::unwrap);
         Self {
             clients: ClientData(clients),
-            backpressure_config: DownstairsBackpressureConfig {
+            backpressure_config: BackpressureConfig {
                 // start byte-based backpressure at 25 MiB of difference
-                bytes_start: 25 * 1024 * 1024,
-                // bytes_scale is chosen to have 1.5 ms of delay at 100 MiB of
-                // discrepancy
-                bytes_scale: 5e-7,
+                bytes: BackpressureScale {
+                    start: 25 * 1024 * 1024,
+                    max: 1024 * 1024 * 200, // max difference is 200 MiB
+                    scale: Duration::from_micros(1500), // 1.5 ms at 100 MiB
+                },
 
                 // start job-based backpressure at 100 jobs of discrepancy
-                jobs_start: 100,
-                // job_scale is chosen to have 1 ms of of per-job delay at 900
-                // jobs of discrepancy
-                jobs_scale: 0.04,
-
-                // max delay is 100 ms, chosen experimentally to keep downstairs
-                // in sync even in heavily loaded systems
-                max_delay: Duration::from_millis(100),
+                jobs: BackpressureScale {
+                    start: 100,
+                    max: 2000,
+                    scale: Duration::from_millis(1), // 1 ms at 1000 jobs
+                },
             },
             cfg,
             next_flush: 0,
@@ -3801,7 +3809,7 @@ impl Downstairs {
 
     #[cfg(test)]
     pub(crate) fn disable_client_backpressure(&mut self) {
-        self.backpressure_config.max_delay = Duration::ZERO;
+        self.backpressure_config.disable();
     }
 
     pub(crate) fn set_client_backpressure(&self) {
@@ -3839,22 +3847,10 @@ impl Downstairs {
                 let bytes_gap =
                     (max_bytes - c.total_bytes_outstanding()) as u64;
 
-                let job_delay_us = (job_gap
-                    .saturating_sub(self.backpressure_config.jobs_start)
-                    as f64
-                    * self.backpressure_config.jobs_scale)
-                    .powf(2.0);
-
-                let bytes_delay_us = (bytes_gap
-                    .saturating_sub(self.backpressure_config.bytes_start)
-                    as f64
-                    * self.backpressure_config.bytes_scale)
-                    .powf(2.0);
-
-                let delay_us = (job_delay_us.max(bytes_delay_us) as u64)
-                    .min(self.backpressure_config.max_delay.as_micros() as u64);
-
-                delays[i] = Some(delay_us);
+                delays[i] = Some(
+                    self.backpressure_config
+                        .get_backpressure_us(bytes_gap, job_gap),
+                );
             }
         }
         // Cancel out any common delay, because it wouldn't be useful.
@@ -4425,33 +4421,6 @@ impl Downstairs {
             }
         });
     }
-}
-
-/// Configuration for per-client backpressure
-///
-/// Per-client backpressure adds an artificial delay to the client queues, to
-/// keep the three clients relatively in sync.  The delay is varied based on two
-/// metrics:
-///
-/// - number of write bytes outstanding
-/// - queue length
-///
-/// These metrics are _relative_ to the slowest downstairs; the goal is to slow
-/// down the faster Downstairs to keep the gap bounded.
-#[derive(Copy, Clone, Debug)]
-struct DownstairsBackpressureConfig {
-    /// When should backpressure start (in bytes)?
-    bytes_start: u64,
-    /// Scale for byte-based quadratic backpressure
-    bytes_scale: f64,
-
-    /// When should job-count-based backpressure start?
-    jobs_start: u64,
-    /// Scale for job-count-based quadratic backpressure
-    jobs_scale: f64,
-
-    /// Maximum delay
-    max_delay: Duration,
 }
 
 #[cfg(test)]
