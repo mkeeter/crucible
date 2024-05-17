@@ -1178,7 +1178,7 @@ impl DownstairsBuilder<'_> {
         self
     }
 
-    pub async fn build(&mut self) -> Result<Arc<Mutex<Downstairs>>> {
+    pub async fn build(&mut self) -> Result<Downstairs> {
         let lossy = self.lossy.unwrap_or(false);
         let read_errors = self.read_errors.unwrap_or(false);
         let write_errors = self.write_errors.unwrap_or(false);
@@ -1218,7 +1218,7 @@ impl DownstairsBuilder<'_> {
         );
 
         let (request_tx, request_rx) = mpsc::unbounded_channel();
-        Ok(Arc::new(Mutex::new(Downstairs {
+        Ok(Downstairs {
             region,
             flags: DownstairsFlags {
                 lossy,
@@ -1235,8 +1235,8 @@ impl DownstairsBuilder<'_> {
             repair_address: None,
             log,
             request_tx,
-            request_rx: Some(request_rx),
-        })))
+            request_rx,
+        })
     }
 }
 
@@ -1270,7 +1270,7 @@ pub struct Downstairs {
     connection_state: HashMap<ConnectionId, ConnectionState>,
 
     request_tx: mpsc::UnboundedSender<DownstairsRequest>,
-    request_rx: Option<mpsc::UnboundedReceiver<DownstairsRequest>>,
+    request_rx: mpsc::UnboundedReceiver<DownstairsRequest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2680,33 +2680,21 @@ impl Downstairs {
         Ok(())
     }
 
-    async fn spawn_runner(
-        d: Arc<Mutex<Downstairs>>,
-    ) -> tokio::task::JoinHandle<()> {
-        let (request_rx, log) = {
-            let mut ds = d.lock().await;
-            let request_rx = ds.request_rx.take().unwrap();
-            let log = ds.log.new(o!("task" => "runner".to_string()));
-            (request_rx, log)
-        };
-        tokio::spawn(Downstairs::run(d, request_rx, log))
+    fn spawn_runner(ds: Downstairs) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(ds.run())
     }
 
-    async fn run(
-        ds: Arc<Mutex<Downstairs>>,
-        mut request_rx: mpsc::UnboundedReceiver<DownstairsRequest>,
-        log: Logger,
-    ) {
-        while let Some(v) = request_rx.recv().await {
+    /// This is it: the function which does everything for the Downstairs
+    async fn run(mut self) {
+        let log = self.log.new(o!("task" => "runner".to_string()));
+        while let Some(v) = self.request_rx.recv().await {
             match v {
                 DownstairsRequest::ShowWork => {
-                    let mut d = ds.lock().await;
-                    show_work(&mut d);
+                    show_work(&mut self);
                 }
                 DownstairsRequest::IsExtentClosed { eid, done } => {
-                    let d = ds.lock().await;
                     let closed = matches!(
-                        d.region.extents[eid.0 as usize],
+                        self.region.extents[eid.0 as usize],
                         ExtentState::Closed
                     );
                     if done.send(closed).is_err() {
@@ -2718,19 +2706,16 @@ impl Downstairs {
                     reply_channel_tx,
                     done,
                 } => {
-                    let mut d = ds.lock().await;
-                    let out = d.new_connection(id, reply_channel_tx);
+                    let out = self.new_connection(id, reply_channel_tx);
                     if done.send(out).is_err() {
                         warn!(log, "failed to reply to NewConnection");
                     }
                 }
                 DownstairsRequest::Message { id, msg } => {
-                    let mut d = ds.lock().await;
-                    d.on_message_for(id, msg).await;
+                    self.on_message_for(id, msg).await;
                 }
                 DownstairsRequest::ConnectionClosed { id } => {
-                    let mut d = ds.lock().await;
-                    d.on_connection_closed(id);
+                    self.on_connection_closed(id);
                 }
             }
         }
@@ -3592,13 +3577,21 @@ pub async fn create_region_with_backend(
     Ok(region)
 }
 
+/// Return `struct` for `start_downstairs`
+#[derive(Debug)]
+pub struct RunningDownstairs {
+    pub join_handle: tokio::task::JoinHandle<Result<()>>,
+    pub address: SocketAddr,
+    pub repair_address: SocketAddr,
+}
+
 /// Returns Ok if everything spawned ok, Err otherwise
 ///
 /// Return Ok(main task join handle) if all the necessary tasks spawned
 /// successfully, and Err otherwise.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_downstairs(
-    d: Arc<Mutex<Downstairs>>,
+    mut ds: Downstairs,
     address: IpAddr,
     oximeter: Option<SocketAddr>,
     port: u16,
@@ -3606,11 +3599,10 @@ pub async fn start_downstairs(
     cert_pem: Option<String>,
     key_pem: Option<String>,
     root_cert_pem: Option<String>,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let root_log = d.lock().await.log.clone();
+) -> Result<RunningDownstairs> {
+    let root_log = ds.log.clone();
     if let Some(oximeter) = oximeter {
-        let dssw = d.lock().await;
-        let dss = dssw.dss.clone();
+        let dss = ds.dss.clone();
         let log = root_log.new(o!("task" => "oximeter".to_string()));
 
         tokio::spawn(async move {
@@ -3636,10 +3628,8 @@ pub async fn start_downstairs(
     // Establish a listen server on the port.
     let listener = TcpListener::bind(&listen_on).await?;
     let local_addr = listener.local_addr()?;
-    {
-        let mut ds = d.lock().await;
-        ds.address = Some(local_addr);
-    }
+    ds.address = Some(local_addr);
+
     let info = crucible_common::BuildInfo::default();
     info!(log, "Crucible Version: {}", info);
     info!(
@@ -3652,11 +3642,9 @@ pub async fn start_downstairs(
         IpAddr::V6(ipv6) => SocketAddr::new(std::net::IpAddr::V6(ipv6), rport),
     };
 
-    let dss = d.clone();
     let repair_log = root_log.new(o!("task" => "repair".to_string()));
-
     let repair_listener =
-        match repair::repair_main(dss, repair_address, &repair_log).await {
+        match repair::repair_main(&ds, repair_address, &repair_log).await {
             Err(e) => {
                 // TODO tear down other things if repair server can't be
                 // started?
@@ -3666,10 +3654,7 @@ pub async fn start_downstairs(
             Ok(socket_addr) => socket_addr,
         };
 
-    {
-        let mut ds = d.lock().await;
-        ds.repair_address = Some(repair_listener);
-    }
+    ds.repair_address = Some(repair_listener);
     info!(log, "Using repair address: {:?}", repair_listener);
 
     // Optionally require SSL connections
@@ -3694,10 +3679,11 @@ pub async fn start_downstairs(
         None
     };
 
-    // We'll run a lightweight Downstairs loop which handles certain operations
-    // using message-passing
-    let mut ds_runner = Downstairs::spawn_runner(d.clone()).await;
-    let handle = d.lock().await.handle();
+    let mut dss = ds.dss.clone(); // shared handle for stats
+    let handle = ds.handle(); // handle for passing messages
+
+    // This is where the actual work takes place; owning the Downstairs
+    let mut ds_runner = Downstairs::spawn_runner(ds);
 
     let join_handle = tokio::spawn(async move {
         /*
@@ -3743,14 +3729,10 @@ pub async fn start_downstairs(
             };
 
             info!(log, "accepted connection from {:?}", raddr);
-            {
-                /*
-                 * Add one to the counter every time we have a connection
-                 * from an upstairs
-                 */
-                let mut ds = d.lock().await;
-                ds.dss.add_connection();
-            }
+
+            // Add one to the counter every time we have a connection
+            // from an upstairs
+            dss.add_connection();
 
             let task_log = root_log.clone();
             let handle = handle.clone();
@@ -3770,7 +3752,11 @@ pub async fn start_downstairs(
         }
     });
 
-    Ok(join_handle)
+    Ok(RunningDownstairs {
+        join_handle,
+        address: local_addr,
+        repair_address: repair_listener,
+    })
 }
 
 #[cfg(test)]
@@ -3962,7 +3948,7 @@ mod test {
         region.extend(2).await?;
 
         let path_dir = dir.as_ref().to_path_buf();
-        let ads = Downstairs::new_builder(&path_dir, false)
+        let mut ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
             .build()
             .await?;
@@ -3975,7 +3961,6 @@ mod test {
         };
 
         // Dummy connection id
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -4026,7 +4011,7 @@ mod test {
         extent_size: u64,
         extent_count: u32,
         dir: &TempDir,
-    ) -> Result<Arc<Mutex<Downstairs>>> {
+    ) -> Result<Downstairs> {
         // create region
         let mut region_options: crucible_common::RegionOptions =
             Default::default();
@@ -4042,12 +4027,12 @@ mod test {
         region.extend(extent_count).await?;
 
         let path_dir = dir.as_ref().to_path_buf();
-        let ads = Downstairs::new_builder(&path_dir, false)
+        let ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
             .build()
             .await?;
 
-        Ok(ads)
+        Ok(ds)
     }
 
     #[tokio::test]
@@ -4064,7 +4049,7 @@ mod test {
         let extent_size = 4;
         let dir = tempdir()?;
 
-        let ads =
+        let mut ds =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
 
         // This happens in proc() function.
@@ -4075,7 +4060,6 @@ mod test {
         };
 
         // Dummy ConnectionId
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -4149,7 +4133,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let ads =
+        let mut ds =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
 
         // This happens in proc() function.
@@ -4160,7 +4144,6 @@ mod test {
         };
 
         // Dummy ConnectionId
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -4322,7 +4305,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let ads =
+        let mut ds =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
 
         let upstairs_connection = UpstairsConnection {
@@ -4331,7 +4314,6 @@ mod test {
             gen,
         };
 
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -4442,7 +4424,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let ads =
+        let mut ds =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
 
         let upstairs_connection = UpstairsConnection {
@@ -4451,7 +4433,6 @@ mod test {
             gen,
         };
 
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -4549,7 +4530,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let ads =
+        let mut ds =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
 
         // This happens in proc() function.
@@ -4560,7 +4541,6 @@ mod test {
         };
 
         // Dummy ConnectionId
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -4662,7 +4642,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let ads =
+        let mut ds =
             create_test_downstairs(block_size, extent_size, 5, &dir).await?;
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -4670,7 +4650,6 @@ mod test {
             gen,
         };
 
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -5864,9 +5843,7 @@ mod test {
         Ok(())
     }
 
-    async fn build_test_downstairs(
-        read_only: bool,
-    ) -> Result<Arc<Mutex<Downstairs>>> {
+    async fn build_test_downstairs(read_only: bool) -> Result<Downstairs> {
         let block_size: u64 = 512;
         let extent_size = 4;
 
@@ -5887,17 +5864,17 @@ mod test {
 
         let path_dir = dir.as_ref().to_path_buf();
 
-        let ads = Downstairs::new_builder(&path_dir, read_only)
+        let mut ds = Downstairs::new_builder(&path_dir, read_only)
             .set_logger(csl())
             .build()
             .await?;
-        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
-        Ok(ads)
+        ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
+        Ok(ds)
     }
 
     #[tokio::test]
     async fn test_promote_to_active_one_read_write() -> Result<()> {
-        let ads = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false).await?;
 
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5905,7 +5882,6 @@ mod test {
             gen: 1,
         };
 
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -5916,7 +5892,7 @@ mod test {
 
     #[tokio::test]
     async fn test_promote_to_active_one_read_only() -> Result<()> {
-        let ads = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true).await?;
 
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5924,7 +5900,6 @@ mod test {
             gen: 1,
         };
 
-        let mut ds = ads.lock().await;
         ds.promote_to_active(upstairs_connection, ConnectionId(0))
             .await?;
 
@@ -5938,7 +5913,7 @@ mod test {
     ) -> Result<()> {
         // Attempting to activate multiple read-write (where it's different
         // Upstairs) but with the same gen should be blocked
-        let ads = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5951,8 +5926,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 1,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let id2 = ConnectionId(2);
@@ -5985,7 +5958,7 @@ mod test {
     ) -> Result<()> {
         // Attempting to activate multiple read-write (where it's different
         // Upstairs) but with a lower gen should be blocked.
-        let ads = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5999,7 +5972,6 @@ mod test {
             gen: 1,
         };
 
-        let mut ds = ads.lock().await;
         println!("ds1: {:?}", ds);
 
         let id1 = ConnectionId(1);
@@ -6035,7 +6007,7 @@ mod test {
         // Attempting to activate multiple read-write (where it's the same
         // Upstairs but a different session) will block the "new" connection
         // if it has the same generation number.
-        let ads = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -6048,8 +6020,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 1,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let id2 = ConnectionId(2);
@@ -6082,7 +6052,7 @@ mod test {
         // Attempting to activate multiple read-write where it's the same
         // Upstairs, but a different session, and with a larger generation
         // should allow the new connection to take over.
-        let ads = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -6095,8 +6065,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 2,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let id2 = ConnectionId(2);
@@ -6127,7 +6095,7 @@ mod test {
     ) -> Result<()> {
         // Activating multiple read-only with different Upstairs UUIDs should
         // work.
-        let ads = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -6140,8 +6108,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 1,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let id2 = ConnectionId(2);
@@ -6170,7 +6136,7 @@ mod test {
     async fn test_promote_to_active_multi_read_only_same_uuid() -> Result<()> {
         // Activating multiple read-only with the same Upstairs UUID should
         // kick out the other active one.
-        let ads = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -6183,8 +6149,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 1,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let id2 = ConnectionId(2);
@@ -6213,7 +6177,7 @@ mod test {
     #[tokio::test]
     async fn test_multiple_read_only_no_job_id_collision() -> Result<()> {
         // Two read-only Upstairs shouldn't see each other's jobs
-        let ads = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true).await?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -6226,8 +6190,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 1,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let id2 = ConnectionId(2);
@@ -6313,11 +6275,11 @@ mod test {
         region.extend(2).await?;
 
         let path_dir = dir.as_ref().to_path_buf();
-        let ads = Downstairs::new_builder(&path_dir, false)
+        let mut ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
             .build()
             .await?;
-        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
+        ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
         let upstairs_connection_1 = UpstairsConnection {
@@ -6325,8 +6287,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 10,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
@@ -6407,11 +6367,11 @@ mod test {
         region.extend(2).await?;
 
         let path_dir = dir.as_ref().to_path_buf();
-        let ads = Downstairs::new_builder(&path_dir, false)
+        let mut ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
             .build()
             .await?;
-        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
+        ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
         let upstairs_connection_1 = UpstairsConnection {
@@ -6419,8 +6379,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 10,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
@@ -6501,11 +6459,11 @@ mod test {
         region.extend(2).await?;
 
         let path_dir = dir.as_ref().to_path_buf();
-        let ads = Downstairs::new_builder(&path_dir, false)
+        let mut ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
             .build()
             .await?;
-        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
+        ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
         let upstairs_connection_1 = UpstairsConnection {
@@ -6513,8 +6471,6 @@ mod test {
             session_id: Uuid::new_v4(),
             gen: 10,
         };
-
-        let mut ds = ads.lock().await;
 
         let id1 = ConnectionId(1);
         let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
@@ -6586,10 +6542,9 @@ mod test {
         let ec = 5;
         let dir = tempdir()?;
 
-        let ads = create_test_downstairs(bs, es, ec, &dir).await?;
-
+        let ds = create_test_downstairs(bs, es, ec, &dir).await?;
         let _jh = start_downstairs(
-            ads,
+            ds,
             "127.0.0.1".parse().unwrap(),
             None,
             listen_port,
