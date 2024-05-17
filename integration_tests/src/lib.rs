@@ -13,7 +13,6 @@ mod test {
     use crucible_downstairs::*;
     use crucible_pantry::pantry::Pantry;
     use crucible_pantry_client::Client as CruciblePantryClient;
-    use futures::lock::Mutex;
     use httptest::{matchers::*, responders::*, Expectation, Server};
     use rand::Rng;
     use repair_client::Client;
@@ -34,7 +33,7 @@ mod test {
     struct TestDownstairs {
         address: IpAddr,
         tempdir: TempDir,
-        downstairs: Arc<Mutex<Downstairs>>,
+        downstairs: Option<RunningDownstairs>,
     }
 
     impl TestDownstairs {
@@ -68,22 +67,21 @@ mod test {
             )
             .await?;
 
-            let downstairs = Downstairs::new_builder(tempdir.path(), read_only)
-                .set_lossy(problematic)
-                .set_logger(csl())
-                .set_test_errors(problematic, problematic, problematic)
-                .set_backend(backend)
-                .build()
-                .await?;
+            let mut downstairs =
+                Downstairs::new_builder(tempdir.path(), read_only)
+                    .set_lossy(problematic)
+                    .set_logger(csl())
+                    .set_test_errors(problematic, problematic, problematic)
+                    .set_backend(backend)
+                    .build()
+                    .await?;
 
             if let Some(ref clone_source) = clone_source {
-                downstairs.lock().await.clone_region(*clone_source).await?
+                downstairs.clone_region(*clone_source).await?
             }
 
-            let _join_handle = start_downstairs(
-                downstairs.clone(),
-                address,
-                None, /* oximeter */
+            let downstairs = start_downstairs(
+                downstairs, address, None, /* oximeter */
                 0,    /* any port */
                 0,    /* any rport */
                 None, /* cert_pem */
@@ -95,50 +93,53 @@ mod test {
             Ok(TestDownstairs {
                 address,
                 tempdir,
-                downstairs,
+                downstairs: Some(downstairs),
             })
         }
 
         pub async fn reboot_read_only(&mut self) -> Result<()> {
-            self.downstairs =
-                Downstairs::new_builder(self.tempdir.path(), true)
-                    .set_logger(csl())
-                    .build()
-                    .await?;
+            let downstairs = Downstairs::new_builder(self.tempdir.path(), true)
+                .set_logger(csl())
+                .build()
+                .await?;
 
-            let _join_handle = start_downstairs(
-                self.downstairs.clone(),
-                self.address,
-                None, /* oximeter */
-                0,    /* any port */
-                0,    /* any rport */
-                None, /* cert_pem */
-                None, /* key_pem */
-                None, /* root_cert_pem */
-            )
-            .await?;
+            self.downstairs = Some(
+                start_downstairs(
+                    downstairs,
+                    self.address,
+                    None, /* oximeter */
+                    0,    /* any port */
+                    0,    /* any rport */
+                    None, /* cert_pem */
+                    None, /* key_pem */
+                    None, /* root_cert_pem */
+                )
+                .await?,
+            );
 
             Ok(())
         }
 
         pub async fn reboot_read_write(&mut self) -> Result<()> {
-            self.downstairs =
+            let downstairs =
                 Downstairs::new_builder(self.tempdir.path(), false)
                     .set_logger(csl())
                     .build()
                     .await?;
 
-            let _join_handle = start_downstairs(
-                self.downstairs.clone(),
-                self.address,
-                None, /* oximeter */
-                0,    /* any port */
-                0,    /* any rport */
-                None, /* cert_pem */
-                None, /* key_pem */
-                None, /* root_cert_pem */
-            )
-            .await?;
+            self.downstairs = Some(
+                start_downstairs(
+                    downstairs,
+                    self.address,
+                    None, /* oximeter */
+                    0,    /* any port */
+                    0,    /* any rport */
+                    None, /* cert_pem */
+                    None, /* key_pem */
+                    None, /* root_cert_pem */
+                )
+                .await?,
+            );
 
             Ok(())
         }
@@ -148,23 +149,26 @@ mod test {
         //
         // The Result is returned to the caller.
         pub async fn reboot_clone(&mut self, source: SocketAddr) -> Result<()> {
-            self.downstairs =
+            // Note that we don't start the new Downstairs here, so we'll clear
+            // out `self.downstairs`.
+            self.downstairs = None;
+            let mut downstairs =
                 Downstairs::new_builder(self.tempdir.path(), true)
                     .set_logger(csl())
                     .build()
                     .await?;
-            self.downstairs.lock().await.clone_region(source).await
+            downstairs.clone_region(source).await
         }
 
-        pub async fn address(&self) -> SocketAddr {
+        pub fn address(&self) -> SocketAddr {
             // If start_downstairs returned Ok, then address will be populated
-            self.downstairs.lock().await.address.unwrap()
+            self.downstairs.as_ref().unwrap().address
         }
 
         // Return the repair address for a running downstairs
-        pub async fn repair_address(&self) -> SocketAddr {
+        pub fn repair_address(&self) -> SocketAddr {
             // If start_downstairs returned Ok, then address will be populated
-            self.downstairs.lock().await.repair_address.unwrap()
+            self.downstairs.as_ref().unwrap().repair_address
         }
     }
 
@@ -291,9 +295,9 @@ mod test {
             let crucible_opts = CrucibleOpts {
                 id: Uuid::new_v4(),
                 target: vec![
-                    downstairs1.address().await,
-                    downstairs2.address().await,
-                    downstairs3.address().await,
+                    downstairs1.address(),
+                    downstairs2.address(),
+                    downstairs3.address(),
                 ],
                 lossy: false,
                 flush_timeout: None,
@@ -336,9 +340,9 @@ mod test {
 
             self.crucible_opts.read_only = true;
             self.crucible_opts.target = vec![
-                self.downstairs1.address().await,
-                self.downstairs2.address().await,
-                self.downstairs3.address().await,
+                self.downstairs1.address(),
+                self.downstairs2.address(),
+                self.downstairs3.address(),
             ];
 
             Ok(())
@@ -351,9 +355,9 @@ mod test {
             self.downstairs3.reboot_read_write().await?;
 
             self.crucible_opts.target = vec![
-                self.downstairs1.address().await,
-                self.downstairs2.address().await,
-                self.downstairs3.address().await,
+                self.downstairs1.address(),
+                self.downstairs2.address(),
+                self.downstairs3.address(),
             ];
 
             Ok(())
@@ -373,16 +377,16 @@ mod test {
             .await
         }
 
-        pub async fn downstairs1_address(&self) -> SocketAddr {
-            self.downstairs1.address().await
+        pub fn downstairs1_address(&self) -> SocketAddr {
+            self.downstairs1.address()
         }
 
-        pub async fn downstairs2_address(&self) -> SocketAddr {
-            self.downstairs2.address().await
+        pub fn downstairs2_address(&self) -> SocketAddr {
+            self.downstairs2.address()
         }
 
-        pub async fn downstairs3_address(&self) -> SocketAddr {
-            self.downstairs3.address().await
+        pub fn downstairs3_address(&self) -> SocketAddr {
+            self.downstairs3.address()
         }
     }
 
@@ -2726,13 +2730,12 @@ mod test {
         .unwrap();
 
         // Clone an original downstairs to our new downstairs
-        let clone_source =
-            test_downstairs_set.downstairs1.repair_address().await;
+        let clone_source = test_downstairs_set.downstairs1.repair_address();
         new_ds.reboot_clone(clone_source).await.unwrap();
 
         // Restart the new downstairs read only.
         new_ds.reboot_read_only().await.unwrap();
-        let new_target = new_ds.address().await;
+        let new_target = new_ds.address();
 
         // Take our original opts, and replace a target with the downstairs
         // we just cloned.
@@ -2765,8 +2768,7 @@ mod test {
         assert_eq!(&buffer[BLOCK_SIZE..], &random_buffer[BLOCK_SIZE..]);
 
         // Clone an original downstairs directly to our new downstairs
-        let clone_source =
-            test_downstairs_set.downstairs1.repair_address().await;
+        let clone_source = test_downstairs_set.downstairs1.repair_address();
         let mut new_ds = TestDownstairs::new(
             "127.0.0.1".parse().unwrap(),
             true,
@@ -2782,7 +2784,7 @@ mod test {
 
         // Restart the new downstairs read only.
         new_ds.reboot_read_only().await.unwrap();
-        let new_target = new_ds.address().await;
+        let new_target = new_ds.address();
 
         // Take our original opts, and replace a target with the downstairs
         // we just cloned.
@@ -2892,12 +2894,11 @@ mod test {
         .unwrap();
 
         // Clone a read only downstairs to our new downstairs.
-        let clone_source =
-            test_downstairs_set.downstairs1.repair_address().await;
+        let clone_source = test_downstairs_set.downstairs1.repair_address();
         new_ds.reboot_clone(clone_source).await.unwrap();
 
         new_ds.reboot_read_only().await.unwrap();
-        let new_target = new_ds.address().await;
+        let new_target = new_ds.address();
 
         // The cloned region should have the .db file
         assert!(new_ds.tempdir.path().join("00/000/000.db").exists());
@@ -2953,7 +2954,7 @@ mod test {
         .await
         .unwrap();
 
-        let repair_addr = new_ds.repair_address().await;
+        let repair_addr = new_ds.repair_address();
 
         let url = format!("http://{:?}", repair_addr);
         let repair_server = Client::new(&url);
@@ -2988,7 +2989,7 @@ mod test {
         .await
         .unwrap();
 
-        let repair_addr = new_ds.repair_address().await;
+        let repair_addr = new_ds.repair_address();
 
         let url = format!("http://{:?}", repair_addr);
         let repair_server = Client::new(&url);
@@ -3023,7 +3024,7 @@ mod test {
         .unwrap();
 
         ds_one.reboot_read_only().await.unwrap();
-        let clone_source = ds_one.repair_address().await;
+        let clone_source = ds_one.repair_address();
 
         let mut ds_two = TestDownstairs::new(
             "127.0.0.1".parse().unwrap(),
@@ -3061,7 +3062,7 @@ mod test {
         .unwrap();
 
         ds_one.reboot_read_only().await.unwrap();
-        let clone_source = ds_one.repair_address().await;
+        let clone_source = ds_one.repair_address();
 
         let mut ds_two = TestDownstairs::new(
             "127.0.0.1".parse().unwrap(),
@@ -3098,7 +3099,7 @@ mod test {
         .await
         .unwrap();
 
-        let clone_source = ds_one.repair_address().await;
+        let clone_source = ds_one.repair_address();
 
         let mut ds_two = TestDownstairs::new(
             "127.0.0.1".parse().unwrap(),
@@ -3135,7 +3136,7 @@ mod test {
         .await
         .unwrap();
 
-        let clone_source = ds_one.repair_address().await;
+        let clone_source = ds_one.repair_address();
 
         let mut ds_two = TestDownstairs::new(
             "127.0.0.1".parse().unwrap(),
@@ -3199,8 +3200,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                new_downstairs.address().await,
+                test_downstairs_set.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3214,8 +3215,8 @@ mod test {
             match volume
                 .replace_downstairs(
                     test_downstairs_set.opts().id,
-                    test_downstairs_set.downstairs1_address().await,
-                    new_downstairs.address().await,
+                    test_downstairs_set.downstairs1_address(),
+                    new_downstairs.address(),
                 )
                 .await
                 .unwrap()
@@ -3323,8 +3324,7 @@ mod test {
         .await
         .unwrap();
 
-        let clone_source =
-            test_downstairs_set.downstairs1.repair_address().await;
+        let clone_source = test_downstairs_set.downstairs1.repair_address();
 
         // Clone a read only downstairs into the new downstairs region.
         new_ds.reboot_clone(clone_source).await.unwrap();
@@ -3336,8 +3336,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1.address().await,
-                new_ds.address().await,
+                test_downstairs_set.downstairs1.address(),
+                new_ds.address(),
             )
             .await
             .unwrap();
@@ -3351,8 +3351,8 @@ mod test {
             match volume
                 .replace_downstairs(
                     test_downstairs_set.opts().id,
-                    test_downstairs_set.downstairs1.address().await,
-                    new_ds.address().await,
+                    test_downstairs_set.downstairs1.address(),
+                    new_ds.address(),
                 )
                 .await
                 .unwrap()
@@ -3416,8 +3416,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                new_downstairs.address().await,
-                other_new_downstairs.address().await,
+                new_downstairs.address(),
+                other_new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3456,8 +3456,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                new_downstairs.address().await,
+                test_downstairs_set.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3496,8 +3496,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                new_downstairs.address().await,
+                test_downstairs_set.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3508,8 +3508,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                new_downstairs.address().await,
+                test_downstairs_set.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3549,8 +3549,8 @@ mod test {
         volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                test_downstairs_set.downstairs2_address().await,
+                test_downstairs_set.downstairs1_address(),
+                test_downstairs_set.downstairs2_address(),
             )
             .await
             .unwrap_err();
@@ -3560,8 +3560,8 @@ mod test {
         volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs2_address().await,
-                test_downstairs_set.downstairs1_address().await,
+                test_downstairs_set.downstairs2_address(),
+                test_downstairs_set.downstairs1_address(),
             )
             .await
             .unwrap_err();
@@ -3621,8 +3621,8 @@ mod test {
         let res = volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                new_downstairs.address().await,
+                test_downstairs_set.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3631,8 +3631,8 @@ mod test {
         match volume
             .replace_downstairs(
                 test_downstairs_set.opts().id,
-                test_downstairs_set.downstairs1_address().await,
-                new_downstairs.address().await,
+                test_downstairs_set.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap()
@@ -3653,9 +3653,9 @@ mod test {
         // target list
         let mut opts = test_downstairs_set.opts();
         opts.target = vec![
-            new_downstairs.address().await,
-            test_downstairs_set.downstairs2_address().await,
-            test_downstairs_set.downstairs3_address().await,
+            new_downstairs.address(),
+            test_downstairs_set.downstairs2_address(),
+            test_downstairs_set.downstairs3_address(),
         ];
 
         let mut new_volume = Volume::new(BLOCK_SIZE as u64, csl());
@@ -3938,8 +3938,8 @@ mod test {
         let res = guest
             .replace_downstairs(
                 tds.opts().id,
-                tds.downstairs1_address().await,
-                new_downstairs.address().await,
+                tds.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -3953,8 +3953,8 @@ mod test {
             match guest
                 .replace_downstairs(
                     tds.opts().id,
-                    tds.downstairs1_address().await,
-                    new_downstairs.address().await,
+                    tds.downstairs1_address(),
+                    new_downstairs.address(),
                 )
                 .await
                 .unwrap()
@@ -4037,8 +4037,8 @@ mod test {
         let res = guest
             .replace_downstairs(
                 tds.opts().id,
-                tds.downstairs1_address().await,
-                new_downstairs.address().await,
+                tds.downstairs1_address(),
+                new_downstairs.address(),
             )
             .await
             .unwrap();
@@ -4050,8 +4050,8 @@ mod test {
         guest
             .replace_downstairs(
                 tds.opts().id,
-                tds.downstairs2_address().await,
-                another_new_downstairs.address().await,
+                tds.downstairs2_address(),
+                another_new_downstairs.address(),
             )
             .await
             .unwrap_err();
@@ -5655,14 +5655,10 @@ mod test {
 
         // Make one new downstairs
         let new_downstairs = tds.new_downstairs().await.unwrap();
-        info!(
-            log,
-            "A New downstairs: {:?}",
-            new_downstairs.address().await
-        );
+        info!(log, "A New downstairs: {:?}", new_downstairs.address());
 
         let mut new_opts = tds.opts().clone();
-        new_opts.target[0] = new_downstairs.address().await;
+        new_opts.target[0] = new_downstairs.address();
         info!(log, "Old ops target: {:?}", opts.target);
         info!(log, "New ops target: {:?}", new_opts.target);
 
