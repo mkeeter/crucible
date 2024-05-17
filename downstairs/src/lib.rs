@@ -1065,28 +1065,8 @@ async fn proc_task(
     let handle = ads.lock().await.handle();
     let cancel_io = handle.new_connection(id, reply_channel_tx).await?;
 
-    /*
-     * See the comment in the proc() function on the upstairs side that
-     * describes how this negotiation takes place.
-     *
-     * The final step in negotiation (as dictated by the upstairs) is
-     * either LastFlush, or ExtentVersionsPlease.  Once we respond to
-     * that message, we can move forward and start receiving IO from
-     * the upstairs.
-     */
     loop {
         tokio::select! {
-            /*
-             * This Upstairs' thread will receive this signal when another
-             * Upstairs promotes itself to active. The only way this path is
-             * reached is if this Upstairs promoted itself to active, storing
-             * another_upstairs_active_tx in the Downstairs active_upstairs
-             * tuple.
-             *
-             * The two unwraps here should be safe: this thread negotiated and
-             * activated, and then another did (in order to send this thread
-             * this signal).
-             */
             _ = cancel_io.cancelled() => {
                 info!(log, "proc_loop cancelled; returning now");
                 return Ok(());
@@ -1094,10 +1074,7 @@ async fn proc_task(
 
             new_read = msg_channel_rx.recv() => {
                 let mut ds = ads.lock().await;
-                if !ds.on_message_for(id, new_read).await? {
-                    info!(log, "on_message_for returned False; returning now");
-                    return Ok(());
-                }
+                ds.on_message_for(id, new_read).await;
             }
         }
     }
@@ -2777,42 +2754,13 @@ impl Downstairs {
         }
     }
 
-    /// Function called when the given upstairs disconnects
-    fn on_disconnected(
-        &mut self,
-        upstairs_connection: UpstairsConnection,
-    ) -> Result<()> {
-        // If our upstairs never completed activation,
-        // or some other upstairs activated, we won't
-        // be able to report how many jobs.
-        match self.jobs(upstairs_connection) {
-            Ok(jobs) => {
-                info!(
-                    self.log,
-                    "upstairs {:?} disconnected, {} jobs left",
-                    upstairs_connection,
-                    jobs,
-                );
-            }
-            Err(e) => {
-                info!(
-                    self.log,
-                    "upstairs {:?} disconnected, {}", upstairs_connection, e
-                );
-            }
-        }
-
-        if self.is_active(upstairs_connection) {
-            info!(
-                self.log,
-                "upstairs {:?} was previously active, clearing",
-                upstairs_connection
-            );
-            self.clear_active(upstairs_connection)?;
-        }
-        Ok(())
-    }
-
+    /// See the comment in the proc() function on the upstairs side that
+    /// describes how this negotiation takes place.
+    ///
+    /// The final step in negotiation (as dictated by the upstairs) is
+    /// either LastFlush, or ExtentVersionsPlease.  Once we respond to
+    /// that message, we can move forward and start receiving IO from
+    /// the upstairs.
     async fn on_negotiation_step(
         &mut self,
         m: Message,
@@ -3133,51 +3081,99 @@ impl Downstairs {
         cancel_child
     }
 
+    /// Removes the given connection
+    fn remove_connection(&mut self, id: ConnectionId) {
+        let state = self.connection_state.remove(&id).unwrap();
+        if let Some(upstairs_connection) = state.upstairs_connection {
+            // If our upstairs never completed activation,
+            // or some other upstairs activated, we won't
+            // be able to report how many jobs.
+            match self.jobs(upstairs_connection) {
+                Ok(jobs) => {
+                    info!(
+                        self.log,
+                        "upstairs {:?} ({id:?}) removed, {} jobs left",
+                        upstairs_connection,
+                        jobs,
+                    );
+                }
+                Err(e) => {
+                    info!(
+                        self.log,
+                        "upstairs {:?} ({id:?}) removed, {}",
+                        upstairs_connection,
+                        e
+                    );
+                }
+            }
+
+            if self.is_active(upstairs_connection) {
+                info!(
+                    self.log,
+                    "upstairs {:?} ({id:?}) was previously active, clearing",
+                    upstairs_connection
+                );
+                if let Err(e) = self.clear_active(upstairs_connection) {
+                    warn!(
+                        self.log,
+                        "error when clearing active for \
+                          {upstairs_connection:?}: {e:?}"
+                    );
+                }
+            }
+        } else {
+            info!(self.log, "unknown upstairs ({id:?}) removed");
+        }
+    }
+
     /// Handles a single message (or empty channel condition)
     ///
     /// Returns `true` if we should keep going, `false` (or an error) otherwise
-    async fn on_message_for(
-        &mut self,
-        id: ConnectionId,
-        msg: Option<Message>,
-    ) -> Result<bool> {
-        /*
-         * Negotiate protocol before we take any IO requests.
-         */
+    async fn on_message_for(&mut self, id: ConnectionId, msg: Option<Message>) {
         match msg {
             None => {
                 // Upstairs disconnected, so discard our local state
-                let state = self.connection_state.remove(&id).unwrap();
-                if let Some(upstairs_connection) = state.upstairs_connection {
-                    self.on_disconnected(upstairs_connection)?;
-                } else {
-                    info!(self.log, "unknown upstairs disconnected");
-                }
-
-                return Ok(false); // stop looping
+                info!(self.log, "connection closed; disconnection");
+                self.remove_connection(id);
             }
-            Some(m) => {
+            Some(m)
                 if self.connection_state[&id].negotiated
-                    == NegotiationState::Ready
-                {
-                    match self.proc_frame(m, id).await {
-                        // If we added work, then do it!
-                        Ok(Some(new_ds_id)) => {
-                            cdt::work__start!(|| new_ds_id.0);
-                            self.do_work_for(id).await?;
-                        }
-                        // If we handled the job locally, nothing to do
-                        Ok(None) => (),
-                        Err(e) => {
-                            bail!("Proc frame returns error: {}", e);
+                    == NegotiationState::Ready =>
+            {
+                match self.proc_frame(m, id).await {
+                    // If we added work, then do it!
+                    Ok(Some(new_ds_id)) => {
+                        cdt::work__start!(|| new_ds_id.0);
+                        if let Err(e) = self.do_work_for(id).await {
+                            warn!(
+                                self.log,
+                                "do_work_for returns error {e:?}; \
+                                 disconnecting"
+                            );
+                            self.remove_connection(id);
                         }
                     }
-                } else {
-                    self.on_negotiation_step(m, id).await?;
+                    // If we handled the job locally, nothing to do
+                    Ok(None) => (),
+                    Err(e) => {
+                        warn!(
+                            self.log,
+                            "proc_frame returns error {e:?}; disconnecting"
+                        );
+                        self.remove_connection(id);
+                    }
+                }
+            }
+            Some(m) => {
+                if let Err(e) = self.on_negotiation_step(m, id).await {
+                    warn!(
+                        self.log,
+                        "on_negotiation_step returns error {e:?}, disconnecting"
+                    );
+                    self.remove_connection(id);
                 }
             }
         }
-        Ok(true)
     }
 
     fn on_new_connection_replacing(
