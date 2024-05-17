@@ -989,40 +989,32 @@ where
     //  │ recv_task  │       │   reply_task   │
     //  └─────┬──────┘       └────────▲───────┘
     //        │                       │
-    //        │message          reply │responses,
-    //        │channel         channel│invalid frame
+    //        │downstairs       reply │responses,
+    //        │handle          channel│invalid frame
     //        │                       │errors, pings
     //        │                       │
-    //        │              ┌────────┴───────┐  ┌──────┐
-    //        └──────────────►   proc_task    │  │ proc │
-    //                       └──┬───────────▲─┘  └──────┘
-    //                          │           │
-    //                       add│work    new│work
-    //   per-connection         │           │
-    //  ======================= │ ========= │ =======
-    //   shared state        ┌──▼───────────┴─┐
-    //                       │   Downstairs   │
-    //                       └────────────────┘
+    //        │                       │
+    //        └─────────────────┐     │    ┌──────┐ task monitoring
+    //                          │     │    │ proc │ and coordinated
+    //                          │     │    └──────┘ shutdown
+    //                          │     │
+    //   per-connection state   │     │
+    //  ======================= │ === │ ===============================
+    //   common state      ┌────▼─────┴──────┐
+    //                     │ Downstairs::run │
+    //                     └─────────────────┘
 
     // We rely on backpressure to limit total jobs in flight, so these channels
     // can be unbounded.
-    let (msg_channel_tx, msg_channel_rx) = mpsc::unbounded_channel();
-    let mut recv_task = tokio::spawn(recv_task(
-        fr,
-        msg_channel_tx,
-        log.new(o!("task" => "recv")),
-    ));
-
     let (reply_channel_tx, reply_channel_rx) = mpsc::unbounded_channel();
     let mut reply_task = tokio::spawn(reply_task(reply_channel_rx, fw));
 
-    let mut proc_task = tokio::spawn(proc_task(
-        ads.clone(),
-        id,
-        msg_channel_rx,
-        reply_channel_tx,
-        log.new(o!("task" => "proc_task")),
-    ));
+    // Populate our state in the Downstairs, keyed by our `id`
+    let handle = ads.lock().await.handle();
+    let cancel_io = handle.new_connection(id, reply_channel_tx).await?;
+
+    let mut recv_task =
+        tokio::spawn(recv_task(id, fr, handle, log.new(o!("task" => "recv"))));
 
     let log = log.new(o!("task" => "proc"));
 
@@ -1031,19 +1023,17 @@ where
     let (name, result) = tokio::select! {
         e = &mut recv_task => {
             reply_task.abort();
-            proc_task.abort();
             ("recv_task", e)
         },
         e = &mut reply_task => {
             recv_task.abort();
-            proc_task.abort();
             ("reply_task", e)
         },
-        e = &mut proc_task => {
+        _ = cancel_io.cancelled() => {
             reply_task.abort();
             recv_task.abort();
-            ("proc_task", e)
-        },
+            ("proc", Ok(Ok(())))
+        }
     };
 
     match &result {
@@ -1052,32 +1042,6 @@ where
         Ok(Ok(())) => info!(log, "{name} exited cleanly"),
     }
     result? // coerce the outer JoinError into anyhow::Error
-}
-
-async fn proc_task(
-    ads: Arc<Mutex<Downstairs>>,
-    id: ConnectionId,
-    mut msg_channel_rx: mpsc::UnboundedReceiver<Message>,
-    reply_channel_tx: mpsc::UnboundedSender<Message>,
-    log: Logger,
-) -> Result<()> {
-    // Populate our state in the Downstairs, keyed by our `id`
-    let handle = ads.lock().await.handle();
-    let cancel_io = handle.new_connection(id, reply_channel_tx).await?;
-
-    loop {
-        tokio::select! {
-            _ = cancel_io.cancelled() => {
-                info!(log, "proc_loop cancelled; returning now");
-                return Ok(());
-            }
-
-            new_read = msg_channel_rx.recv() => {
-                let mut ds = ads.lock().await;
-                ds.on_message_for(id, new_read).await;
-            }
-        }
-    }
 }
 
 /// Receives messages from a channel and sends them to a socket
@@ -1106,8 +1070,9 @@ where
 /// under other circumstances (timeout, a `FramedRead` error, or failing to send
 /// to the `mpsc`).
 async fn recv_task<RT>(
+    id: ConnectionId,
     mut fr: FramedRead<RT, CrucibleDecoder>,
-    msg_channel_tx: mpsc::UnboundedSender<Message>,
+    handle: DownstairsHandle,
     log: Logger,
 ) -> Result<()>
 where
@@ -1140,6 +1105,13 @@ where
                             log,
                             "upstairs disconnected; recv_task stopping"
                         );
+                        let m = DownstairsRequest::ConnectionClosed { id };
+                        if let Err(e) = handle.tx.send(m) {
+                            bail!(
+                                "Failed sending ConnectionClosed to handle:
+                                 {e:?}"
+                            );
+                        }
                         break Ok(());
                     }
                     Some(Err(e)) => {
@@ -1147,8 +1119,11 @@ where
                         // terminates, we don't yet have a HangUp message
                         bail!("Error reading from Upstairs: {}", e);
                     }
-                    Some(Ok(v)) => if let Err(e) = msg_channel_tx.send(v) {
-                        bail!("Failed sending message on msg_channel: {e}");
+                    Some(Ok(msg)) => {
+                        let m = DownstairsRequest::Message { id, msg };
+                        if let Err(e) = handle.tx.send(m) {
+                            bail!("Failed sending Message to handle: {e:?}");
+                        }
                     },
                 }
             }
@@ -1243,7 +1218,7 @@ impl DownstairsBuilder<'_> {
             region.def().extent_count(),
         );
 
-        let (request_tx, request_rx) = mpsc::channel(256); // TODO size?
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Mutex::new(Downstairs {
             region,
             flags: DownstairsFlags {
@@ -1295,8 +1270,8 @@ pub struct Downstairs {
     /// Per-connection state
     connection_state: HashMap<ConnectionId, ConnectionState>,
 
-    request_tx: mpsc::Sender<DownstairsRequest>,
-    request_rx: Option<mpsc::Receiver<DownstairsRequest>>,
+    request_tx: mpsc::UnboundedSender<DownstairsRequest>,
+    request_rx: Option<mpsc::UnboundedReceiver<DownstairsRequest>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2720,7 +2695,7 @@ impl Downstairs {
 
     async fn run(
         ds: Arc<Mutex<Downstairs>>,
-        mut request_rx: mpsc::Receiver<DownstairsRequest>,
+        mut request_rx: mpsc::UnboundedReceiver<DownstairsRequest>,
         log: Logger,
     ) {
         while let Some(v) = request_rx.recv().await {
@@ -2749,6 +2724,14 @@ impl Downstairs {
                     if done.send(out).is_err() {
                         warn!(log, "failed to reply to NewConnection");
                     }
+                }
+                DownstairsRequest::Message { id, msg } => {
+                    let mut d = ds.lock().await;
+                    d.on_message_for(id, msg).await;
+                }
+                DownstairsRequest::ConnectionClosed { id } => {
+                    let mut d = ds.lock().await;
+                    d.on_connection_closed(id);
                 }
             }
         }
@@ -3062,7 +3045,7 @@ impl Downstairs {
         // Prepare for the autonegotiation / IO loop
         //
         // We'll create a cancellation token here, store it in a DropGuard, and
-        // return a child token for the proc_task loop to listen for.
+        // return a child token for the proc loop to listen for.
         let token = tokio_util::sync::CancellationToken::new();
         let cancel_child = token.child_token();
         let cancel_guard = token.drop_guard();
@@ -3126,53 +3109,46 @@ impl Downstairs {
         }
     }
 
+    fn on_connection_closed(&mut self, id: ConnectionId) {
+        // Upstairs disconnected, so discard our local state
+        info!(self.log, "connection closed; disconnection");
+        self.remove_connection(id);
+    }
+
     /// Handles a single message (or empty channel condition)
     ///
     /// Returns `true` if we should keep going, `false` (or an error) otherwise
-    async fn on_message_for(&mut self, id: ConnectionId, msg: Option<Message>) {
-        match msg {
-            None => {
-                // Upstairs disconnected, so discard our local state
-                info!(self.log, "connection closed; disconnection");
-                self.remove_connection(id);
-            }
-            Some(m)
-                if self.connection_state[&id].negotiated
-                    == NegotiationState::Ready =>
-            {
-                match self.proc_frame(m, id).await {
-                    // If we added work, then do it!
-                    Ok(Some(new_ds_id)) => {
-                        cdt::work__start!(|| new_ds_id.0);
-                        if let Err(e) = self.do_work_for(id).await {
-                            warn!(
-                                self.log,
-                                "do_work_for returns error {e:?}; \
-                                 disconnecting"
-                            );
-                            self.remove_connection(id);
-                        }
-                    }
-                    // If we handled the job locally, nothing to do
-                    Ok(None) => (),
-                    Err(e) => {
+    async fn on_message_for(&mut self, id: ConnectionId, m: Message) {
+        if self.connection_state[&id].negotiated == NegotiationState::Ready {
+            match self.proc_frame(m, id).await {
+                // If we added work, then do it!
+                Ok(Some(new_ds_id)) => {
+                    cdt::work__start!(|| new_ds_id.0);
+                    if let Err(e) = self.do_work_for(id).await {
                         warn!(
                             self.log,
-                            "proc_frame returns error {e:?}; disconnecting"
+                            "do_work_for returns error {e:?}; \
+                                 disconnecting"
                         );
                         self.remove_connection(id);
                     }
                 }
-            }
-            Some(m) => {
-                if let Err(e) = self.on_negotiation_step(m, id).await {
+                // If we handled the job locally, nothing to do
+                Ok(None) => (),
+                Err(e) => {
                     warn!(
                         self.log,
-                        "on_negotiation_step returns error {e:?}, disconnecting"
+                        "proc_frame returns error {e:?}; disconnecting"
                     );
                     self.remove_connection(id);
                 }
             }
+        } else if let Err(e) = self.on_negotiation_step(m, id).await {
+            warn!(
+                self.log,
+                "on_negotiation_step returns error {e:?}, disconnecting"
+            );
+            self.remove_connection(id);
         }
     }
 
@@ -3224,11 +3200,20 @@ enum DownstairsRequest {
     ///
     /// This is fire-and-forget, so there's no oneshot reply channel
     ShowWork,
+
+    /// A message has arrived for the given id
+    ///
+    /// This is fire-and-forget; if the Downstairs doesn't like the message, it
+    /// will kill that IO task through the cancellation handle.
+    Message { id: ConnectionId, msg: Message },
+
+    /// The given id's upstream connection has closed
+    ConnectionClosed { id: ConnectionId },
 }
 
 /// Handle allowing for async calls to the Downstairs task
 pub struct DownstairsHandle {
-    tx: mpsc::Sender<DownstairsRequest>,
+    tx: mpsc::UnboundedSender<DownstairsRequest>,
 }
 
 impl DownstairsHandle {
@@ -3236,14 +3221,12 @@ impl DownstairsHandle {
         let (done, rx) = oneshot::channel();
         self.tx
             .send(DownstairsRequest::IsExtentClosed { eid, done })
-            .await
             .context("could not send message on channel")?;
         rx.await.context("could not receive result")
     }
-    pub async fn show_work(&self) -> Result<()> {
+    pub fn show_work(&self) -> Result<()> {
         self.tx
             .send(DownstairsRequest::ShowWork)
-            .await
             .context("could not send message on channel")
     }
 
@@ -3259,7 +3242,6 @@ impl DownstairsHandle {
                 reply_channel_tx,
                 done,
             })
-            .await
             .context("could not send message on channel")?;
         rx.await.context("could not receive result")
     }
