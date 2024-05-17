@@ -919,7 +919,7 @@ enum NegotiationState {
     Ready,
 }
 
-struct NegotiationData {
+struct ConnectionState {
     /// State machine progress
     negotiated: NegotiationState,
 
@@ -936,6 +936,9 @@ struct NegotiationData {
     /// `NegotiationState::ConnectedToUpstairs` and
     /// `NegotiationState::PromotedToActive`
     another_upstairs_active_tx: Option<oneshot::Sender<UpstairsConnection>>,
+
+    /// IO channel to the reply task
+    reply_channel_tx: mpsc::UnboundedSender<Message>,
 }
 
 /// Handle all of the work for this Upstairs connection
@@ -1040,7 +1043,7 @@ where
 async fn proc_task(
     ads: Arc<Mutex<Downstairs>>,
     mut msg_channel_rx: mpsc::UnboundedReceiver<Message>,
-    mut reply_channel_tx: mpsc::UnboundedSender<Message>,
+    reply_channel_tx: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
     // In this function, repair address should exist, and shouldn't change. Grab
     // it here.
@@ -1053,13 +1056,14 @@ async fn proc_task(
     let (another_upstairs_active_tx, mut another_upstairs_active_rx) =
         oneshot::channel::<UpstairsConnection>();
 
-    let mut state = NegotiationData {
+    let mut state = ConnectionState {
         repair_addr,
         upstairs_connection: None,
         // Put the oneshot tx side into an Option so we can move it out at the
         // appropriate point in negotiation.
         another_upstairs_active_tx: Some(another_upstairs_active_tx),
         negotiated: NegotiationState::Start,
+        reply_channel_tx,
     };
 
     let log = log.new(o!("task" => "proc".to_string()));
@@ -1112,7 +1116,7 @@ async fn proc_task(
                             new_upstairs_connection, state.upstairs_connection
                         );
 
-                        if let Err(e) = reply_channel_tx.send(
+                        if let Err(e) = state.reply_channel_tx.send(
                             Message::YouAreNoLongerActive {
                                 new_upstairs_id:
                                     new_upstairs_connection.upstairs_id,
@@ -1156,7 +1160,7 @@ async fn proc_task(
                                 &ads,
                                 state.upstairs_connection.unwrap(),
                                 m,
-                                &reply_channel_tx,
+                                &state.reply_channel_tx,
                             )
                             .await
                             {
@@ -1166,7 +1170,7 @@ async fn proc_task(
                                     Downstairs::do_work_for(
                                         &ads,
                                         state.upstairs_connection.unwrap(),
-                                        &reply_channel_tx,
+                                        &state.reply_channel_tx,
                                     )
                                     .await?;
                                 }
@@ -1181,7 +1185,6 @@ async fn proc_task(
                             ds.on_negotiation_step(
                                 m,
                                 &mut state,
-                                &mut reply_channel_tx
                             ).await?;
                         }
                     }
@@ -2929,12 +2932,11 @@ impl Downstairs {
     async fn on_negotiation_step(
         &mut self,
         m: Message,
-        state: &mut NegotiationData,
-        fw: &mut mpsc::UnboundedSender<Message>,
+        state: &mut ConnectionState,
     ) -> Result<()> {
         match m {
             Message::Ruok => {
-                if let Err(e) = fw.send(Message::Imok) {
+                if let Err(e) = state.reply_channel_tx.send(Message::Imok) {
                     bail!("Failed to answer ping: {}", e);
                 }
             }
@@ -2979,7 +2981,7 @@ impl Downstairs {
                         let m = Message::VersionMismatch {
                             version: CRUCIBLE_MESSAGE_VERSION,
                         };
-                        if let Err(e) = fw.send(m) {
+                        if let Err(e) = state.reply_channel_tx.send(m) {
                             warn!(
                                 self.log,
                                 "Failed to send VersionMismatch: {}", e
@@ -2999,9 +3001,11 @@ impl Downstairs {
                 // Upstairs will not be able to successfully negotiate.
                 {
                     if self.flags.read_only != read_only {
-                        if let Err(e) = fw.send(Message::ReadOnlyMismatch {
-                            expected: self.flags.read_only,
-                        }) {
+                        if let Err(e) = state.reply_channel_tx.send(
+                            Message::ReadOnlyMismatch {
+                                expected: self.flags.read_only,
+                            },
+                        ) {
                             warn!(
                                 self.log,
                                 "Failed to send ReadOnlyMismatch: {}", e
@@ -3015,9 +3019,11 @@ impl Downstairs {
                     }
 
                     if self.flags.encrypted != encrypted {
-                        if let Err(e) = fw.send(Message::EncryptedMismatch {
-                            expected: self.flags.encrypted,
-                        }) {
+                        if let Err(e) = state.reply_channel_tx.send(
+                            Message::EncryptedMismatch {
+                                expected: self.flags.encrypted,
+                            },
+                        ) {
                             warn!(
                                 self.log,
                                 "Failed to send EncryptedMismatch: {}", e
@@ -3044,7 +3050,7 @@ impl Downstairs {
                     CRUCIBLE_MESSAGE_VERSION
                 );
 
-                if let Err(e) = fw.send(Message::YesItsMe {
+                if let Err(e) = state.reply_channel_tx.send(Message::YesItsMe {
                     version: CRUCIBLE_MESSAGE_VERSION,
                     repair_addr: state.repair_addr,
                 }) {
@@ -3071,9 +3077,11 @@ impl Downstairs {
                     && upstairs_connection.session_id == session_id;
 
                 if !matches_self {
-                    if let Err(e) = fw.send(Message::UuidMismatch {
-                        expected_id: upstairs_connection.upstairs_id,
-                    }) {
+                    if let Err(e) =
+                        state.reply_channel_tx.send(Message::UuidMismatch {
+                            expected_id: upstairs_connection.upstairs_id,
+                        })
+                    {
                         warn!(self.log, "Failed sending UuidMismatch: {}", e);
                     }
                     bail!(
@@ -3108,11 +3116,13 @@ impl Downstairs {
                     .await?;
                     state.negotiated = NegotiationState::PromotedToActive;
 
-                    if let Err(e) = fw.send(Message::YouAreNowActive {
-                        upstairs_id,
-                        session_id,
-                        gen,
-                    }) {
+                    if let Err(e) =
+                        state.reply_channel_tx.send(Message::YouAreNowActive {
+                            upstairs_id,
+                            session_id,
+                            gen,
+                        })
+                    {
                         bail!("Failed sending YouAreNewActive: {}", e);
                     }
                 }
@@ -3127,7 +3137,10 @@ impl Downstairs {
                 state.negotiated = NegotiationState::SentRegionInfo;
                 let region_def = { self.region.def() };
 
-                if let Err(e) = fw.send(Message::RegionInfo { region_def }) {
+                if let Err(e) = state
+                    .reply_channel_tx
+                    .send(Message::RegionInfo { region_def })
+                {
                     bail!("Failed sending RegionInfo: {}", e);
                 }
             }
@@ -3144,8 +3157,9 @@ impl Downstairs {
                 work.last_flush = last_flush_number;
                 info!(self.log, "Set last flush {}", last_flush_number);
 
-                if let Err(e) =
-                    fw.send(Message::LastFlushAck { last_flush_number })
+                if let Err(e) = state
+                    .reply_channel_tx
+                    .send(Message::LastFlushAck { last_flush_number })
                 {
                     bail!("Failed sending LastFlushAck: {}", e);
                 }
@@ -3185,11 +3199,13 @@ impl Downstairs {
                     );
                 }
 
-                if let Err(e) = fw.send(Message::ExtentVersions {
-                    gen_numbers,
-                    flush_numbers,
-                    dirty_bits,
-                }) {
+                if let Err(e) =
+                    state.reply_channel_tx.send(Message::ExtentVersions {
+                        gen_numbers,
+                        flush_numbers,
+                        dirty_bits,
+                    })
+                {
                     bail!("Failed sending ExtentVersions: {}", e);
                 }
 
