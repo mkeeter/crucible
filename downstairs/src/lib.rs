@@ -939,13 +939,9 @@ struct ConnectionState {
     /// Upstairs connection, populated at `HelloItsMe`
     upstairs_connection: Option<UpstairsConnection>,
 
-    /// Channel used to kill this Downstairs' IO tasks
-    ///
-    /// The value is moved out of the option when
-    /// `Downstairs::promote_to_active` is called, i.e. between
-    /// `NegotiationState::ConnectedToUpstairs` and
-    /// `NegotiationState::PromotedToActive`
-    another_upstairs_active_tx: Option<oneshot::Sender<UpstairsConnection>>,
+    /// Token used to cancel the IO tasks
+    #[allow(unused)]
+    cancel: tokio_util::sync::DropGuard,
 
     /// IO channel to the reply task
     reply_channel_tx: mpsc::UnboundedSender<Message>,
@@ -1062,8 +1058,13 @@ async fn proc_task(
     reply_channel_tx: mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
     // Populate our state in the Downstairs, keyed by our `id`
-    let mut another_upstairs_active_rx =
-        ads.lock().await.new_connection(id, reply_channel_tx);
+    let (log, cancel_io) = {
+        let mut ds = ads.lock().await;
+        (
+            ds.log.new(o!("task" => "proc_task".to_string())),
+            ds.new_connection(id, reply_channel_tx),
+        )
+    };
 
     /*
      * See the comment in the proc() function on the upstairs side that
@@ -1087,35 +1088,15 @@ async fn proc_task(
              * activated, and then another did (in order to send this thread
              * this signal).
              */
-            new_upstairs_connection = &mut another_upstairs_active_rx => {
-                match new_upstairs_connection {
-                    Err(e) => {
-                        // There shouldn't be a path through the code where we
-                        // close the channel before sending a message through it
-                        // (see [`promote_to_active`]), though [`clear_active`]
-                        // simply drops the active_upstairs tuple - but the only
-                        // place that calls `clear_active` is below when the
-                        // Upstairs disconnects.
-                        //
-                        // We have to bail here though - the Downstairs can't be
-                        // running without the ability for another Upstairs to
-                        // kick out the previous one during activation.
-                        bail!("another_upstairs_active_rx closed during \
-                               proc: {e:?}");
-                    }
-
-                    Ok(new_upstairs_connection) => {
-                        let mut ds = ads.lock().await;
-                        ds.on_new_connection_replacing(
-                            id, new_upstairs_connection);
-                        return Ok(());
-                    }
-                }
+            _ = cancel_io.cancelled() => {
+                info!(log, "proc_loop cancelled; returning now");
+                return Ok(());
             }
 
             new_read = msg_channel_rx.recv() => {
                 let mut ds = ads.lock().await;
                 if !ds.on_message_for(id, new_read).await? {
+                    info!(log, "on_message_for returned False; returning now");
                     return Ok(());
                 }
             }
@@ -1203,7 +1184,11 @@ where
 pub struct ActiveUpstairs {
     pub upstairs_connection: UpstairsConnection,
     pub work: Work,
-    pub terminate_sender: oneshot::Sender<UpstairsConnection>,
+
+    /// Id of this connection in the `connection_state` map
+    ///
+    /// This is used as a key to kill the IO tasks if the upstairs is stopped
+    id: ConnectionId,
 }
 
 #[derive(Debug)]
@@ -1954,7 +1939,7 @@ impl Downstairs {
     async fn promote_to_active(
         &mut self,
         upstairs_connection: UpstairsConnection,
-        tx: oneshot::Sender<UpstairsConnection>,
+        id: ConnectionId,
     ) -> Result<()> {
         if self.flags.read_only {
             // Multiple active read-only sessions are allowed, but multiple
@@ -1976,24 +1961,10 @@ impl Downstairs {
                     upstairs_connection,
                 );
 
-                match active_upstairs.terminate_sender.send(upstairs_connection)
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        /*
-                         * It's possible the old thread died due to some
-                         * connection error. In that case the
-                         * receiver will have closed and
-                         * the above send will fail.
-                         */
-                        error!(
-                            self.log,
-                            "Error while signaling to {:?} thread: {:?}",
-                            active_upstairs.upstairs_connection,
-                            e,
-                        );
-                    }
-                }
+                self.on_new_connection_replacing(
+                    active_upstairs.id,
+                    upstairs_connection,
+                );
 
                 // Note: in the future, differentiate between new upstairs
                 // connecting vs same upstairs reconnecting here.
@@ -2027,7 +1998,7 @@ impl Downstairs {
                 ActiveUpstairs {
                     upstairs_connection,
                     work: Work::new(),
-                    terminate_sender: tx,
+                    id,
                 },
             );
 
@@ -2046,7 +2017,7 @@ impl Downstairs {
                         ActiveUpstairs {
                             upstairs_connection,
                             work: Work::new(),
-                            terminate_sender: tx,
+                            id,
                         },
                     );
 
@@ -2133,26 +2104,10 @@ impl Downstairs {
                         upstairs_connection,
                     );
 
-                    match active_upstairs
-                        .terminate_sender
-                        .send(upstairs_connection)
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            /*
-                             * It's possible the old thread died due to some
-                             * connection error. In that case the
-                             * receiver will have closed and
-                             * the above send will fail.
-                             */
-                            error!(
-                                self.log,
-                                "Error while signaling to {:?} thread: {:?}",
-                                active_upstairs.upstairs_connection,
-                                e,
-                            );
-                        }
-                    }
+                    self.on_new_connection_replacing(
+                        active_upstairs.id,
+                        upstairs_connection,
+                    );
 
                     // Note: in the future, differentiate between new upstairs
                     // connecting vs same upstairs reconnecting here.
@@ -2184,7 +2139,7 @@ impl Downstairs {
                         ActiveUpstairs {
                             upstairs_connection,
                             work: Work::new(),
-                            terminate_sender: tx,
+                            id,
                         },
                     );
 
@@ -3025,15 +2980,7 @@ impl Downstairs {
                         state.upstairs_connection.as_mut().unwrap().gen = gen;
                     }
 
-                    let another_upstairs_active_tx = state
-                        .another_upstairs_active_tx
-                        .take()
-                        .expect("no oneshot tx");
-                    self.promote_to_active(
-                        upstairs_connection,
-                        another_upstairs_active_tx,
-                    )
-                    .await?;
+                    self.promote_to_active(upstairs_connection, id).await?;
 
                     // reborrow our local state
                     let state = self.connection_state.get_mut(&id).unwrap();
@@ -3153,26 +3100,27 @@ impl Downstairs {
         &mut self,
         id: ConnectionId,
         reply_channel_tx: mpsc::UnboundedSender<Message>,
-    ) -> oneshot::Receiver<UpstairsConnection> {
-        // Prepare for the autonegotiation / IO loop loop
-        let (another_upstairs_active_tx, another_upstairs_active_rx) =
-            oneshot::channel::<UpstairsConnection>();
-
+    ) -> tokio_util::sync::CancellationToken {
+        // Prepare for the autonegotiation / IO loop
+        //
+        // We'll create a cancellation token here, store it in a DropGuard, and
+        // return a child token for the proc_task loop to listen for.
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel_child = token.child_token();
+        let cancel_guard = token.drop_guard();
         let prev = self.connection_state.insert(
             id,
             ConnectionState {
                 repair_addr: self.repair_address.unwrap(),
                 upstairs_connection: None,
-                // Put the oneshot tx side into an Option so we can move it out at the
-                // appropriate point in negotiation.
-                another_upstairs_active_tx: Some(another_upstairs_active_tx),
+                cancel: cancel_guard,
                 negotiated: NegotiationState::Start,
                 reply_channel_tx,
             },
         );
         assert!(prev.is_none());
 
-        another_upstairs_active_rx
+        cancel_child
     }
 
     /// Handles a single message (or empty channel condition)
@@ -3819,7 +3767,9 @@ mod test {
     use std::net::Ipv4Addr;
     use tempfile::{tempdir, TempDir};
     use tokio::net::TcpSocket;
-    use tokio::sync::oneshot::error::TryRecvError;
+
+    const DUMMY_REPAIR_SOCKET: SocketAddr =
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
 
     // Create a simple logger
     fn csl() -> Logger {
@@ -4011,11 +3961,10 @@ mod test {
             gen: 10,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx, mut _rx) = oneshot::channel();
-
+        // Dummy connection id
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let rio = IOop::Read {
             dependencies: Vec::new(),
@@ -4112,11 +4061,10 @@ mod test {
             gen: 10,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx, mut _rx) = oneshot::channel();
-
+        // Dummy ConnectionId
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let rio = IOop::ExtentClose {
             dependencies: Vec::new(),
@@ -4198,11 +4146,10 @@ mod test {
             gen,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx, mut _rx) = oneshot::channel();
-
+        // Dummy ConnectionId
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let rio = IOop::ExtentClose {
             dependencies: Vec::new(),
@@ -4370,10 +4317,10 @@ mod test {
             session_id: Uuid::new_v4(),
             gen,
         };
-        let (tx, mut _rx) = oneshot::channel();
 
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let eid = ExtentId(3);
 
@@ -4490,10 +4437,10 @@ mod test {
             session_id: Uuid::new_v4(),
             gen,
         };
-        let (tx, mut _rx) = oneshot::channel();
 
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let eid = ExtentId(0);
 
@@ -4599,11 +4546,10 @@ mod test {
             gen,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx, mut _rx) = oneshot::channel();
-
+        // Dummy ConnectionId
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let eid = ExtentId(1);
 
@@ -4711,9 +4657,9 @@ mod test {
             gen,
         };
 
-        let (tx, mut _rx) = oneshot::channel();
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         let eid_one = ExtentId(1);
         let eid_two = ExtentId(2);
@@ -5928,10 +5874,12 @@ mod test {
 
         let path_dir = dir.as_ref().to_path_buf();
 
-        Downstairs::new_builder(&path_dir, read_only)
+        let ads = Downstairs::new_builder(&path_dir, read_only)
             .set_logger(csl())
             .build()
-            .await
+            .await?;
+        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
+        Ok(ads)
     }
 
     #[tokio::test]
@@ -5944,10 +5892,9 @@ mod test {
             gen: 1,
         };
 
-        let (tx, mut _rx) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -5964,10 +5911,9 @@ mod test {
             gen: 1,
         };
 
-        let (tx, mut _rx) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection, tx).await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))
+            .await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -5993,21 +5939,23 @@ mod test {
             gen: 1,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        let res = ds.promote_to_active(upstairs_connection_2, tx2).await;
+        let res = ds.promote_to_active(upstairs_connection_2, id2).await;
         assert!(res.is_err());
 
-        assert!(matches!(rx1.try_recv().unwrap_err(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().unwrap_err(), TryRecvError::Closed));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled()); // XXX should we cancel IO task here?
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -6038,23 +5986,25 @@ mod test {
             gen: 1,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
         println!("ds1: {:?}", ds);
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
         println!("\nds2: {:?}\n", ds);
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        let res = ds.promote_to_active(upstairs_connection_2, tx2).await;
+        let res = ds.promote_to_active(upstairs_connection_2, id2).await;
         assert!(res.is_err());
 
-        assert!(matches!(rx1.try_recv().unwrap_err(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().unwrap_err(), TryRecvError::Closed));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled()); // XXX should we cancel IO task here?
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -6086,21 +6036,24 @@ mod test {
             gen: 1,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        let res = ds.promote_to_active(upstairs_connection_2, tx2).await;
+        let res = ds.promote_to_active(upstairs_connection_2, id2).await;
         assert!(res.is_err());
 
-        assert!(matches!(rx1.try_recv().unwrap_err(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().unwrap_err(), TryRecvError::Closed));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled()); // XXX should we cancel IO task here?
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -6130,19 +6083,23 @@ mod test {
             gen: 2,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, tx2).await?;
-        assert_eq!(rx1.try_recv().unwrap(), upstairs_connection_2);
-        assert!(matches!(rx2.try_recv().unwrap_err(), TryRecvError::Empty));
+        ds.promote_to_active(upstairs_connection_2, id2).await?;
+
+        assert!(cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -6171,19 +6128,22 @@ mod test {
             gen: 1,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, tx2).await?;
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        ds.promote_to_active(upstairs_connection_2, id2).await?;
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         assert_eq!(ds.active_upstairs().len(), 2);
 
@@ -6211,19 +6171,23 @@ mod test {
             gen: 1,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, tx2).await?;
-        assert_eq!(rx1.try_recv().unwrap(), upstairs_connection_2);
-        assert!(matches!(rx2.try_recv().unwrap_err(), TryRecvError::Empty));
+        ds.promote_to_active(upstairs_connection_2, id2).await?;
+
+        assert!(cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
@@ -6250,19 +6214,22 @@ mod test {
             gen: 1,
         };
 
-        let (tx1, mut rx1) = oneshot::channel();
-        let (tx2, mut rx2) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let id2 = ConnectionId(2);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().err().unwrap(), TryRecvError::Empty));
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, tx2).await?;
-        assert!(matches!(rx1.try_recv().err().unwrap(), TryRecvError::Empty));
-        assert!(matches!(rx2.try_recv().unwrap_err(), TryRecvError::Empty));
+        ds.promote_to_active(upstairs_connection_2, id2).await?;
+        assert!(!cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         assert_eq!(ds.active_upstairs().len(), 2);
 
@@ -6337,6 +6304,7 @@ mod test {
             .set_logger(csl())
             .build()
             .await?;
+        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
         let upstairs_connection_1 = UpstairsConnection {
@@ -6345,11 +6313,11 @@ mod test {
             gen: 10,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx1, mut rx1) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         // Add one job, id 1000
         let rio = IOop::Read {
@@ -6382,10 +6350,12 @@ mod test {
             gen: 11,
         };
 
-        let (tx2, mut _rx2) = oneshot::channel();
-        ds.promote_to_active(upstairs_connection_2, tx2).await?;
+        let id2 = ConnectionId(2);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_2, id2).await?;
 
-        assert_eq!(rx1.try_recv().unwrap(), upstairs_connection_2);
+        assert!(cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         // This should error with UpstairsInactive - upstairs_connection_1 isn't
         // active anymore and can't borrow the work map.
@@ -6428,6 +6398,7 @@ mod test {
             .set_logger(csl())
             .build()
             .await?;
+        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
         let upstairs_connection_1 = UpstairsConnection {
@@ -6436,11 +6407,11 @@ mod test {
             gen: 10,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx1, mut rx1) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         // Add one job, id 1000
         let rio = IOop::Read {
@@ -6473,10 +6444,12 @@ mod test {
             gen: 11,
         };
 
-        let (tx2, mut _rx2) = oneshot::channel();
-        ds.promote_to_active(upstairs_connection_2, tx2).await?;
+        let id2 = ConnectionId(2);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_2, id2).await?;
 
-        assert_eq!(rx1.try_recv().unwrap(), upstairs_connection_2);
+        assert!(cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         // This should error with UpstairsInactive - upstairs_connection_1 isn't
         // active anymore and can't borrow the work map.
@@ -6519,6 +6492,7 @@ mod test {
             .set_logger(csl())
             .build()
             .await?;
+        ads.lock().await.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
         let upstairs_connection_1 = UpstairsConnection {
@@ -6527,11 +6501,11 @@ mod test {
             gen: 10,
         };
 
-        // For the other_active_upstairs, unused.
-        let (tx1, mut rx1) = oneshot::channel();
-
         let mut ds = ads.lock().await;
-        ds.promote_to_active(upstairs_connection_1, tx1).await?;
+
+        let id1 = ConnectionId(1);
+        let cancel1 = ds.new_connection(id1, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_1, id1).await?;
 
         // Add one job, id 1000
         let rio = IOop::Read {
@@ -6557,8 +6531,9 @@ mod test {
             .unwrap();
 
         // Before complete_work, the same Upstairs reconnects and goes active
-        let (tx2, mut _rx2) = oneshot::channel();
-        ds.promote_to_active(upstairs_connection_1, tx2).await?;
+        let id2 = ConnectionId(2);
+        let cancel2 = ds.new_connection(id2, mpsc::unbounded_channel().0);
+        ds.promote_to_active(upstairs_connection_1, id2).await?;
 
         // In the real downstairs, there would be two tasks now that both
         // correspond to upstairs_connection_1.
@@ -6566,7 +6541,8 @@ mod test {
         // Validate that the original set of tasks were sent the termination
         // signal.
 
-        assert_eq!(rx1.try_recv().unwrap(), upstairs_connection_1);
+        assert!(cancel1.is_cancelled());
+        assert!(!cancel2.is_cancelled());
 
         // If the original set of tasks don't end right away, they'll try to run
         // complete_work:
