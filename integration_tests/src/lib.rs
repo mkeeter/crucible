@@ -2263,9 +2263,12 @@ mod test {
             )
             .await?;
 
+        eprintln!("\n\nDEATIVATING\n\n");
         volume.deactivate().await?;
+        eprintln!("\n\nDONE DEACTIVATING\n\n");
 
         drop(volume);
+        eprintln!("\n\nDROPPED VOLUME\n\n");
 
         test_downstairs_set.reboot_read_only().await?;
 
