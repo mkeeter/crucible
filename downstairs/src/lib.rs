@@ -446,7 +446,7 @@ impl IntoIterator for RegionWrite {
  * We will start from the provided start_block.
  * We will stop after "count" blocks are written to the export_path.
  */
-pub async fn downstairs_export<P: AsRef<Path> + std::fmt::Debug>(
+pub fn downstairs_export<P: AsRef<Path> + std::fmt::Debug>(
     region: &mut Region,
     export_path: P,
     start_block: u64,
@@ -485,19 +485,17 @@ pub async fn downstairs_export<P: AsRef<Path> + std::fmt::Debug>(
             if (extent_offset + block_offset) >= start_block {
                 blocks_copied += 1;
 
-                let response = region
-                    .region_read(
-                        &RegionReadRequest(vec![RegionReadReq {
-                            extent: eid,
-                            offset: Block::new_with_ddef(
-                                block_offset,
-                                &region.def(),
-                            ),
-                            count: NonZeroUsize::new(1).unwrap(),
-                        }]),
-                        JobId(0),
-                    )
-                    .await?;
+                let response = region.region_read(
+                    &RegionReadRequest(vec![RegionReadReq {
+                        extent: eid,
+                        offset: Block::new_with_ddef(
+                            block_offset,
+                            &region.def(),
+                        ),
+                        count: NonZeroUsize::new(1).unwrap(),
+                    }]),
+                    JobId(0),
+                )?;
 
                 out_file.write_all(&response.data).unwrap();
 
@@ -518,7 +516,7 @@ pub async fn downstairs_export<P: AsRef<Path> + std::fmt::Debug>(
  * The total size of the region will be rounded up to the next largest
  * extent multiple.
  */
-pub async fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
+pub fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
     region: &mut Region,
     import_path: P,
 ) -> Result<()> {
@@ -546,7 +544,7 @@ pub async fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
          * Extend the region to fit the file.
          */
         println!("Extending region to fit image");
-        region.extend(extents_needed as u32).await?;
+        region.extend(extents_needed as u32)?;
     } else {
         println!("Region already large enough for image");
     }
@@ -638,7 +636,7 @@ pub async fn downstairs_import<P: AsRef<Path> + std::fmt::Debug>(
         let write = RegionWrite::new(&blocks, buffer)?;
 
         // We have no job ID, so it makes no sense for accounting.
-        region.region_write(write, JobId(0), false).await?;
+        region.region_write(write, JobId(0), false)?;
         offset.advance(nblocks);
     }
 
@@ -1275,15 +1273,12 @@ impl ActiveConnection {
                         gen_number
                     );
 
-                    match region
-                        .region_flush_extent(
-                            extent_id,
-                            gen_number,
-                            flush_number,
-                            repair_id,
-                        )
-                        .await
-                    {
+                    match region.region_flush_extent(
+                        extent_id,
+                        gen_number,
+                        flush_number,
+                        repair_id,
+                    ) {
                         Ok(()) => Message::RepairAckId { repair_id },
                         Err(error) => Message::ExtentError {
                             repair_id,
@@ -1304,7 +1299,7 @@ impl ActiveConnection {
                         self.log,
                         "{} Close extent {}", repair_id, extent_id
                     );
-                    match region.close_extent(extent_id).await {
+                    match region.close_extent(extent_id) {
                         Ok(_) => Message::RepairAckId { repair_id },
                         Err(error) => Message::ExtentError {
                             repair_id,
@@ -1357,7 +1352,7 @@ impl ActiveConnection {
                         self.log,
                         "{} Reopen extent {}", repair_id, extent_id
                     );
-                    match region.reopen_extent(extent_id).await {
+                    match region.reopen_extent(extent_id) {
                         Ok(()) => Message::RepairAckId { repair_id },
                         Err(error) => Message::ExtentError {
                             repair_id,
@@ -1505,7 +1500,7 @@ impl ActiveConnection {
                 } else {
                     // This clone shouldn't be too expensive, since it's only
                     // 32 bytes per extent (and should usually only be 1 extent)
-                    region.region_read(&requests, job_id).await
+                    region.region_read(&requests, job_id)
                 };
                 debug!(
                     self.log,
@@ -1573,7 +1568,7 @@ impl ActiveConnection {
                 } else {
                     // The region_write will handle what happens to each block
                     // based on if they have data or not.
-                    region.region_write(writes, job_id, true).await
+                    region.region_write(writes, job_id, true)
                 };
 
                 Message::WriteUnwrittenAck {
@@ -1591,7 +1586,7 @@ impl ActiveConnection {
                     warn!(self.log, "returning error on write!");
                     Err(CrucibleError::GenericError("test error".to_string()))
                 } else {
-                    region.region_write(writes, job_id, false).await
+                    region.region_write(writes, job_id, false)
                 };
                 debug!(
                     self.log,
@@ -1619,15 +1614,13 @@ impl ActiveConnection {
                     warn!(self.log, "returning error on flush!");
                     Err(CrucibleError::GenericError("test error".to_string()))
                 } else {
-                    region
-                        .region_flush(
-                            flush_number,
-                            gen_number,
-                            &snapshot_details,
-                            job_id,
-                            extent_limit,
-                        )
-                        .await
+                    region.region_flush(
+                        flush_number,
+                        gen_number,
+                        &snapshot_details,
+                        job_id,
+                        extent_limit,
+                    )
                 };
                 debug!(
                     self.log,
@@ -1647,7 +1640,7 @@ impl ActiveConnection {
                 dependencies,
                 extent,
             } => {
-                let result = region.close_extent(extent).await;
+                let result = region.close_extent(extent);
                 debug!(
                     self.log,
                     "JustClose :{} extent {} deps:{:?} res:{}",
@@ -1673,17 +1666,14 @@ impl ActiveConnection {
                 // If flush fails, return that result.
                 // Else, if close fails, return that result.
                 // Else, return the f/g/d from the close.
-                let result = match region
-                    .region_flush_extent(
-                        extent,
-                        gen_number,
-                        flush_number,
-                        job_id,
-                    )
-                    .await
-                {
+                let result = match region.region_flush_extent(
+                    extent,
+                    gen_number,
+                    flush_number,
+                    job_id,
+                ) {
                     Err(f_res) => Err(f_res),
-                    Ok(_) => region.close_extent(extent).await,
+                    Ok(_) => region.close_extent(extent),
                 };
 
                 debug!(
@@ -1738,7 +1728,7 @@ impl ActiveConnection {
                 dependencies,
                 extent,
             } => {
-                let result = region.reopen_extent(extent).await;
+                let result = region.reopen_extent(extent);
                 debug!(
                     self.log,
                     "LiveReopen:{} extent {} deps:{:?} res:{}",
@@ -2036,7 +2026,7 @@ impl DownstairsBuilder<'_> {
         self
     }
 
-    pub async fn build(&mut self) -> Result<Downstairs> {
+    pub fn build(&mut self) -> Result<Downstairs> {
         let lossy = self.lossy.unwrap_or(false);
         let read_errors = self.read_errors.unwrap_or(false);
         let write_errors = self.write_errors.unwrap_or(false);
@@ -2056,8 +2046,7 @@ impl DownstairsBuilder<'_> {
             self.read_only,
             backend,
             &log,
-        )
-        .await?;
+        )?;
 
         let encrypted = region.encrypted();
 
@@ -2227,7 +2216,7 @@ impl Downstairs {
         (cancel, reply_channel_rx)
     }
 
-    async fn promote_to_active(
+    fn promote_to_active(
         &mut self,
         upstairs_connection: UpstairsConnection,
         conn_id: ConnectionId,
@@ -2274,7 +2263,7 @@ impl Downstairs {
                     assert_eq!(self.active_upstairs.len(), 1);
 
                     // Re-open any closed extents
-                    self.region.reopen_all_extents().await?;
+                    self.region.reopen_all_extents()?;
 
                     info!(
                         self.log,
@@ -2369,7 +2358,7 @@ impl Downstairs {
                     assert_eq!(self.active_upstairs.len(), 1);
 
                     // Re-open any closed extents
-                    self.region.reopen_all_extents().await?;
+                    self.region.reopen_all_extents()?;
 
                     info!(
                         self.log,
@@ -2473,7 +2462,7 @@ impl Downstairs {
             bail!("Incompatible region definitions: {e}");
         }
 
-        if let Err(e) = self.region.close_all_extents().await {
+        if let Err(e) = self.region.close_all_extents() {
             bail!("Failed to close all extents: {e}");
         }
 
@@ -2539,7 +2528,7 @@ impl Downstairs {
     /// either LastFlush, or ExtentVersionsPlease.  Once we respond to
     /// that message, we can move forward and start receiving IO from
     /// the upstairs.
-    async fn on_negotiation_step(
+    fn on_negotiation_step(
         &mut self,
         m: Message,
         conn_id: ConnectionId,
@@ -2713,8 +2702,7 @@ impl Downstairs {
                         );
                     }
 
-                    self.promote_to_active(upstairs_connection, conn_id)
-                        .await?;
+                    self.promote_to_active(upstairs_connection, conn_id)?;
 
                     // reborrow our local state
                     let state =
@@ -2818,7 +2806,7 @@ impl Downstairs {
                     &self.log,
                 ));
 
-                let meta_info = self.region.meta_info().await?;
+                let meta_info = self.region.meta_info()?;
 
                 let flush_numbers: Vec<_> =
                     meta_info.iter().map(|m| m.flush_number).collect();
@@ -2951,7 +2939,7 @@ impl Downstairs {
                 );
                 self.remove_connection(id);
             }
-        } else if let Err(e) = self.on_negotiation_step(m, id).await {
+        } else if let Err(e) = self.on_negotiation_step(m, id) {
             warn!(
                 self.log,
                 "on_negotiation_step returns error {e:?}, disconnecting"
@@ -3327,7 +3315,7 @@ pub enum Backend {
     SQLite,
 }
 
-pub async fn create_region(
+pub fn create_region(
     block_size: u64,
     data: PathBuf,
     extent_size: u64,
@@ -3348,10 +3336,9 @@ pub async fn create_region(
         Backend::default(),
         log,
     )
-    .await
 }
 
-pub async fn create_region_with_backend(
+pub fn create_region_with_backend(
     data: PathBuf,
     extent_size: Block,
     extent_count: u32,
@@ -3370,8 +3357,8 @@ pub async fn create_region_with_backend(
     region_options.set_encrypted(encrypted);
 
     let mut region =
-        Region::create_with_backend(data, region_options, backend, log).await?;
-    region.extend(extent_count).await?;
+        Region::create_with_backend(data, region_options, backend, log)?;
+    region.extend(extent_count)?;
 
     Ok(region)
 }
@@ -3443,7 +3430,7 @@ pub async fn start_downstairs(
 
     let repair_log = root_log.new(o!("task" => "repair".to_string()));
     let repair_listener =
-        match repair::repair_main(&ds, repair_address, &repair_log).await {
+        match repair::repair_main(&ds, repair_address, &repair_log) {
             Err(e) => {
                 // TODO tear down other things if repair server can't be
                 // started?
@@ -3718,14 +3705,13 @@ mod test {
         let dir = tempdir()?;
         mkdir_for_file(dir.path())?;
 
-        let mut region = Region::create(&dir, region_options, csl()).await?;
-        region.extend(2).await?;
+        let mut region = Region::create(&dir, region_options, csl())?;
+        region.extend(2)?;
 
         let path_dir = dir.as_ref().to_path_buf();
         let mut ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
-            .build()
-            .await?;
+            .build()?;
         ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
@@ -3738,7 +3724,7 @@ mod test {
         // Dummy connection id
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let rio = IOop::Read {
             dependencies: Vec::new(),
@@ -3779,7 +3765,7 @@ mod test {
 
     // Test function to create a simple downstairs with the given block
     // and extent values.  Returns the Downstairs.
-    async fn create_test_downstairs(
+    fn create_test_downstairs(
         block_size: u64,
         extent_size: u64,
         extent_count: u32,
@@ -3796,14 +3782,13 @@ mod test {
         region_options.set_uuid(Uuid::new_v4());
 
         mkdir_for_file(dir.path())?;
-        let mut region = Region::create(dir, region_options, csl()).await?;
-        region.extend(extent_count).await?;
+        let mut region = Region::create(dir, region_options, csl())?;
+        region.extend(extent_count)?;
 
         let path_dir = dir.as_ref().to_path_buf();
         let mut ds = Downstairs::new_builder(&path_dir, false)
             .set_logger(csl())
-            .build()
-            .await?;
+            .build()?;
         ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         Ok(ds)
@@ -3823,8 +3808,7 @@ mod test {
         let extent_size = 4;
         let dir = tempdir()?;
 
-        let mut ds =
-            create_test_downstairs(block_size, extent_size, 5, &dir).await?;
+        let mut ds = create_test_downstairs(block_size, extent_size, 5, &dir)?;
 
         // This happens in proc() function.
         let upstairs_connection = UpstairsConnection {
@@ -3836,7 +3820,7 @@ mod test {
         // Dummy ConnectionId
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let rio = IOop::ExtentClose {
             dependencies: Vec::new(),
@@ -3905,8 +3889,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let mut ds =
-            create_test_downstairs(block_size, extent_size, 5, &dir).await?;
+        let mut ds = create_test_downstairs(block_size, extent_size, 5, &dir)?;
         ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
 
         // This happens in proc() function.
@@ -3919,7 +3902,7 @@ mod test {
         // Dummy ConnectionId
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let rio = IOop::ExtentClose {
             dependencies: Vec::new(),
@@ -4075,8 +4058,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let mut ds =
-            create_test_downstairs(block_size, extent_size, 5, &dir).await?;
+        let mut ds = create_test_downstairs(block_size, extent_size, 5, &dir)?;
 
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -4086,7 +4068,7 @@ mod test {
 
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let eid = ExtentId(3);
 
@@ -4184,8 +4166,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let mut ds =
-            create_test_downstairs(block_size, extent_size, 5, &dir).await?;
+        let mut ds = create_test_downstairs(block_size, extent_size, 5, &dir)?;
 
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -4195,7 +4176,7 @@ mod test {
 
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let eid = ExtentId(0);
 
@@ -4288,8 +4269,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let mut ds =
-            create_test_downstairs(block_size, extent_size, 5, &dir).await?;
+        let mut ds = create_test_downstairs(block_size, extent_size, 5, &dir)?;
 
         // This happens in proc() function.
         let upstairs_connection = UpstairsConnection {
@@ -4301,7 +4281,7 @@ mod test {
         // Dummy ConnectionId
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let eid = ExtentId(1);
 
@@ -4398,8 +4378,7 @@ mod test {
         let dir = tempdir()?;
         let gen = 10;
 
-        let mut ds =
-            create_test_downstairs(block_size, extent_size, 5, &dir).await?;
+        let mut ds = create_test_downstairs(block_size, extent_size, 5, &dir)?;
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
@@ -4408,7 +4387,7 @@ mod test {
 
         let conn_id = ConnectionId(0);
         let (_, mut rx) = ds.add_fake_connection(upstairs_connection, conn_id);
-        ds.promote_to_active(upstairs_connection, conn_id).await?;
+        ds.promote_to_active(upstairs_connection, conn_id)?;
 
         let eid_one = ExtentId(1);
         let eid_two = ExtentId(2);
@@ -5098,8 +5077,8 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn import_test_basic() -> Result<()> {
+    #[test]
+    fn import_test_basic() -> Result<()> {
         /*
          * import + export test where data matches region size
          */
@@ -5121,8 +5100,8 @@ mod test {
         let dir = tempdir()?;
         mkdir_for_file(dir.path())?;
 
-        let mut region = Region::create(&dir, region_options, csl()).await?;
-        region.extend(10).await?;
+        let mut region = Region::create(&dir, region_options, csl())?;
+        region.extend(10)?;
 
         // create random file
 
@@ -5144,8 +5123,8 @@ mod test {
 
         // import random_data to the region
 
-        downstairs_import(&mut region, &random_file_path).await?;
-        region.region_flush(1, 1, &None, JobId(0), None).await?;
+        downstairs_import(&mut region, &random_file_path)?;
+        region.region_flush(1, 1, &None, JobId(0), None)?;
 
         // export region to another file
 
@@ -5155,8 +5134,7 @@ mod test {
             &export_path,
             0,
             total_bytes / block_size,
-        )
-        .await?;
+        )?;
 
         // compare files
 
@@ -5168,8 +5146,8 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn import_test_too_small() -> Result<()> {
+    #[test]
+    fn import_test_too_small() -> Result<()> {
         /*
          * import + export test where data is smaller than region size
          */
@@ -5190,8 +5168,8 @@ mod test {
         let dir = tempdir()?;
         mkdir_for_file(dir.path())?;
 
-        let mut region = Region::create(&dir, region_options, csl()).await?;
-        region.extend(10).await?;
+        let mut region = Region::create(&dir, region_options, csl())?;
+        region.extend(10)?;
 
         // create random file (100 fewer bytes than region size)
 
@@ -5213,8 +5191,8 @@ mod test {
 
         // import random_data to the region
 
-        downstairs_import(&mut region, &random_file_path).await?;
-        region.region_flush(1, 1, &None, JobId(0), None).await?;
+        downstairs_import(&mut region, &random_file_path)?;
+        region.region_flush(1, 1, &None, JobId(0), None)?;
 
         // export region to another file (note: 100 fewer bytes imported than
         // region size still means the whole region is exported)
@@ -5226,8 +5204,7 @@ mod test {
             &export_path,
             0,
             region_size / block_size,
-        )
-        .await?;
+        )?;
 
         // compare files
 
@@ -5251,8 +5228,8 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn import_test_too_large() -> Result<()> {
+    #[test]
+    fn import_test_too_large() -> Result<()> {
         /*
          * import + export test where data is larger than region size
          */
@@ -5273,8 +5250,8 @@ mod test {
         let dir = tempdir()?;
         mkdir_for_file(dir.path())?;
 
-        let mut region = Region::create(&dir, region_options, csl()).await?;
-        region.extend(10).await?;
+        let mut region = Region::create(&dir, region_options, csl())?;
+        region.extend(10)?;
 
         // create random file (100 more bytes than region size)
 
@@ -5296,8 +5273,8 @@ mod test {
 
         // import random_data to the region
 
-        downstairs_import(&mut region, &random_file_path).await?;
-        region.region_flush(1, 1, &None, JobId(0), None).await?;
+        downstairs_import(&mut region, &random_file_path)?;
+        region.region_flush(1, 1, &None, JobId(0), None)?;
 
         // export region to another file (note: 100 more bytes will have caused
         // 10 more extents to be added, but someone running the export command
@@ -5310,8 +5287,7 @@ mod test {
             &export_path,
             0,
             total_bytes / block_size + 1,
-        )
-        .await?;
+        )?;
 
         // compare files
 
@@ -5334,8 +5310,8 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn import_test_basic_read_blocks() -> Result<()> {
+    #[test]
+    fn import_test_basic_read_blocks() -> Result<()> {
         /*
          * import + export test where data matches region size, and read the
          * blocks
@@ -5357,8 +5333,8 @@ mod test {
         let dir = tempdir()?;
         mkdir_for_file(dir.path())?;
 
-        let mut region = Region::create(&dir, region_options, csl()).await?;
-        region.extend(10).await?;
+        let mut region = Region::create(&dir, region_options, csl())?;
+        region.extend(10)?;
 
         // create random file
 
@@ -5380,23 +5356,21 @@ mod test {
 
         // import random_data to the region
 
-        downstairs_import(&mut region, &random_file_path).await?;
-        region.region_flush(1, 1, &None, JobId(0), None).await?;
+        downstairs_import(&mut region, &random_file_path)?;
+        region.region_flush(1, 1, &None, JobId(0), None)?;
 
         // read block by block
         let mut read_data = Vec::with_capacity(total_bytes as usize);
         for eid in (0..region.def().extent_count()).map(ExtentId) {
             for offset in 0..region.def().extent_size().value {
-                let response = region
-                    .region_read(
-                        &RegionReadRequest(vec![RegionReadReq {
-                            extent: eid,
-                            offset: Block::new_512(offset),
-                            count: NonZeroUsize::new(1).unwrap(),
-                        }]),
-                        JobId(0),
-                    )
-                    .await?;
+                let response = region.region_read(
+                    &RegionReadRequest(vec![RegionReadReq {
+                        extent: eid,
+                        offset: Block::new_512(offset),
+                        count: NonZeroUsize::new(1).unwrap(),
+                    }]),
+                    JobId(0),
+                )?;
 
                 assert_eq!(response.blocks.len(), 1);
 
@@ -5413,7 +5387,7 @@ mod test {
         Ok(())
     }
 
-    async fn build_test_downstairs(read_only: bool) -> Result<Downstairs> {
+    fn build_test_downstairs(read_only: bool) -> Result<Downstairs> {
         let block_size: u64 = 512;
         let extent_size = 4;
 
@@ -5429,22 +5403,21 @@ mod test {
         let dir = tempdir()?;
         mkdir_for_file(dir.path())?;
 
-        let mut region = Region::create(&dir, region_options, csl()).await?;
-        region.extend(2).await?;
+        let mut region = Region::create(&dir, region_options, csl())?;
+        region.extend(2)?;
 
         let path_dir = dir.as_ref().to_path_buf();
 
         let mut ds = Downstairs::new_builder(&path_dir, read_only)
             .set_logger(csl())
-            .build()
-            .await?;
+            .build()?;
         ds.repair_address = Some(DUMMY_REPAIR_SOCKET);
         Ok(ds)
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_one_read_write() -> Result<()> {
-        let mut ds = build_test_downstairs(false).await?;
+    #[test]
+    fn test_promote_to_active_one_read_write() -> Result<()> {
+        let mut ds = build_test_downstairs(false)?;
 
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5453,17 +5426,16 @@ mod test {
         };
 
         ds.add_fake_connection(upstairs_connection, ConnectionId(0));
-        ds.promote_to_active(upstairs_connection, ConnectionId(0))
-            .await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_one_read_only() -> Result<()> {
-        let mut ds = build_test_downstairs(true).await?;
+    #[test]
+    fn test_promote_to_active_one_read_only() -> Result<()> {
+        let mut ds = build_test_downstairs(true)?;
 
         let upstairs_connection = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5472,20 +5444,19 @@ mod test {
         };
 
         ds.add_fake_connection(upstairs_connection, ConnectionId(0));
-        ds.promote_to_active(upstairs_connection, ConnectionId(0))
-            .await?;
+        ds.promote_to_active(upstairs_connection, ConnectionId(0))?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_multi_read_write_different_uuid_same_gen(
+    #[test]
+    fn test_promote_to_active_multi_read_write_different_uuid_same_gen(
     ) -> Result<()> {
         // Attempting to activate multiple read-write (where it's different
         // Upstairs) but with the same gen should be blocked
-        let mut ds = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5503,13 +5474,13 @@ mod test {
         let id2 = ConnectionId(2);
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        let res = ds.promote_to_active(upstairs_connection_2, id2).await;
+        let res = ds.promote_to_active(upstairs_connection_2, id2);
         assert!(res.is_err());
 
         assert!(!cancel1.is_cancelled());
@@ -5525,12 +5496,12 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_multi_read_write_different_uuid_lower_gen(
+    #[test]
+    fn test_promote_to_active_multi_read_write_different_uuid_lower_gen(
     ) -> Result<()> {
         // Attempting to activate multiple read-write (where it's different
         // Upstairs) but with a lower gen should be blocked.
-        let mut ds = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5550,14 +5521,14 @@ mod test {
         let id2 = ConnectionId(2);
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
         println!("\nds2: {:?}\n", ds);
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        let res = ds.promote_to_active(upstairs_connection_2, id2).await;
+        let res = ds.promote_to_active(upstairs_connection_2, id2);
         assert!(res.is_err());
 
         assert!(!cancel1.is_cancelled());
@@ -5573,13 +5544,13 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_multi_read_write_same_uuid_same_gen(
-    ) -> Result<()> {
+    #[test]
+    fn test_promote_to_active_multi_read_write_same_uuid_same_gen() -> Result<()>
+    {
         // Attempting to activate multiple read-write (where it's the same
         // Upstairs but a different session) will block the "new" connection
         // if it has the same generation number.
-        let mut ds = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5598,13 +5569,13 @@ mod test {
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
 
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        let res = ds.promote_to_active(upstairs_connection_2, id2).await;
+        let res = ds.promote_to_active(upstairs_connection_2, id2);
         assert!(res.is_err());
 
         assert!(!cancel1.is_cancelled());
@@ -5618,13 +5589,13 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_multi_read_write_same_uuid_larger_gen(
+    #[test]
+    fn test_promote_to_active_multi_read_write_same_uuid_larger_gen(
     ) -> Result<()> {
         // Attempting to activate multiple read-write where it's the same
         // Upstairs, but a different session, and with a larger generation
         // should allow the new connection to take over.
-        let mut ds = build_test_downstairs(false).await?;
+        let mut ds = build_test_downstairs(false)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5643,13 +5614,13 @@ mod test {
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
 
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, id2).await?;
+        ds.promote_to_active(upstairs_connection_2, id2)?;
 
         assert!(cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
@@ -5662,12 +5633,11 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_multi_read_only_different_uuid(
-    ) -> Result<()> {
+    #[test]
+    fn test_promote_to_active_multi_read_only_different_uuid() -> Result<()> {
         // Activating multiple read-only with different Upstairs UUIDs should
         // work.
-        let mut ds = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5686,13 +5656,13 @@ mod test {
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
 
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, id2).await?;
+        ds.promote_to_active(upstairs_connection_2, id2)?;
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
@@ -5704,11 +5674,11 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_promote_to_active_multi_read_only_same_uuid() -> Result<()> {
+    #[test]
+    fn test_promote_to_active_multi_read_only_same_uuid() -> Result<()> {
         // Activating multiple read-only with the same Upstairs UUID should
         // kick out the other active one.
-        let mut ds = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5727,13 +5697,13 @@ mod test {
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
 
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, id2).await?;
+        ds.promote_to_active(upstairs_connection_2, id2)?;
 
         assert!(cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
@@ -5746,10 +5716,10 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_multiple_read_only_no_job_id_collision() -> Result<()> {
+    #[test]
+    fn test_multiple_read_only_no_job_id_collision() -> Result<()> {
         // Two read-only Upstairs shouldn't see each other's jobs
-        let mut ds = build_test_downstairs(true).await?;
+        let mut ds = build_test_downstairs(true)?;
 
         let upstairs_connection_1 = UpstairsConnection {
             upstairs_id: Uuid::new_v4(),
@@ -5768,13 +5738,13 @@ mod test {
         let (cancel1, _) = ds.add_fake_connection(upstairs_connection_1, id1);
         let (cancel2, _) = ds.add_fake_connection(upstairs_connection_2, id2);
 
-        ds.promote_to_active(upstairs_connection_1, id1).await?;
+        ds.promote_to_active(upstairs_connection_1, id1)?;
 
         assert_eq!(ds.active_upstairs().len(), 1);
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
-        ds.promote_to_active(upstairs_connection_2, id2).await?;
+        ds.promote_to_active(upstairs_connection_2, id2)?;
         assert!(!cancel1.is_cancelled());
         assert!(!cancel2.is_cancelled());
 
@@ -5836,7 +5806,7 @@ mod test {
         let ec = 5;
         let dir = tempdir()?;
 
-        let ds = create_test_downstairs(bs, es, ec, &dir).await?;
+        let ds = create_test_downstairs(bs, es, ec, &dir)?;
         let _jh = start_downstairs(
             ds,
             "127.0.0.1".parse().unwrap(),

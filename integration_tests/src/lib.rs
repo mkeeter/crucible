@@ -64,8 +64,7 @@ mod test {
                 encrypted,
                 backend,
                 csl(),
-            )
-            .await?;
+            )?;
 
             let mut downstairs =
                 Downstairs::new_builder(tempdir.path(), read_only)
@@ -73,8 +72,7 @@ mod test {
                     .set_logger(csl())
                     .set_test_errors(problematic, problematic, problematic)
                     .set_backend(backend)
-                    .build()
-                    .await?;
+                    .build()?;
 
             if let Some(ref clone_source) = clone_source {
                 downstairs.clone_region(*clone_source).await?
@@ -100,8 +98,7 @@ mod test {
         pub async fn reboot_read_only(&mut self) -> Result<()> {
             let downstairs = Downstairs::new_builder(self.tempdir.path(), true)
                 .set_logger(csl())
-                .build()
-                .await?;
+                .build()?;
 
             self.downstairs = Some(
                 start_downstairs(
@@ -124,8 +121,7 @@ mod test {
             let downstairs =
                 Downstairs::new_builder(self.tempdir.path(), false)
                     .set_logger(csl())
-                    .build()
-                    .await?;
+                    .build()?;
 
             self.downstairs = Some(
                 start_downstairs(
@@ -155,8 +151,7 @@ mod test {
             let mut downstairs =
                 Downstairs::new_builder(self.tempdir.path(), true)
                     .set_logger(csl())
-                    .build()
-                    .await?;
+                    .build()?;
             downstairs.clone_region(source).await
         }
 

@@ -464,16 +464,14 @@ impl Extent {
         Ok(extent)
     }
 
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn dirty(&self) -> bool {
+    pub fn dirty(&self) -> bool {
         self.inner.dirty().unwrap()
     }
 
     /**
      * Close an extent and the metadata db files for it.
      */
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
+    pub fn close(self) -> Result<(u64, u64, bool), CrucibleError> {
         let gen = self.inner.gen_number().unwrap();
         let flush = self.inner.flush_number().unwrap();
         let dirty = self.inner.dirty().unwrap();
@@ -542,7 +540,7 @@ impl Extent {
     /// returned.  Otherwise, the value in `ExtentReadResponse::data` is
     /// guaranteed to be fully initialized and of the requested length.
     #[instrument]
-    pub async fn read(
+    pub fn read(
         &mut self,
         job_id: JobId,
         req: ExtentReadRequest,
@@ -558,7 +556,7 @@ impl Extent {
     }
 
     #[instrument]
-    pub async fn write(
+    pub fn write(
         &mut self,
         job_id: JobId,
         write: ExtentWrite,
@@ -580,7 +578,7 @@ impl Extent {
     }
 
     #[instrument]
-    pub(crate) async fn flush<I: Into<JobOrReconciliationId> + Debug>(
+    pub(crate) fn flush<I: Into<JobOrReconciliationId> + Debug>(
         &mut self,
         new_flush: u64,
         new_gen: u64,
@@ -608,8 +606,7 @@ impl Extent {
         self.inner.flush(new_flush, new_gen, job_id)
     }
 
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn get_meta_info(&self) -> ExtentMeta {
+    pub fn get_meta_info(&self) -> ExtentMeta {
         ExtentMeta {
             ext_version: 0,
             gen_number: self.inner.gen_number().unwrap(),
@@ -624,8 +621,7 @@ impl Extent {
     /// If the inner extent implementation does not support setting block
     /// contexts separately from a write operation
     #[cfg(test)]
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn set_dirty_and_block_context(
+    pub fn set_dirty_and_block_context(
         &mut self,
         block_context: &DownstairsBlockContext,
     ) -> Result<(), CrucibleError> {
@@ -638,8 +634,7 @@ impl Extent {
     /// If the inner extent implementation does not support getting block
     /// contexts separately from a read operation
     #[cfg(test)]
-    #[allow(clippy::unused_async)] // this will be async again in the future
-    pub async fn get_block_contexts(
+    pub fn get_block_contexts(
         &mut self,
         block: u64,
         count: u64,
