@@ -534,7 +534,7 @@ fn show_extent(
                 Region::open(dir, Default::default(), false, true, &log)?;
 
             let response = region.region_read(
-                &RegionReadRequest(vec![RegionReadReq {
+                RegionReadRequest(vec![RegionReadReq {
                     extent: cmp_extent,
                     offset: Block::new_with_ddef(block, &region.def()),
                     count: NonZeroUsize::new(1).unwrap(),
@@ -647,7 +647,7 @@ fn show_extent_block(
             Region::open(dir, Default::default(), false, true, &log)?;
 
         let response = region.region_read(
-            &RegionReadRequest(vec![RegionReadReq {
+            RegionReadRequest(vec![RegionReadReq {
                 extent: cmp_extent,
                 offset: Block::new_with_ddef(block_in_extent, &region.def()),
                 count: NonZeroUsize::new(1).unwrap(),

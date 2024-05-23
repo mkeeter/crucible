@@ -200,6 +200,7 @@ impl IntoIterator for RegionReadRequest {
 /// Do not derive `Clone` on this type; it will be expensive and tempting to
 /// call by accident!
 pub(crate) struct RegionReadResponse {
+    req: RegionReadRequest,
     blocks: Vec<Vec<BlockContext>>,
     data: BytesMut,
     uninit: BytesMut,
@@ -209,6 +210,7 @@ impl RegionReadResponse {
     /// Builds a new empty `ReadResponse` with the given capacity
     fn with_capacity(block_count: usize, block_size: u64) -> Self {
         Self {
+            req: RegionReadRequest(vec![]),
             blocks: vec![],
             data: BytesMut::new(),
             uninit: BytesMut::with_capacity(block_size as usize * block_count),
@@ -486,7 +488,7 @@ pub fn downstairs_export<P: AsRef<Path> + std::fmt::Debug>(
                 blocks_copied += 1;
 
                 let response = region.region_read(
-                    &RegionReadRequest(vec![RegionReadReq {
+                    RegionReadRequest(vec![RegionReadReq {
                         extent: eid,
                         offset: Block::new_with_ddef(
                             block_offset,
@@ -1500,7 +1502,7 @@ impl ActiveConnection {
                 } else {
                     // This clone shouldn't be too expensive, since it's only
                     // 32 bytes per extent (and should usually only be 1 extent)
-                    region.region_read(&requests, job_id)
+                    region.region_read(requests, job_id)
                 };
                 debug!(
                     self.log,
@@ -1517,7 +1519,7 @@ impl ActiveConnection {
                 // match statement.
                 let (blocks, data) = match response {
                     Ok(r) => (
-                        Ok(requests
+                        Ok(r.req
                             .iter()
                             .flat_map(|req| {
                                 // Iterate over blocks within this extent.  By
@@ -5370,7 +5372,7 @@ mod test {
         for eid in (0..region.def().extent_count()).map(ExtentId) {
             for offset in 0..region.def().extent_size().value {
                 let response = region.region_read(
-                    &RegionReadRequest(vec![RegionReadReq {
+                    RegionReadRequest(vec![RegionReadReq {
                         extent: eid,
                         offset: Block::new_512(offset),
                         count: NonZeroUsize::new(1).unwrap(),
