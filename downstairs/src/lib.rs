@@ -969,13 +969,14 @@ impl ActiveConnection {
         }
     }
 
+    #[cfg(test)]
     fn add_work(&mut self, ds_id: JobId, work: IOop) {
         let dsw = DownstairsWork {
             ds_id,
             work,
             state: WorkState::New,
         };
-        self.work.add_work(ds_id, dsw);
+        self.work.add_work(dsw);
     }
 
     /// Checks that the message's upstairs and session ID match this connection
@@ -1073,13 +1074,12 @@ impl ActiveConnection {
         dss: &mut DsStatOuter,
         region: &mut Region,
     ) -> Result<()> {
-        if let Some(new_ds_id) = self
-            .proc_frame(m, flags, region)
+        if self
+            .proc_frame(m, flags, dss, region)
             .await
             .context("proc_frame")?
         {
-            // If we added work, then do it!
-            cdt::work__start!(|| new_ds_id.0);
+            // This work may have unblocked future work
             self.do_work_for(flags, dss, region)
                 .await
                 .context("do_work_for")?;
@@ -1089,16 +1089,17 @@ impl ActiveConnection {
 
     /// Handle a new message from the upstairs
     ///
-    /// If the message is an IO, then put the new IO the work hashmap. If the
-    /// message is a repair message, then we handle it right here.
+    /// Returns `true` if the message was evaluated, `false` otherwise, or an
+    /// error if communication failed.
     async fn proc_frame(
         &mut self,
         m: Message,
         flags: &DownstairsFlags,
+        dss: &mut DsStatOuter,
         region: &mut Region,
-    ) -> Result<Option<JobId>> {
+    ) -> Result<bool> {
         if !self.is_message_valid(&m)? {
-            return Ok(None);
+            return Ok(false);
         }
 
         // The Upstairs will send Flushes periodically, even in read only mode
@@ -1130,9 +1131,8 @@ impl ActiveConnection {
                     dependencies: header.dependencies,
                     writes,
                 };
-
-                self.add_work(header.job_id, new_write);
-                Some(header.job_id)
+                let dsw = DownstairsWork::new(header.job_id, new_write);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::Flush {
                 job_id,
@@ -1153,8 +1153,8 @@ impl ActiveConnection {
                     extent_limit,
                 };
 
-                self.add_work(job_id, new_flush);
-                Some(job_id)
+                let dsw = DownstairsWork::new(job_id, new_flush);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::WriteUnwritten { header, data } => {
                 cdt::submit__writeunwritten__start!(|| header.job_id.0);
@@ -1164,9 +1164,8 @@ impl ActiveConnection {
                     dependencies: header.dependencies,
                     writes,
                 };
-
-                self.add_work(header.job_id, new_write);
-                Some(header.job_id)
+                let dsw = DownstairsWork::new(header.job_id, new_write);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::ReadRequest {
                 job_id,
@@ -1180,9 +1179,8 @@ impl ActiveConnection {
                     dependencies,
                     requests: RegionReadRequest::new(&requests),
                 };
-
-                self.add_work(job_id, new_read);
-                Some(job_id)
+                let dsw = DownstairsWork::new(job_id, new_read);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             // These are for repair while taking live IO
             Message::ExtentLiveClose {
@@ -1197,9 +1195,8 @@ impl ActiveConnection {
                     dependencies,
                     extent: extent_id,
                 };
-
-                self.add_work(job_id, ext_close);
-                Some(job_id)
+                let dsw = DownstairsWork::new(job_id, ext_close);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::ExtentLiveFlushClose {
                 job_id,
@@ -1217,9 +1214,8 @@ impl ActiveConnection {
                     flush_number,
                     gen_number,
                 };
-
-                self.add_work(job_id, new_flush);
-                Some(job_id)
+                let dsw = DownstairsWork::new(job_id, new_flush);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::ExtentLiveRepair {
                 job_id,
@@ -1236,10 +1232,9 @@ impl ActiveConnection {
 
                     source_repair_address,
                 };
-
-                self.add_work(job_id, new_repair);
                 debug!(self.log, "Received ExtentLiveRepair {}", job_id);
-                Some(job_id)
+                let dsw = DownstairsWork::new(job_id, new_repair);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::ExtentLiveReopen {
                 job_id,
@@ -1252,9 +1247,8 @@ impl ActiveConnection {
                     dependencies,
                     extent: extent_id,
                 };
-
-                self.add_work(job_id, new_open);
-                Some(job_id)
+                let dsw = DownstairsWork::new(job_id, new_open);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
             Message::ExtentLiveNoOp {
                 job_id,
@@ -1262,11 +1256,9 @@ impl ActiveConnection {
                 ..
             } => {
                 cdt::submit__el__noop__start!(|| job_id.0);
-                let new_open = IOop::ExtentLiveNoOp { dependencies };
-
-                self.add_work(job_id, new_open);
-                debug!(self.log, "Received NoOP {}", job_id);
-                Some(job_id)
+                let new_noop = IOop::ExtentLiveNoOp { dependencies };
+                let dsw = DownstairsWork::new(job_id, new_noop);
+                self.do_work_if_ready(dsw, flags, dss, region).await?
             }
 
             // These messages arrive during initial reconciliation.
@@ -1302,7 +1294,7 @@ impl ActiveConnection {
                     }
                 };
                 self.reply(msg)?;
-                None
+                true
             }
             Message::ExtentClose {
                 repair_id,
@@ -1323,7 +1315,7 @@ impl ActiveConnection {
                     }
                 };
                 self.reply(msg)?;
-                None
+                true
             }
             Message::ExtentRepair {
                 repair_id,
@@ -1355,7 +1347,7 @@ impl ActiveConnection {
                     }
                 };
                 self.reply(msg)?;
-                None
+                true
             }
             Message::ExtentReopen {
                 repair_id,
@@ -1376,11 +1368,11 @@ impl ActiveConnection {
                     }
                 };
                 self.reply(msg)?;
-                None
+                true
             }
             Message::Ruok => {
                 self.reply(Message::Imok)?;
-                None
+                false
             }
             x => bail!("unexpected frame {:?}", x),
         };
@@ -1429,6 +1421,27 @@ impl ActiveConnection {
             }
         }
         Ok(())
+    }
+
+    async fn do_work_if_ready(
+        &mut self,
+        mut job: DownstairsWork,
+        flags: &DownstairsFlags,
+        dss: &mut DsStatOuter,
+        region: &mut Region,
+    ) -> Result<bool> {
+        if self.work.check_ready(&mut job) {
+            cdt::work__start!(|| job.ds_id.0);
+            let mut prev = self.do_work(job, flags, dss, region).await?;
+            while let Some(ds_id) = prev.take() {
+                let job = self.work.in_progress(ds_id).unwrap();
+                prev = self.do_work(job, flags, dss, region).await?;
+            }
+            Ok(true)
+        } else {
+            self.work.add_work(job);
+            Ok(false)
+        }
     }
 
     /// Do work for the given IO job
@@ -3130,6 +3143,16 @@ struct DownstairsWork {
     state: WorkState,
 }
 
+impl DownstairsWork {
+    fn new(ds_id: JobId, work: IOop) -> Self {
+        DownstairsWork {
+            ds_id,
+            work,
+            state: WorkState::New,
+        }
+    }
+}
+
 impl Work {
     fn new(log: Logger) -> Self {
         Work {
@@ -3161,8 +3184,8 @@ impl Work {
         result
     }
 
-    fn add_work(&mut self, ds_id: JobId, dsw: DownstairsWork) {
-        self.active.insert(ds_id, dsw);
+    fn add_work(&mut self, dsw: DownstairsWork) {
+        self.active.insert(dsw.ds_id, dsw);
     }
 
     #[cfg(test)]
@@ -3583,45 +3606,39 @@ mod test {
         deps: Vec<JobId>,
         is_flush: bool,
     ) {
-        work.add_work(
+        work.add_work(DownstairsWork {
             ds_id,
-            DownstairsWork {
-                ds_id,
-                work: if is_flush {
-                    IOop::Flush {
-                        dependencies: deps,
-                        flush_number: 10,
-                        gen_number: 0,
-                        snapshot_details: None,
-                        extent_limit: None,
-                    }
-                } else {
-                    IOop::Read {
-                        dependencies: deps,
-                        requests: RegionReadRequest(vec![RegionReadReq {
-                            extent: ExtentId(1),
-                            offset: Block::new_512(1),
-                            count: NonZeroUsize::new(1).unwrap(),
-                        }]),
-                    }
-                },
-                state: WorkState::New,
+            work: if is_flush {
+                IOop::Flush {
+                    dependencies: deps,
+                    flush_number: 10,
+                    gen_number: 0,
+                    snapshot_details: None,
+                    extent_limit: None,
+                }
+            } else {
+                IOop::Read {
+                    dependencies: deps,
+                    requests: RegionReadRequest(vec![RegionReadReq {
+                        extent: ExtentId(1),
+                        offset: Block::new_512(1),
+                        count: NonZeroUsize::new(1).unwrap(),
+                    }]),
+                }
             },
-        );
+            state: WorkState::New,
+        });
     }
 
     fn add_work_rf(work: &mut Work, ds_id: JobId, deps: Vec<JobId>) {
-        work.add_work(
+        work.add_work(DownstairsWork {
             ds_id,
-            DownstairsWork {
-                ds_id,
-                work: IOop::WriteUnwritten {
-                    dependencies: deps,
-                    writes: RegionWrite(vec![]),
-                },
-                state: WorkState::New,
+            work: IOop::WriteUnwritten {
+                dependencies: deps,
+                writes: RegionWrite(vec![]),
             },
-        );
+            state: WorkState::New,
+        });
     }
 
     fn complete(work: &mut Work, job: DownstairsWork) {
@@ -4532,14 +4549,11 @@ mod test {
     fn test_misc_work_through_work_queue(ds_id: JobId, ioop: IOop) {
         // Verify that a IOop work request will move through the work queue.
         let mut work = Work::new(csl());
-        work.add_work(
+        work.add_work(DownstairsWork {
             ds_id,
-            DownstairsWork {
-                ds_id,
-                work: ioop,
-                state: WorkState::New,
-            },
-        );
+            work: ioop,
+            state: WorkState::New,
+        });
 
         assert_eq!(work.new_work(), vec![ds_id]);
 
