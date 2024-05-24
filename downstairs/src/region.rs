@@ -826,7 +826,7 @@ impl Region {
     #[instrument]
     pub fn region_write(
         &mut self,
-        writes: RegionWrite,
+        writes: &RegionWrite,
         job_id: JobId,
         only_write_unwritten: bool,
     ) -> Result<(), CrucibleError> {
@@ -837,24 +837,24 @@ impl Region {
         /*
          * Before anything, validate hashes
          */
-        self.validate_hashes(&writes)?;
+        self.validate_hashes(writes)?;
 
         if only_write_unwritten {
             cdt::os__writeunwritten__start!(|| job_id.0);
         } else {
             cdt::os__write__start!(|| job_id.0);
         }
-        for req in writes {
+        for req in writes.iter() {
             // Mark any extents we sent a write-command to as potentially dirty
             self.dirty_extents.insert(req.extent);
 
             let extent = self.get_opened_extent_mut(req.extent);
             if req.write.data.len() > MIN_BLOCKING_SIZE {
                 run_blocking(|| {
-                    extent.write(job_id, req.write, only_write_unwritten)
+                    extent.write(job_id, &req.write, only_write_unwritten)
                 })
             } else {
-                extent.write(job_id, req.write, only_write_unwritten)
+                extent.write(job_id, &req.write, only_write_unwritten)
             }?;
         }
 
@@ -870,7 +870,7 @@ impl Region {
     #[instrument]
     pub fn region_read(
         &mut self,
-        req: RegionReadRequest,
+        req: &RegionReadRequest,
         job_id: JobId,
     ) -> Result<RegionReadResponse, CrucibleError> {
         let mut response = RegionReadResponse::with_capacity(
@@ -897,7 +897,6 @@ impl Region {
             response.unsplit(out);
         }
         cdt::os__read__done!(|| job_id.0);
-        response.req = req;
 
         Ok(response)
     }
@@ -1689,7 +1688,7 @@ pub(crate) mod test {
         let ddef = region.def();
 
         region.region_write(
-            RegionWrite(vec![
+            &RegionWrite(vec![
                 RegionWriteReq {
                     extent: ExtentId(1),
                     write: ExtentWrite {
@@ -1755,7 +1754,7 @@ pub(crate) mod test {
         let mut region =
             Region::open(&dir, new_region_options(), true, false, &log)?;
         let out = region.region_read(
-            RegionReadRequest(vec![
+            &RegionReadRequest(vec![
                 RegionReadReq {
                     extent: ExtentId(1),
                     offset: Block::new_512(0),
@@ -1790,7 +1789,7 @@ pub(crate) mod test {
 
         // Make some writes, which we'll check after migration
         region.region_write(
-            RegionWrite(vec![
+            &RegionWrite(vec![
                 RegionWriteReq {
                     extent: ExtentId(1),
                     write: ExtentWrite {
@@ -1857,7 +1856,7 @@ pub(crate) mod test {
         let mut region =
             Region::open(&dir, new_region_options(), true, false, &log)?;
         let out = region.region_read(
-            RegionReadRequest(vec![
+            &RegionReadRequest(vec![
                 RegionReadReq {
                     extent: ExtentId(1),
                     offset: Block::new_512(0),
@@ -2253,7 +2252,7 @@ pub(crate) mod test {
         }
 
         region
-            .region_write(RegionWrite(writes), JobId(0), only_write_unwritten)
+            .region_write(&RegionWrite(writes), JobId(0), only_write_unwritten)
             .unwrap();
         buffer
     }
@@ -2296,7 +2295,7 @@ pub(crate) mod test {
         }
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         assert_eq!(buffer.len(), responses.data.len());
         assert_eq!(buffer, responses.data);
@@ -2356,7 +2355,7 @@ pub(crate) mod test {
         }
 
         let req = || RegionReadRequest::new(&requests);
-        let read_from_region = region.region_read(req(), JobId(0))?.data;
+        let read_from_region = region.region_read(&req(), JobId(0))?.data;
 
         assert_eq!(buffer.len(), read_from_region.len());
         assert_eq!(buffer, read_from_region);
@@ -2375,7 +2374,7 @@ pub(crate) mod test {
                 .join(extent_file_name(i, ExtentType::Db))
                 .exists());
         }
-        let read_from_region = region.region_read(req(), JobId(0))?.data;
+        let read_from_region = region.region_read(&req(), JobId(0))?.data;
 
         assert_eq!(buffer.len(), read_from_region.len());
         assert_eq!(buffer, read_from_region);
@@ -2441,7 +2440,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq {
+                &RegionWrite(vec![RegionWriteReq {
                     extent: ExtentId(0),
                     write: ExtentWrite {
                         offset: Block::new_512(0),
@@ -2459,7 +2458,7 @@ pub(crate) mod test {
 
         let responses = region
             .region_read(
-                RegionReadRequest(vec![RegionReadReq {
+                &RegionReadRequest(vec![RegionReadReq {
                     extent: ExtentId(0),
                     offset: Block::new_512(0),
                     count: NonZeroUsize::new(1).unwrap(),
@@ -2503,7 +2502,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq {
+                &RegionWrite(vec![RegionWriteReq {
                     extent: ExtentId(0),
                     write,
                 }]),
@@ -2550,7 +2549,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 true,
             )
@@ -2563,7 +2562,7 @@ pub(crate) mod test {
         // Now read back that block, make sure it is updated.
         let responses = region
             .region_read(
-                RegionReadRequest(vec![RegionReadReq {
+                &RegionReadRequest(vec![RegionReadReq {
                     extent: eid,
                     offset,
                     count: NonZeroUsize::new(1).unwrap(),
@@ -2615,7 +2614,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 false,
             )
@@ -2642,7 +2641,7 @@ pub(crate) mod test {
         // Do the write again, but with only_write_unwritten set now.
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(1),
                 true,
             )
@@ -2651,7 +2650,7 @@ pub(crate) mod test {
         // Now read back that block, make sure it has the first write
         let responses = region
             .region_read(
-                RegionReadRequest(vec![RegionReadReq {
+                &RegionReadRequest(vec![RegionReadReq {
                     extent: eid,
                     offset,
                     count: NonZeroUsize::new(1).unwrap(),
@@ -2707,7 +2706,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 true,
             )
@@ -2744,7 +2743,7 @@ pub(crate) mod test {
         // Do the write again, but with only_write_unwritten set now.
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(1),
                 true,
             )
@@ -2756,7 +2755,7 @@ pub(crate) mod test {
         // Read back our block, make sure it has the first write data
         let responses = region
             .region_read(
-                RegionReadRequest(vec![RegionReadReq {
+                &RegionReadRequest(vec![RegionReadReq {
                     extent: eid,
                     offset,
                     count: NonZeroUsize::new(1).unwrap(),
@@ -2812,7 +2811,7 @@ pub(crate) mod test {
         }
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         assert_eq!(buffer, responses.data);
     }
@@ -2863,7 +2862,7 @@ pub(crate) mod test {
         // Now write just one block
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 false,
             )
@@ -2898,7 +2897,7 @@ pub(crate) mod test {
         }
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         assert_eq!(buffer, responses.data);
     }
@@ -2948,7 +2947,7 @@ pub(crate) mod test {
         // Now write just to the second block.
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 false,
             )
@@ -2983,7 +2982,7 @@ pub(crate) mod test {
         }
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         assert_eq!(buffer, responses.data);
     }
@@ -3037,7 +3036,7 @@ pub(crate) mod test {
         // Now write just to the second block.
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 false,
             )
@@ -3067,7 +3066,7 @@ pub(crate) mod test {
         // send only_write_unwritten command.
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 true,
             )
@@ -3094,7 +3093,7 @@ pub(crate) mod test {
         }
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         assert_eq!(buffer, responses.data);
     }
@@ -3147,7 +3146,7 @@ pub(crate) mod test {
             // Now write just one block
             region
                 .region_write(
-                    RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                    &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                     JobId(0),
                     false,
                 )
@@ -3181,7 +3180,7 @@ pub(crate) mod test {
         }
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         assert_eq!(buffer, responses.data);
     }
@@ -3228,12 +3227,12 @@ pub(crate) mod test {
 
         // Write to extent 0 block 0 first
         let writes = create_generic_write(ExtentId(0), Block::new_512(0));
-        region.region_write(writes, JobId(0), true).unwrap();
+        region.region_write(&writes, JobId(0), true).unwrap();
 
         // Now write to extent 1 block 0
         let writes = create_generic_write(ExtentId(1), Block::new_512(0));
 
-        region.region_write(writes, JobId(0), true).unwrap();
+        region.region_write(&writes, JobId(0), true).unwrap();
 
         // Verify the dirty bit is now set for both extents.
         assert!(region.get_opened_extent(ExtentId(0)).dirty());
@@ -3265,11 +3264,11 @@ pub(crate) mod test {
 
         // Write to extent 1 block 9 first
         let writes = create_generic_write(ExtentId(1), Block::new_512(9));
-        region.region_write(writes, JobId(1), true).unwrap();
+        region.region_write(&writes, JobId(1), true).unwrap();
 
         // Now write to extent 2 block 9
         let writes = create_generic_write(ExtentId(2), Block::new_512(9));
-        region.region_write(writes, JobId(2), true).unwrap();
+        region.region_write(&writes, JobId(2), true).unwrap();
 
         // Verify the dirty bit is now set for both extents.
         assert!(region.get_opened_extent(ExtentId(1)).dirty());
@@ -3309,7 +3308,7 @@ pub(crate) mod test {
         let mut job_id = 1;
         for ext in (0..10).map(ExtentId) {
             let writes = create_generic_write(ext, Block::new_512(5));
-            region.region_write(writes, JobId(job_id), true).unwrap();
+            region.region_write(&writes, JobId(job_id), true).unwrap();
             job_id += 1;
         }
 
@@ -3395,7 +3394,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 true,
             )
@@ -3452,7 +3451,7 @@ pub(crate) mod test {
 
         region
             .region_write(
-                RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
+                &RegionWrite(vec![RegionWriteReq { extent: eid, write }]),
                 JobId(0),
                 true,
             )
@@ -3542,7 +3541,7 @@ pub(crate) mod test {
 
         // Write all the writes
         for w in &writes {
-            region.region_write(w.clone(), JobId(0), false).unwrap();
+            region.region_write(w, JobId(0), false).unwrap();
         }
 
         // Flush
@@ -3616,7 +3615,7 @@ pub(crate) mod test {
         for w in &writes {
             region
                 .region_write(
-                    RegionWrite(vec![RegionWriteReq {
+                    &RegionWrite(vec![RegionWriteReq {
                         extent: ExtentId(0),
                         write: w.clone(),
                     }]),
@@ -3683,7 +3682,7 @@ pub(crate) mod test {
         };
 
         let result = region.region_write(
-            RegionWrite(vec![RegionWriteReq {
+            &RegionWrite(vec![RegionWriteReq {
                 extent: ExtentId(0),
                 write,
             }]),
@@ -3716,7 +3715,7 @@ pub(crate) mod test {
 
         let responses = region
             .region_read(
-                RegionReadRequest(vec![RegionReadReq {
+                &RegionReadRequest(vec![RegionReadReq {
                     extent: ExtentId(0),
                     offset: Block::new_512(0),
                     count: NonZeroUsize::new(1).unwrap(),
@@ -3783,7 +3782,7 @@ pub(crate) mod test {
         }
 
         region
-            .region_write(RegionWrite(writes), JobId(0), false)
+            .region_write(&RegionWrite(writes), JobId(0), false)
             .unwrap();
 
         (dir, region, buffer)
@@ -3801,7 +3800,7 @@ pub(crate) mod test {
             .collect();
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         // Validate returned data
         assert_eq!(responses.data, &data[512..(8 * 512)],);
@@ -3820,7 +3819,7 @@ pub(crate) mod test {
             .collect();
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         // Validate returned data
         assert_eq!(&responses.data, &data[(9 * 512)..(28 * 512)],);
@@ -3855,7 +3854,7 @@ pub(crate) mod test {
         .collect();
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         // Validate returned data
         assert_eq!(
@@ -3893,7 +3892,7 @@ pub(crate) mod test {
         ];
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(0)).unwrap();
+        let responses = region.region_read(&req, JobId(0)).unwrap();
 
         // Validate returned data
         assert_eq!(
@@ -3965,7 +3964,7 @@ pub(crate) mod test {
             .collect();
 
         let req = RegionReadRequest::new(&requests);
-        let responses = region.region_read(req, JobId(1)).unwrap();
+        let responses = region.region_read(&req, JobId(1)).unwrap();
 
         assert_eq!(&responses.data, &data,);
     }
@@ -3976,7 +3975,7 @@ pub(crate) mod test {
         // Call region_write with a single large contiguous range
         let writes = RegionWrite(prepare_writes(1..8, &mut data));
 
-        region.region_write(writes, JobId(0), false).unwrap();
+        region.region_write(&writes, JobId(0), false).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -3990,7 +3989,7 @@ pub(crate) mod test {
         // multiple extents
         let writes = RegionWrite(prepare_writes(9..28, &mut data));
 
-        region.region_write(writes, JobId(0), false).unwrap();
+        region.region_write(&writes, JobId(0), false).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -4010,7 +4009,7 @@ pub(crate) mod test {
             .concat(),
         );
 
-        region.region_write(writes, JobId(0), false).unwrap();
+        region.region_write(&writes, JobId(0), false).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -4031,7 +4030,7 @@ pub(crate) mod test {
             .concat(),
         );
 
-        region.region_write(writes, JobId(0), false).unwrap();
+        region.region_write(&writes, JobId(0), false).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -4059,7 +4058,7 @@ pub(crate) mod test {
         let writes = RegionWrite(prepare_writes(1..8, &mut data));
 
         // write_unwritten = true
-        region.region_write(writes, JobId(0), true).unwrap();
+        region.region_write(&writes, JobId(0), true).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -4090,7 +4089,7 @@ pub(crate) mod test {
         let writes = RegionWrite(prepare_writes(9..28, &mut data));
 
         // write_unwritten = true
-        region.region_write(writes, JobId(0), true).unwrap();
+        region.region_write(&writes, JobId(0), true).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -4127,7 +4126,7 @@ pub(crate) mod test {
         );
 
         // write_unwritten = true
-        region.region_write(writes, JobId(0), true).unwrap();
+        region.region_write(&writes, JobId(0), true).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
@@ -4165,7 +4164,7 @@ pub(crate) mod test {
         );
 
         // write_unwritten = true
-        region.region_write(writes, JobId(0), true).unwrap();
+        region.region_write(&writes, JobId(0), true).unwrap();
 
         // Validate written data by reading everything back and comparing with
         // data buffer
