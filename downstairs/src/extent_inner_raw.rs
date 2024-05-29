@@ -1206,6 +1206,40 @@ impl RawLayout {
         block_count: u64,
         slot: ContextSlot,
     ) -> Result<Vec<Option<DownstairsBlockContext>>, CrucibleError> {
+        let mut out = Vec::with_capacity(block_count as usize);
+        self.read_context_slots_contiguous_inner(
+            file,
+            block_start,
+            block_count,
+            slot,
+            |ctx, i| {
+                ctx.map(|c| DownstairsBlockContext {
+                    block: block_start + i as u64,
+                    block_context: c.block_context,
+                    on_disk_hash: c.on_disk_hash,
+                })
+            },
+            &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Low-level function to read context slots
+    ///
+    /// This function takes a generic transform function and writes to a
+    /// user-provided array, to minimize allocations.
+    fn read_context_slots_contiguous_inner<F, T>(
+        &self,
+        file: &File,
+        block_start: u64,
+        block_count: u64,
+        slot: ContextSlot,
+        f: F,
+        out: &mut Vec<T>,
+    ) -> Result<(), CrucibleError>
+    where
+        F: Fn(Option<OnDiskDownstairsBlockContext>, usize) -> T,
+    {
         let mut buf =
             vec![0u8; (BLOCK_CONTEXT_SLOT_SIZE_BYTES * block_count) as usize];
 
@@ -1214,7 +1248,6 @@ impl RawLayout {
             CrucibleError::IoError(format!("reading context slots failed: {e}"))
         })?;
 
-        let mut out = vec![];
         for (i, chunk) in buf
             .chunks_exact(BLOCK_CONTEXT_SLOT_SIZE_BYTES as usize)
             .enumerate()
@@ -1223,13 +1256,10 @@ impl RawLayout {
                 bincode::deserialize(chunk).map_err(|e| {
                     CrucibleError::BadContextSlot(e.to_string())
                 })?;
-            out.push(ctx.map(|c| DownstairsBlockContext {
-                block: block_start + i as u64,
-                block_context: c.block_context,
-                on_disk_hash: c.on_disk_hash,
-            }));
+            let v = f(ctx, i);
+            out.push(v);
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Write out the active context array and metadata section of the file
