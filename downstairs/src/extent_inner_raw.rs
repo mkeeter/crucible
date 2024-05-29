@@ -18,6 +18,7 @@ use crucible_common::ExtentId;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use slog::{error, Logger};
+use smallvec::smallvec;
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -324,8 +325,8 @@ impl ExtentInner for RawInner {
             req.offset.value,
             num_blocks,
             |ctx, _block| match ctx {
-                Some(b) => vec![b.block_context],
-                None => vec![],
+                Some(b) => smallvec![b.block_context],
+                None => smallvec![],
             },
             &mut blocks,
         )?;
@@ -1377,6 +1378,7 @@ mod test {
     use bytes::{Bytes, BytesMut};
     use crucible_protocol::EncryptionContext;
     use rand::Rng;
+    use smallvec::SmallVec;
     use tempfile::tempdir;
 
     const IOV_MAX_TEST: usize = 1000;
@@ -1641,7 +1643,9 @@ mod test {
             let resp = inner.read(JobId(21), read, IOV_MAX_TEST)?;
 
             // We should not get back our data, because block 0 was written.
-            assert_ne!(resp.blocks, vec![vec![block_context]]);
+            let expected: Vec<SmallVec<[BlockContext; 1]>> =
+                vec![smallvec![block_context]];
+            assert_ne!(resp.blocks, expected);
             assert_ne!(resp.data, BytesMut::from(data.as_ref()));
         }
 
@@ -1667,7 +1671,9 @@ mod test {
             let resp = inner.read(JobId(31), read, IOV_MAX_TEST)?;
 
             // We should get back our data! Block 1 was never written.
-            assert_eq!(resp.blocks, vec![vec![block_context]]);
+            let expected: Vec<SmallVec<[BlockContext; 1]>> =
+                vec![smallvec![block_context]];
+            assert_eq!(resp.blocks, expected);
             assert_eq!(resp.data, BytesMut::from(data.as_ref()));
         }
 
@@ -1894,7 +1900,9 @@ mod test {
             let resp = inner.read(JobId(31), read, IOV_MAX_TEST)?;
 
             // We should get back our data! Block 1 was never written.
-            assert_eq!(resp.blocks, vec![vec![block_context]]);
+            let expected: Vec<SmallVec<[BlockContext; 1]>> =
+                vec![smallvec![block_context]];
+            assert_eq!(resp.blocks, expected);
             assert_eq!(resp.data, BytesMut::from(data.as_ref()));
         }
 

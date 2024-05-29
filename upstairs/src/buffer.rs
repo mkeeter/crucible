@@ -377,6 +377,7 @@ mod test {
     use crate::{Block, BlockContext, ReadResponseBlockMetadata};
     use crucible_common::ExtentId;
     use rand::RngCore;
+    use smallvec::smallvec;
 
     #[test]
     fn test_buffer_sane() {
@@ -499,12 +500,12 @@ mod test {
                 eid: ExtentId(0),
                 offset: Block::new_512(i),
                 block_contexts: if f(i) {
-                    vec![BlockContext {
+                    smallvec![BlockContext {
                         hash: 123,
                         encryption_context: None,
                     }]
                 } else {
-                    vec![]
+                    smallvec![]
                 },
             })
             .collect();
@@ -574,7 +575,7 @@ mod test {
             .map(|i| ReadResponseBlockMetadata {
                 eid: ExtentId(0),
                 offset: Block::new_512(i),
-                block_contexts: vec![BlockContext {
+                block_contexts: smallvec![BlockContext {
                     hash: 123,
                     encryption_context: None,
                 }],

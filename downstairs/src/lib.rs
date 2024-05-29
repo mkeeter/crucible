@@ -201,7 +201,7 @@ impl IntoIterator for RegionReadRequest {
 /// Do not derive `Clone` on this type; it will be expensive and tempting to
 /// call by accident!
 pub(crate) struct RegionReadResponse {
-    blocks: Vec<Vec<BlockContext>>,
+    blocks: Vec<smallvec::SmallVec<[BlockContext; 1]>>,
     data: BytesMut,
     uninit: BytesMut,
 }
@@ -303,7 +303,7 @@ impl RegionReadResponse {
 /// Do not derive `Clone` on this type; it will be expensive and tempting to
 /// call by accident!
 pub(crate) struct ExtentReadResponse {
-    blocks: Vec<Vec<BlockContext>>,
+    blocks: Vec<smallvec::SmallVec<[BlockContext; 1]>>,
     /// At this point, the buffer must be fully initialized
     data: BytesMut,
 }

@@ -1175,6 +1175,7 @@ mod test {
     use bytes::{Bytes, BytesMut};
     use rand::Rng;
     use rand::RngCore;
+    use smallvec::{smallvec, SmallVec};
     use tempfile::tempdir;
 
     const IOV_MAX_TEST: usize = 1000;
@@ -1623,7 +1624,9 @@ mod test {
             let resp = inner.read(JobId(21), read, IOV_MAX_TEST)?;
 
             // We should not get back our data, because block 0 was written.
-            assert_ne!(resp.blocks, vec![vec![block_context]]);
+            let expected: Vec<SmallVec<[BlockContext; 1]>> =
+                vec![smallvec![block_context]];
+            assert_ne!(resp.blocks, expected);
             assert_ne!(resp.data, BytesMut::from(data.as_ref()));
         }
 
@@ -1649,7 +1652,9 @@ mod test {
             let resp = inner.read(JobId(31), read, IOV_MAX_TEST)?;
 
             // We should get back our data! Block 1 was never written.
-            assert_eq!(resp.blocks, vec![vec![block_context]]);
+            let expected: Vec<SmallVec<[BlockContext; 1]>> =
+                vec![smallvec![block_context]];
+            assert_eq!(resp.blocks, expected);
             assert_eq!(resp.data, BytesMut::from(data.as_ref()));
         }
 
@@ -1710,7 +1715,9 @@ mod test {
             let resp = inner.read(JobId(31), read, IOV_MAX_TEST)?;
 
             // We should get back our data! Block 1 was never written.
-            assert_eq!(resp.blocks, vec![vec![block_context]]);
+            let expected: Vec<SmallVec<[BlockContext; 1]>> =
+                vec![smallvec![block_context]];
+            assert_eq!(resp.blocks, expected);
             assert_eq!(resp.data, BytesMut::from(data.as_ref()));
         }
 
@@ -1755,8 +1762,8 @@ mod test {
             data: BytesMut::with_capacity(512 * 2),
         };
         let resp = inner.read(JobId(31), read(), IOV_MAX_TEST)?;
-        let expected_blocks: Vec<_> =
-            block_contexts.iter().map(|b| vec![*b]).collect();
+        let expected_blocks: Vec<SmallVec<[BlockContext; 1]>> =
+            block_contexts.iter().map(|b| smallvec![*b]).collect();
         assert_eq!(resp.blocks, expected_blocks);
         assert_eq!(resp.data, BytesMut::from(data.as_ref()));
 

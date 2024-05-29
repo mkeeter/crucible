@@ -53,6 +53,7 @@ pub(crate) mod up_test {
 
     use base64::{engine, Engine};
     use pseudo_file::IOSpan;
+    use smallvec::smallvec;
 
     // Create a simple logger
     pub fn csl() -> Logger {
@@ -388,7 +389,7 @@ pub(crate) mod up_test {
         let read_response_hash = integrity_hash(&[&nonce, &tag, &data[..]]);
 
         // Create the read response
-        let mut block_contexts = vec![BlockContext {
+        let mut block_contexts = smallvec![BlockContext {
             hash: read_response_hash,
             encryption_context: Some(crucible_protocol::EncryptionContext {
                 nonce: nonce.into(),
@@ -439,7 +440,7 @@ pub(crate) mod up_test {
         let read_response_hash = integrity_hash(&[&nonce, &tag, &data[..]]);
 
         // Create the read response
-        let mut block_contexts = vec![
+        let mut block_contexts = smallvec![
             // The first context here doesn't match
             BlockContext {
                 hash: thread_rng().gen(),
@@ -520,7 +521,7 @@ pub(crate) mod up_test {
 
         // Validate the read response
         let successful_hash = validate_encrypted_read_response(
-            &mut vec![],
+            &mut smallvec![],
             &mut data,
             &Arc::new(context),
             &csl(),
@@ -545,7 +546,7 @@ pub(crate) mod up_test {
         let original_data = data.clone();
 
         // Create the read response
-        let mut block_contexts = vec![BlockContext {
+        let mut block_contexts = smallvec![BlockContext {
             hash: read_response_hash,
             encryption_context: None,
         }];
@@ -572,8 +573,11 @@ pub(crate) mod up_test {
         let original_data = data.clone();
 
         // Validate a read response
-        let successful_hash =
-            validate_unencrypted_read_response(&mut vec![], &mut data, &csl())?;
+        let successful_hash = validate_unencrypted_read_response(
+            &mut smallvec![],
+            &mut data,
+            &csl(),
+        )?;
 
         assert_eq!(successful_hash, None);
         assert_eq!(data, original_data);
@@ -594,7 +598,7 @@ pub(crate) mod up_test {
         let original_data = data.clone();
 
         // Create the read response
-        let mut block_contexts = vec![
+        let mut block_contexts = smallvec![
             // The context here doesn't match
             BlockContext {
                 hash: thread_rng().gen(),
@@ -646,7 +650,7 @@ pub(crate) mod up_test {
         let original_data = data.clone();
 
         // Create the read response
-        let mut block_contexts = vec![
+        let mut block_contexts = smallvec![
             // Correct one
             BlockContext {
                 hash: read_response_hash,

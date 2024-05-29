@@ -2098,6 +2098,7 @@ pub(crate) mod test {
     use crucible_common::{integrity_hash, ExtentId};
     use crucible_protocol::{ReadResponseBlockMetadata, ReadResponseHeader};
     use futures::FutureExt;
+    use smallvec::smallvec;
 
     // Test function to create just enough of an Upstairs for our needs.
     pub(crate) fn create_test_upstairs() -> Upstairs {
@@ -3658,7 +3659,7 @@ pub(crate) mod test {
         let blocks = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext {
                         nonce: nonce.into(),
@@ -3721,7 +3722,7 @@ pub(crate) mod test {
             responses.push(ReadResponseBlockMetadata {
                 eid: ExtentId(0),
                 offset: Block::new_512(offset.value + i as u64),
-                block_contexts: vec![BlockContext {
+                block_contexts: smallvec![BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext { nonce, tag },
                     ),
@@ -3799,7 +3800,7 @@ pub(crate) mod test {
             responses.push(ReadResponseBlockMetadata {
                 eid: ExtentId(0),
                 offset: Block::new_512(offset.value + i as u64),
-                block_contexts: vec![BlockContext {
+                block_contexts: smallvec![BlockContext {
                     encryption_context: Some(
                         crucible_protocol::EncryptionContext { nonce, tag },
                     ),
@@ -3882,7 +3883,7 @@ pub(crate) mod test {
         let responses = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext { nonce, tag },
                 ),
@@ -3948,7 +3949,7 @@ pub(crate) mod test {
         let responses = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: Some(
                     crucible_protocol::EncryptionContext { nonce, tag },
                 ),
@@ -4001,7 +4002,7 @@ pub(crate) mod test {
         let responses = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash: 10000, // junk hash
             }],
@@ -4052,7 +4053,7 @@ pub(crate) mod test {
         let r1 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4080,7 +4081,7 @@ pub(crate) mod test {
         let r2 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4129,7 +4130,7 @@ pub(crate) mod test {
             let r = Ok(vec![ReadResponseBlockMetadata {
                 eid: ExtentId(0),
                 offset,
-                block_contexts: vec![BlockContext {
+                block_contexts: smallvec![BlockContext {
                     encryption_context: None,
                     hash,
                 }],
@@ -4158,7 +4159,7 @@ pub(crate) mod test {
         let r = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4206,7 +4207,7 @@ pub(crate) mod test {
         let r1 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4231,7 +4232,7 @@ pub(crate) mod test {
         let response = ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4281,7 +4282,7 @@ pub(crate) mod test {
         let r1 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![],
+            block_contexts: smallvec![],
         }]);
         up.apply(UpstairsAction::Downstairs(DownstairsAction::Client {
             client_id: ClientId::new(1),
@@ -4301,7 +4302,7 @@ pub(crate) mod test {
         let r2 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4350,7 +4351,7 @@ pub(crate) mod test {
         let r1 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 encryption_context: None,
                 hash,
             }],
@@ -4372,7 +4373,7 @@ pub(crate) mod test {
         let r2 = Ok(vec![ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset,
-            block_contexts: vec![
+            block_contexts: smallvec![
                 // No block contexts!
             ],
         }]);

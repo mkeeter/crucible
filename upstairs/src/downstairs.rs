@@ -4503,6 +4503,7 @@ pub(crate) mod test {
         BlockContext, Message, ReadRequest, ReadResponseBlockMetadata,
     };
     use ringbuffer::RingBuffer;
+    use smallvec::smallvec;
 
     use std::{
         collections::{BTreeMap, HashMap},
@@ -4521,7 +4522,7 @@ pub(crate) mod test {
             blocks: vec![ReadResponseBlockMetadata {
                 eid: request.eid,
                 offset: request.offset,
-                block_contexts: vec![BlockContext {
+                block_contexts: smallvec![BlockContext {
                     hash: crucible_common::integrity_hash(&[data]),
                     encryption_context: None,
                 }],

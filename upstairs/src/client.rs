@@ -2885,7 +2885,7 @@ fn update_net_done_probes(m: &Message, cid: ClientId) {
 /// The return value of this will be stored with the job, and compared
 /// between each read.
 pub(crate) fn validate_encrypted_read_response(
-    block_contexts: &mut Vec<BlockContext>,
+    block_contexts: &mut smallvec::SmallVec<[BlockContext; 1]>,
     data: &mut [u8],
     encryption_context: &EncryptionContext,
     log: &Logger,
@@ -3030,7 +3030,7 @@ pub(crate) fn validate_encrypted_read_response(
 ///   block is all 0
 /// - Err otherwise
 pub(crate) fn validate_unencrypted_read_response(
-    block_contexts: &mut Vec<BlockContext>,
+    block_contexts: &mut smallvec::SmallVec<[BlockContext; 1]>,
     data: &mut [u8],
     log: &Logger,
 ) -> Result<Option<u64>, CrucibleError> {

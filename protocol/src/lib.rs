@@ -569,7 +569,7 @@ pub struct ReadResponseHeader {
 pub struct ReadResponseBlockMetadata {
     pub eid: ExtentId,
     pub offset: Block,
-    pub block_contexts: Vec<BlockContext>,
+    pub block_contexts: smallvec::SmallVec<[BlockContext; 1]>,
 }
 
 impl ReadResponseBlockMetadata {

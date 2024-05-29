@@ -39,6 +39,7 @@ use slog::o;
 use slog::warn;
 use slog::Drain;
 use slog::Logger;
+use smallvec::smallvec;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
@@ -617,7 +618,7 @@ fn make_blank_read_response() -> (ReadResponseBlockMetadata, BytesMut) {
         ReadResponseBlockMetadata {
             eid: ExtentId(0),
             offset: Block::new_512(0),
-            block_contexts: vec![BlockContext {
+            block_contexts: smallvec![BlockContext {
                 hash,
                 encryption_context: None,
             }],
