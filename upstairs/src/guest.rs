@@ -1,16 +1,12 @@
 // Copyright 2024 Oxide Computer Company
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
 };
 
 use crate::{
-    backpressure::{
-        BackpressureAmount, BackpressureConfig, SharedBackpressureAmount,
-    },
-    BlockIO, BlockOp, BlockOpWaiter, BlockRes, Buffer, JobId, RawReadResponse,
+    io_limits::{IOLimitView, IOLimits},
+    BlockIO, BlockOp, BlockOpWaiter, BlockRes, Buffer, RawReadResponse,
     ReplaceResult, UpstairsAction,
 };
 use crucible_common::{build_logger, Block, BlockIndex, CrucibleError};
@@ -18,9 +14,8 @@ use crucible_protocol::SnapshotDetails;
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use ringbuffer::{AllocRingBuffer, RingBuffer};
-use slog::{error, info, warn, Logger};
-use tokio::sync::{mpsc, Mutex};
+use slog::{info, warn, Logger};
+use tokio::sync::mpsc;
 use tracing::{instrument, span, Level};
 use uuid::Uuid;
 
@@ -92,67 +87,6 @@ impl GuestBlockRes {
     }
 }
 
-/// This structure keeps track of work that Crucible has accepted from the
-/// "guest" (Propolis, `crutest`, etc)
-///
-/// We store a set of `JobId` for all I/O that has not yet been acknowledged to
-/// the guest, and a ring buffer of the last _N_ acked jobs.
-#[derive(Debug)]
-pub struct GuestWork {
-    active: HashSet<JobId>,
-    completed: AllocRingBuffer<JobId>,
-}
-
-impl GuestWork {
-    pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.active.len()
-    }
-
-    /// Helper function to install new work into the map
-    pub(crate) fn submit_job(&mut self, ds_id: JobId, acked: bool) {
-        if acked {
-            self.completed.push(ds_id);
-        } else {
-            self.active.insert(ds_id);
-        }
-    }
-
-    /// Move the given job from active to complete
-    ///
-    /// # Panics
-    /// If the job is not in our active set
-    #[instrument]
-    pub(crate) fn gw_ds_complete(&mut self, ds_id: JobId) {
-        if self.active.remove(&ds_id) {
-            self.completed.push(ds_id);
-        } else {
-            /*
-             * XXX This is just so I can see if ever does happen.
-             */
-            panic!("job {ds_id} not on active list");
-        }
-    }
-
-    pub fn print_last_completed(&self, n: usize) {
-        for j in self.completed.iter().rev().take(n) {
-            print!(" {:4}", j);
-        }
-    }
-}
-
-impl Default for GuestWork {
-    fn default() -> Self {
-        Self {
-            active: HashSet::new(),
-            completed: AllocRingBuffer::new(2048),
-        }
-    }
-}
-
 /// IO handles used by the guest to pass work into Crucible proper
 ///
 /// This data structure is the counterpart to the [`GuestIoHandle`], which
@@ -173,19 +107,8 @@ pub struct Guest {
     /// it can be read from a `&self` reference.
     block_size: AtomicU64,
 
-    /// Backpressure is implemented as a delay on host write operations
-    ///
-    /// It is stored in an `Arc` so that the `GuestIoHandle` can update it from
-    /// the IO task.
-    backpressure: SharedBackpressureAmount,
-
-    /// Lock held during backpressure delay
-    ///
-    /// Without this lock, multiple tasks could submit jobs to the upstairs and
-    /// wait in parallel, which defeats the purpose of backpressure (since you
-    /// could send arbitrarily many jobs at high speed by sending them from
-    /// different tasks).
-    backpressure_lock: Mutex<()>,
+    /// View into global IO limits
+    io_limits: IOLimitView,
 
     /// Logger for the guest
     log: Logger,
@@ -213,23 +136,30 @@ impl Guest {
         // time spent waiting for the queue versus time spent in Upstairs code).
         let (req_tx, req_rx) = mpsc::channel(500);
 
-        let backpressure = SharedBackpressureAmount::new();
+        // We have to set limits above `IO_OUTSTANDING_MAX_JOBS/BYTES`:
+        // an `Offline` downstairs must hit that threshold to transition to
+        // `Faulted`, so we can't be IO-limited before that point.
+        let io_limits = IOLimits::new(
+            crate::IO_OUTSTANDING_MAX_JOBS * 3 / 2,
+            crate::IO_OUTSTANDING_MAX_BYTES as usize * 3 / 2,
+        );
+        let io_limits_view = io_limits.view();
+
         let io = GuestIoHandle {
             req_rx,
 
-            guest_work: GuestWork::default(),
+            io_limits,
 
-            backpressure: backpressure.clone(),
-            backpressure_config: BackpressureConfig::default(),
+            #[cfg(test)]
+            disable_backpressure: false,
             log: log.clone(),
         };
         let guest = Guest {
             req_tx,
 
             block_size: AtomicU64::new(0),
+            io_limits: io_limits_view,
 
-            backpressure,
-            backpressure_lock: Mutex::new(()),
             log,
         };
         (guest, io)
@@ -293,28 +223,6 @@ impl Guest {
         );
 
         Ok(())
-    }
-
-    /// Sleeps for a backpressure-dependent amount, holding the lock
-    ///
-    /// If backpressure is saturated, logs and returns an error.
-    async fn backpressure_sleep(&self) -> Result<(), CrucibleError> {
-        let bp = self.backpressure.load();
-        match bp {
-            BackpressureAmount::Saturated => {
-                let err = "write queue is saturated";
-                error!(self.log, "{err}");
-                Err(CrucibleError::IoError(err.to_owned()))
-            }
-            BackpressureAmount::Duration(d) => {
-                if d > Duration::ZERO {
-                    let _guard = self.backpressure_lock.lock().await;
-                    tokio::time::sleep(d).await;
-                    drop(_guard);
-                }
-                Ok(())
-            }
-        }
     }
 
     #[cfg(test)]
@@ -447,11 +355,20 @@ impl BlockIO for Guest {
             assert_eq!(chunk.len() as u64 % bs, 0);
 
             let offset_change = chunk.len() as u64 / bs;
+            let io_guard =
+                self.io_limits.claim(chunk.len() as u32).await.map_err(
+                    |e| {
+                        CrucibleError::IoError(format!(
+                            "could not get IO guard for Read: {e:?}"
+                        ))
+                    },
+                )?;
             let (rx, done) = BlockOpWaiter::pair();
             let rio = BlockOp::Read {
                 offset,
                 data: chunk,
                 done,
+                io_guard,
             };
 
             // Our return value always includes the buffer, so we can splice it
@@ -509,13 +426,19 @@ impl BlockIO for Guest {
             assert_eq!(buf.len() as u64 % bs, 0);
             let offset_change = buf.len() as u64 / bs;
 
-            self.backpressure_sleep().await?;
+            let io_guard =
+                self.io_limits.claim(buf.len() as u32).await.map_err(|e| {
+                    CrucibleError::IoError(format!(
+                        "could not get IO guard for Write: {e:?}"
+                    ))
+                })?;
 
             let reply = self
                 .send_and_wait(|done| BlockOp::Write {
                     offset,
                     data: buf,
                     done,
+                    io_guard,
                 })
                 .await;
             reply?;
@@ -536,11 +459,17 @@ impl BlockIO for Guest {
             return Ok(());
         }
 
-        self.backpressure_sleep().await?;
+        let io_guard =
+            self.io_limits.claim(data.len() as u32).await.map_err(|e| {
+                CrucibleError::IoError(format!(
+                    "could not get IO guard for WriteUnwritten: {e:?}"
+                ))
+            })?;
         self.send_and_wait(|done| BlockOp::WriteUnwritten {
             offset,
             data,
             done,
+            io_guard,
         })
         .await
     }
@@ -549,9 +478,15 @@ impl BlockIO for Guest {
         &self,
         snapshot_details: Option<SnapshotDetails>,
     ) -> Result<(), CrucibleError> {
+        let io_guard = self.io_limits.claim(0).await.map_err(|e| {
+            CrucibleError::IoError(format!(
+                "could not get IO guard for flush: {e:?}"
+            ))
+        })?;
         self.send_and_wait(|done| BlockOp::Flush {
             snapshot_details,
             done,
+            io_guard,
         })
         .await
     }
@@ -608,26 +543,15 @@ pub struct GuestIoHandle {
     /// Queue to receive new blockreqs
     req_rx: mpsc::Receiver<BlockOp>,
 
-    /// Current backpressure (shared with the `Guest`)
-    backpressure: SharedBackpressureAmount,
-
-    /// Backpressure configuration, as a starting point and max delay
-    backpressure_config: BackpressureConfig,
-
-    /// Active work from the guest
-    ///
-    /// When the crucible listening task has noticed a new IO request, it
-    /// will pull it from the reqs queue and create an `GtoS` struct
-    /// as well as convert the new IO request into the matching
-    /// downstairs request(s).
-    ///
-    /// It is during this process that data will encrypted. For a read, the
-    /// data is decrypted back to the guest provided buffer after all the
-    /// required downstairs operations are completed.
-    pub guest_work: GuestWork,
+    /// IO limiting (shared with the `Guest`)
+    io_limits: IOLimits,
 
     /// Log handle, mainly to pass it into the [`Upstairs`]
     pub log: Logger,
+
+    /// Flag to disable backpressure during unit tests
+    #[cfg(test)]
+    disable_backpressure: bool,
 }
 
 impl GuestIoHandle {
@@ -641,52 +565,18 @@ impl GuestIoHandle {
         }
     }
 
-    #[cfg(test)]
-    pub fn disable_queue_backpressure(&mut self) {
-        self.backpressure_config.queue.delay_scale = Duration::ZERO;
+    pub fn io_limits(&self) -> &IOLimits {
+        &self.io_limits
     }
 
     #[cfg(test)]
-    pub fn disable_byte_backpressure(&mut self) {
-        self.backpressure_config.bytes.delay_scale = Duration::ZERO;
+    pub fn disable_backpressure(&mut self) {
+        self.disable_backpressure = true;
     }
 
     #[cfg(test)]
-    pub fn is_queue_backpressure_disabled(&self) -> bool {
-        self.backpressure_config.queue.delay_scale == Duration::ZERO
-    }
-
-    /// Set `self.backpressure` based on outstanding IO ratio
-    pub fn set_backpressure(&self, bytes: u64, jobs: u64) {
-        let bp = self.backpressure_config.get_backpressure(bytes, jobs);
-        self.backpressure.store(bp);
-    }
-
-    /// Returns the number of active jobs
-    pub fn active_count(&self) -> usize {
-        self.guest_work.active.len()
-    }
-
-    /// Looks up current backpressure
-    pub fn get_backpressure(&self) -> BackpressureAmount {
-        self.backpressure.load()
-    }
-
-    /// Debug function to dump the guest work structure.
-    ///
-    /// TODO: make this one big dump, where we include the up.work.active
-    /// printing for each guest_work. It will be much more dense, but require
-    /// holding both locks for the duration.
-    pub(crate) fn show_work(&self) -> usize {
-        println!("Guest work:  Active and Completed Jobs:");
-        let gw = &self.guest_work;
-        let mut kvec: Vec<_> = gw.active.iter().cloned().collect();
-        kvec.sort_unstable();
-        for id in kvec.iter() {
-            println!("JOB active:[{id:?}]");
-        }
-        println!("JOB completed count:{:?} ", gw.completed.len());
-        kvec.len()
+    pub fn is_backpressure_disabled(&self) -> bool {
+        self.disable_backpressure
     }
 }
 
