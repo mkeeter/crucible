@@ -3,13 +3,9 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
 };
 
 use crate::{
-    backpressure::{
-        BackpressureAmount, BackpressureConfig, SharedBackpressureAmount,
-    },
     io_limits::{IOLimitView, IOLimits},
     BlockIO, BlockOp, BlockOpWaiter, BlockRes, Buffer, JobId, RawReadResponse,
     ReplaceResult, UpstairsAction,
@@ -20,8 +16,8 @@ use crucible_protocol::SnapshotDetails;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use slog::{error, info, warn, Logger};
-use tokio::sync::{mpsc, Mutex};
+use slog::{info, warn, Logger};
+use tokio::sync::mpsc;
 use tracing::{instrument, span, Level};
 use uuid::Uuid;
 
@@ -174,22 +170,8 @@ pub struct Guest {
     /// it can be read from a `&self` reference.
     block_size: AtomicU64,
 
-    /// Backpressure is implemented as a delay on host write operations
-    ///
-    /// It is stored in an `Arc` so that the `GuestIoHandle` can update it from
-    /// the IO task.
-    backpressure: SharedBackpressureAmount,
-
     /// View into global IO limits
     io_limits: IOLimitView,
-
-    /// Lock held during backpressure delay
-    ///
-    /// Without this lock, multiple tasks could submit jobs to the upstairs and
-    /// wait in parallel, which defeats the purpose of backpressure (since you
-    /// could send arbitrarily many jobs at high speed by sending them from
-    /// different tasks).
-    backpressure_lock: Mutex<()>,
 
     /// Logger for the guest
     log: Logger,
@@ -217,8 +199,6 @@ impl Guest {
         // time spent waiting for the queue versus time spent in Upstairs code).
         let (req_tx, req_rx) = mpsc::channel(500);
 
-        let backpressure = SharedBackpressureAmount::new();
-
         // We have to set limits above `IO_OUTSTANDING_MAX_JOBS/BYTES`:
         // an `Offline` downstairs must hit that threshold to transition to
         // `Faulted`, so we can't be IO-limited before that point.
@@ -234,8 +214,9 @@ impl Guest {
             guest_work: GuestWork::default(),
             io_limits,
 
-            backpressure: backpressure.clone(),
-            backpressure_config: BackpressureConfig::default(),
+            #[cfg(test)]
+            disable_backpressure: false,
+
             log: log.clone(),
         };
         let guest = Guest {
@@ -244,8 +225,6 @@ impl Guest {
             block_size: AtomicU64::new(0),
             io_limits: io_limits_view,
 
-            backpressure,
-            backpressure_lock: Mutex::new(()),
             log,
         };
         (guest, io)
@@ -309,28 +288,6 @@ impl Guest {
         );
 
         Ok(())
-    }
-
-    /// Sleeps for a backpressure-dependent amount, holding the lock
-    ///
-    /// If backpressure is saturated, logs and returns an error.
-    async fn backpressure_sleep(&self) -> Result<(), CrucibleError> {
-        let bp = self.backpressure.load();
-        match bp {
-            BackpressureAmount::Saturated => {
-                let err = "write queue is saturated";
-                error!(self.log, "{err}");
-                Err(CrucibleError::IoError(err.to_owned()))
-            }
-            BackpressureAmount::Duration(d) => {
-                if d > Duration::ZERO {
-                    let _guard = self.backpressure_lock.lock().await;
-                    tokio::time::sleep(d).await;
-                    drop(_guard);
-                }
-                Ok(())
-            }
-        }
     }
 
     #[cfg(test)]
@@ -540,7 +497,6 @@ impl BlockIO for Guest {
                         "could not get IO guard for Write: {e:?}"
                     ))
                 })?;
-            self.backpressure_sleep().await?;
 
             let reply = self
                 .send_and_wait(|done| BlockOp::Write {
@@ -574,7 +530,6 @@ impl BlockIO for Guest {
                     "could not get IO guard for WriteUnwritten: {e:?}"
                 ))
             })?;
-        self.backpressure_sleep().await?;
         self.send_and_wait(|done| BlockOp::WriteUnwritten {
             offset,
             data,
@@ -656,12 +611,6 @@ pub struct GuestIoHandle {
     /// IO limiting (shared with the `Guest`)
     io_limits: IOLimits,
 
-    /// Current backpressure (shared with the `Guest`)
-    backpressure: SharedBackpressureAmount,
-
-    /// Backpressure configuration, as a starting point and max delay
-    backpressure_config: BackpressureConfig,
-
     /// Active work from the guest
     ///
     /// When the crucible listening task has noticed a new IO request, it
@@ -676,6 +625,10 @@ pub struct GuestIoHandle {
 
     /// Log handle, mainly to pass it into the [`Upstairs`]
     pub log: Logger,
+
+    /// Flag to disable backpressure during unit tests
+    #[cfg(test)]
+    disable_backpressure: bool,
 }
 
 impl GuestIoHandle {
@@ -690,34 +643,18 @@ impl GuestIoHandle {
     }
 
     #[cfg(test)]
-    pub fn disable_queue_backpressure(&mut self) {
-        self.backpressure_config.queue.delay_scale = Duration::ZERO;
+    pub fn disable_backpressure(&mut self) {
+        self.disable_backpressure = true;
     }
 
     #[cfg(test)]
-    pub fn disable_byte_backpressure(&mut self) {
-        self.backpressure_config.bytes.delay_scale = Duration::ZERO;
-    }
-
-    #[cfg(test)]
-    pub fn is_queue_backpressure_disabled(&self) -> bool {
-        self.backpressure_config.queue.delay_scale == Duration::ZERO
-    }
-
-    /// Set `self.backpressure` based on outstanding IO ratio
-    pub fn set_backpressure(&self, bytes: u64, jobs: u64) {
-        let bp = self.backpressure_config.get_backpressure(bytes, jobs);
-        self.backpressure.store(bp);
+    pub fn is_backpressure_disabled(&self) -> bool {
+        self.disable_backpressure
     }
 
     /// Returns the number of active jobs
     pub fn active_count(&self) -> usize {
         self.guest_work.active.len()
-    }
-
-    /// Looks up current backpressure
-    pub fn get_backpressure(&self) -> BackpressureAmount {
-        self.backpressure.load()
     }
 
     /// Debug function to dump the guest work structure.

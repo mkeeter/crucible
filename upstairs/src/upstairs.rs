@@ -425,11 +425,6 @@ impl Upstairs {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn disable_client_backpressure(&mut self) {
-        self.downstairs.disable_client_backpressure();
-    }
-
     /// Build an Upstairs for simple tests
     #[cfg(test)]
     pub fn test_default(ddef: Option<RegionDefinition>) -> Self {
@@ -673,7 +668,7 @@ impl Upstairs {
 
         // For now, check backpressure after every event.  We may want to make
         // this more nuanced in the future.
-        self.set_backpressure();
+        self.downstairs.set_client_backpressure();
     }
 
     /// Attempts to acquire permits to perform an IO job with the given bytes
@@ -757,7 +752,6 @@ impl Upstairs {
                 up_count: self.guest.guest_work.len() as u32,
                 up_counters: self.counters,
                 next_job_id: self.downstairs.peek_next_id(),
-                up_backpressure: self.guest.get_backpressure().as_micros(),
                 write_bytes_out: self.downstairs.write_bytes_outstanding(),
                 ds_count: self.downstairs.active_count() as u32,
                 ds_state: self.downstairs.collect_stats(|c| c.state()),
@@ -2093,16 +2087,6 @@ impl Upstairs {
 
         self.downstairs
             .reinitialize(client_id, auto_promote, &self.state);
-    }
-
-    /// Sets both guest and per-client backpressure
-    fn set_backpressure(&self) {
-        self.guest.set_backpressure(
-            self.downstairs.write_bytes_outstanding(),
-            self.downstairs.jobs_outstanding(),
-        );
-
-        self.downstairs.set_client_backpressure();
     }
 
     /// Returns the `RegionDefinition`
