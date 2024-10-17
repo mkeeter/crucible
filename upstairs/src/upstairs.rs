@@ -170,7 +170,7 @@ impl UpCounters {
 /// - Ack all ackable jobs to the guest
 /// - Step through the live-repair state machine (if it's running)
 /// - Check for client-side deactivation (if it's pending)
-/// - Set backpressure time in the guest
+/// - Set backpressure time in the clients
 ///
 /// Keeping the `Upstairs` "clean" through this invariant maintenance makes it
 /// easier to think about its state, because it's guaranteed to be clean when we
@@ -1497,9 +1497,6 @@ impl Upstairs {
         let impacted_blocks =
             extent_from_offset(&ddef, offset, ddef.bytes_to_blocks(data.len()));
 
-        let backpressure_guard =
-            self.downstairs.early_write_backpressure(data.len() as u64);
-
         // Fast-ack, pretending to be done immediately operations
         res.send_ok(());
 
@@ -1509,7 +1506,6 @@ impl Upstairs {
             data,
             is_write_unwritten,
             cfg: self.cfg.clone(),
-            backpressure_guard,
             io_guard,
         })
     }
@@ -1530,7 +1526,6 @@ impl Upstairs {
             write.impacted_blocks,
             write.data,
             write.is_write_unwritten,
-            write.backpressure_guard,
             write.io_guard,
         );
         self.guest.guest_work.submit_job(ds_id, true);

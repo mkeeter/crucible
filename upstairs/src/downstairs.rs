@@ -7,7 +7,6 @@ use std::{
 };
 
 use crate::{
-    backpressure::BackpressureGuard,
     cdt,
     client::{ClientAction, ClientStopReason, DownstairsClient},
     guest::{GuestBlockRes, GuestWork},
@@ -1196,7 +1195,7 @@ impl Downstairs {
 
         cdt::gw__noop__start!(|| (noop_id.0));
         gw.submit_job(noop_id, false);
-        self.enqueue(noop_id, nio, None, None, None)
+        self.enqueue(noop_id, nio, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1214,7 +1213,7 @@ impl Downstairs {
         cdt::gw__repair__start!(|| (repair_id.0, eid.0));
 
         gw.submit_job(repair_id, false);
-        self.enqueue(repair_id, repair_io, None, None, None)
+        self.enqueue(repair_id, repair_io, None, None)
     }
 
     fn repair_or_noop(
@@ -1412,7 +1411,7 @@ impl Downstairs {
         cdt::gw__reopen__start!(|| (reopen_id.0, eid.0));
 
         gw.submit_job(reopen_id, false);
-        self.enqueue(reopen_id, reopen_io, None, None, None)
+        self.enqueue(reopen_id, reopen_io, None, None)
     }
 
     #[cfg(test)]
@@ -1440,7 +1439,7 @@ impl Downstairs {
             block_size: 512,
         };
 
-        self.enqueue(ds_id, aread, None, None, None);
+        self.enqueue(ds_id, aread, None, None);
         ds_id
     }
 
@@ -1471,7 +1470,6 @@ impl Downstairs {
             iblocks,
             request,
             is_write_unwritten,
-            ClientData::from_fn(|_| BackpressureGuard::dummy()),
             IOLimitGuard::dummy(),
         )
     }
@@ -1481,7 +1479,6 @@ impl Downstairs {
         blocks: ImpactedBlocks,
         write: RawWrite,
         is_write_unwritten: bool,
-        bp_guard: ClientData<BackpressureGuard>,
         io_guard: IOLimitGuard,
     ) -> JobId {
         let ds_id = self.next_id();
@@ -1525,7 +1522,6 @@ impl Downstairs {
             ds_id,
             awrite,
             Some(GuestBlockRes::Acked), // writes are always acked
-            Some(bp_guard),
             Some(io_guard),
         );
         ds_id
@@ -1558,7 +1554,7 @@ impl Downstairs {
 
         cdt::gw__close__start!(|| (close_id.0, eid.0));
         gw.submit_job(close_id, false);
-        self.enqueue(close_id, close_io, None, None, None)
+        self.enqueue(close_id, close_io, None, None)
     }
 
     /// Get the repair IDs and dependencies for this extent.
@@ -1938,13 +1934,7 @@ impl Downstairs {
             extent_limit: extent_under_repair,
         };
 
-        self.enqueue(
-            next_id,
-            flush,
-            res.map(GuestBlockRes::Other),
-            None,
-            io_guard,
-        );
+        self.enqueue(next_id, flush, res.map(GuestBlockRes::Other), io_guard);
         next_id
     }
 
@@ -1958,7 +1948,7 @@ impl Downstairs {
         let dependencies = self.ds_active.deps_for_flush(next_id);
         debug!(self.log, "IO Barrier {next_id} has deps {dependencies:?}");
 
-        self.enqueue(next_id, IOop::Barrier { dependencies }, None, None, None);
+        self.enqueue(next_id, IOop::Barrier { dependencies }, None, None);
         next_id
     }
 
@@ -2067,7 +2057,7 @@ impl Downstairs {
         };
 
         let res = GuestBlockRes::Read(data, res);
-        self.enqueue(ds_id, aread, Some(res), None, Some(io_guard));
+        self.enqueue(ds_id, aread, Some(res), Some(io_guard));
 
         ds_id
     }
@@ -2077,7 +2067,6 @@ impl Downstairs {
         blocks: ImpactedBlocks,
         write: RawWrite,
         is_write_unwritten: bool,
-        backpressure_guard: ClientData<BackpressureGuard>,
         io_guard: IOLimitGuard,
     ) -> JobId {
         // If there is a live-repair in progress that intersects with this read,
@@ -2088,7 +2077,6 @@ impl Downstairs {
             blocks,
             write,
             is_write_unwritten,
-            backpressure_guard,
             io_guard,
         )
     }
@@ -2142,7 +2130,6 @@ impl Downstairs {
         ds_id: JobId,
         io: IOop,
         res: Option<GuestBlockRes>,
-        bp_guard: Option<ClientData<BackpressureGuard>>,
         io_limits: Option<IOLimitGuard>,
     ) {
         let mut skipped = 0;
@@ -2151,25 +2138,11 @@ impl Downstairs {
         let mut io_limits = io_limits
             .map(ClientMap::from)
             .unwrap_or_else(ClientMap::new);
-        let mut bp_guard =
-            bp_guard.map(ClientMap::from).unwrap_or_else(ClientMap::new);
 
         // Send the job to each client!
         let state = ClientData::from_fn(|cid| {
             let client = &mut self.clients[cid];
-
-            // There's an awkward asymmetry here:
-            //
-            // - `bp_guard` is unpopulated (except for writes), and should be
-            //   filled in if we're not skipping the IO.
-            // - `io_guard` is always populated (except for purely internal IO),
-            //   and guards should be **removed** if we're skipping the IO
             if client.enqueue(ds_id, &io, last_repair_extent) {
-                // Update the per-client backpressure guard
-                if !bp_guard.contains(&cid) {
-                    let g = client.backpressure_counters.increment(&io);
-                    bp_guard.insert(cid, g);
-                }
                 self.send(ds_id, io.clone(), cid);
                 IOState::InProgress
             } else {
@@ -2198,7 +2171,6 @@ impl Downstairs {
                 replay: false,
                 data: None,
                 read_validations: vec![],
-                backpressure_guard: bp_guard,
                 io_limits,
             },
         );
@@ -2708,10 +2680,10 @@ impl Downstairs {
                 // **not** when they are retired.  We'll do a sanity check here
                 // and print a warning if that's not the case.
                 for c in ClientId::iter() {
-                    if job.backpressure_guard.contains(&c) {
+                    if job.io_limits.contains(&c) {
                         warn!(
                             self.log,
-                            "job {ds_id} had pending backpressure bytes \
+                            "job {ds_id} had pending io limits \
                              for client {c}"
                         );
                         // Backpressure is decremented on drop
@@ -3339,7 +3311,7 @@ impl Downstairs {
         self.clients
             .iter()
             .filter(|c| matches!(c.state(), DsState::Active))
-            .map(|c| c.backpressure_counters.get_write_bytes())
+            .map(|c| c.io_state_byte_count().in_progress)
             .max()
             .unwrap_or(0)
     }
@@ -3467,7 +3439,6 @@ impl Downstairs {
                 data,
             },
             is_write_unwritten,
-            ClientData::from_fn(|_| BackpressureGuard::dummy()),
             IOLimitGuard::dummy(),
         )
     }
@@ -4208,19 +4179,6 @@ impl Downstairs {
                 }
             }
         });
-    }
-
-    /// Assign the given number of write bytes to the backpressure counters
-    #[must_use]
-    pub(crate) fn early_write_backpressure(
-        &mut self,
-        bytes: u64,
-    ) -> ClientData<BackpressureGuard> {
-        ClientData::from_fn(|i| {
-            self.clients[i]
-                .backpressure_counters
-                .early_write_increment(bytes)
-        })
     }
 
     pub(crate) fn set_ddef(&mut self, ddef: RegionDefinition) {
