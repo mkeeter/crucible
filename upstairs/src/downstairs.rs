@@ -203,40 +203,6 @@ impl LiveRepairState {
             | LiveRepairState::FinalFlush { flush_job: j } => j.result.take(),
         }
     }
-
-    /// Iterates over all [PendingJob] objects for the given state
-    fn jobs_mut(&mut self) -> impl Iterator<Item = &mut PendingJob> {
-        match self {
-            LiveRepairState::Closing {
-                close_job,
-                repair_job,
-                noop_job,
-                reopen_job,
-            } => [
-                Some(close_job),
-                Some(repair_job),
-                Some(noop_job),
-                Some(reopen_job),
-            ],
-            LiveRepairState::Repairing {
-                repair_job,
-                noop_job,
-                reopen_job,
-            } => [None, Some(repair_job), Some(noop_job), Some(reopen_job)],
-            LiveRepairState::Noop {
-                noop_job,
-                reopen_job,
-            } => [None, None, Some(noop_job), Some(reopen_job)],
-            LiveRepairState::Reopening { reopen_job } => {
-                [None, None, None, Some(reopen_job)]
-            }
-            LiveRepairState::FinalFlush { flush_job } => {
-                [None, None, None, Some(flush_job)]
-            }
-        }
-        .into_iter()
-        .flatten()
-    }
 }
 
 #[derive(Debug)]
@@ -285,8 +251,37 @@ pub(crate) struct LiveRepairData {
 
 impl LiveRepairData {
     /// If the given job is one that we're waiting for, store its result
-    fn job_complete(&mut self, ds_id: JobId, io: &DownstairsIO) {
-        for pending in self.state.jobs_mut() {
+    fn on_job_complete(&mut self, ds_id: JobId, io: &DownstairsIO) {
+        // Build an array of `Option<&mut PendingJob>` to check
+        let jobs = match &mut self.state {
+            LiveRepairState::Closing {
+                close_job,
+                repair_job,
+                noop_job,
+                reopen_job,
+            } => [
+                Some(close_job),
+                Some(repair_job),
+                Some(noop_job),
+                Some(reopen_job),
+            ],
+            LiveRepairState::Repairing {
+                repair_job,
+                noop_job,
+                reopen_job,
+            } => [Some(repair_job), Some(noop_job), Some(reopen_job), None],
+            LiveRepairState::Noop {
+                noop_job,
+                reopen_job,
+            } => [Some(noop_job), Some(reopen_job), None, None],
+            LiveRepairState::Reopening { reopen_job } => {
+                [Some(reopen_job), None, None, None]
+            }
+            LiveRepairState::FinalFlush { flush_job } => {
+                [Some(flush_job), None, None, None]
+            }
+        };
+        for pending in jobs.into_iter().flatten() {
             if pending.id == ds_id {
                 assert!(pending.result.is_none());
                 pending.result = Some(io.result())
@@ -516,7 +511,7 @@ impl Downstairs {
         debug!(self.log, "[A] ack job {}", ds_id);
 
         if let Some(r) = &mut self.repair {
-            r.job_complete(ds_id, done);
+            r.on_job_complete(ds_id, done);
         }
 
         // Copy (if present) read data back to the guest buffer they
